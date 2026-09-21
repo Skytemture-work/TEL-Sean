@@ -34,7 +34,7 @@ def main():
             # 你可以用示波器或 ESP32 端的 Serial Monitor 查看是否有收到這組資料
             uart.send_packet(mode='A', vx=10, vy=0, wz=0, yaw=50, pitch=50, fire=0, speed=0)
             
-            time.sleep(0.1) # 10Hz 測試頻率
+            time.sleep(1) # 10Hz 測試頻率
 
     except KeyboardInterrupt:
         print("\n測試結束，關閉 UART")
