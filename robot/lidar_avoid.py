@@ -1,4 +1,5 @@
-# lidar_avoid.py
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 import socket
 import struct
 import threading
@@ -6,54 +7,25 @@ import time
 from collections import deque
 import numpy as np
 
-try:
-    import config
-except ImportError:
-    # 若在非標準路徑下測試，提供 fallback 預設值
-    class config:
-        MIN_DYNAMIC_CELLS = 5
-        MIN_CLUSTER_CELLS = 3
-        ROBOT_MIN_DIAMETER_M = 0.15
-        ROBOT_MAX_DIAMETER_M = 1.0
-        CLUSTER_SIZE_SCORE_CAP = 60
-        MIN_VELOCITY_FOR_DIR_CHECK_MPS = 0.1
-        W_TRACK_DIST = 0.35
-        W_TRACK_DIR = 0.35
-        W_TRACK_SIZE = 0.20
-        W_TRACK_SENSOR_DIST = 0.10
-        W_ACQ_SENSOR_DIST = 0.5
-        W_ACQ_SIZE = 0.5
-        TRACK_VELOCITY_EMA_ALPHA = 0.5
-        TRACK_LOST_TIMEOUT_S = 1.0
-        MAX_TRACK_SPEED_MPS = 4.0
-        JUMP_MARGIN_M = 0.3
-        MOVEMENT_WINDOW_S = 0.6
-        MIN_ENEMY_MOVE_M = 0.15
-        DETECTION_RADIUS_M = 2.5
-        SAFE_DISTANCE_M = 1.2
-        ROBOT_SAFE_RADIUS_M = 0.5
-        MAX_VX = 100
-        MAX_VY = 100
-        MIN_VX = -100
+import config
 
 # ==========================================
 # 網路與埠號設定 (對應 Livox Mid-360)
 # ==========================================
-HOST_IP = "0.0.0.0"
-POINT_PORT = 56301
-IMU_PORT = 56401
-CMD_PORT = 56100
+HOST_IP = "0.0.0.0"      
+POINT_PORT = 56301       
+IMU_PORT = 56401         
+CMD_PORT = 56100         
 LIDAR_IP = "192.168.1.163"
 
-HEARTBEAT_INTERVAL_S = 1.0
+HEARTBEAT_INTERVAL_S = 1.0   
 HEARTBEAT_MSG = b"\x01\x00\x00\x00\x00\x00\x00\x00"
 
 SUPPORTED_POINT_DATA_TYPE = 0
 POINT_HEADER_LEN = 36
 POINT_STRIDE = 14
 IMU_HEADER_LEN = 24
-IMU_PAYLOAD_LEN = 24
-
+IMU_PAYLOAD_LEN = 24 
 
 class LidarAvoidance(threading.Thread):
     def __init__(self):
@@ -61,53 +33,59 @@ class LidarAvoidance(threading.Thread):
         self.buffer_lock = threading.Lock()
 
         # 資料快取與統計
-        self.point_buffer = []
-        self.latest_sample_point = None
-        self.latest_imu_data = None
+        self.point_buffer = []          
+        self.latest_sample_point = None 
+        self.latest_imu_data = None     
         self.point_packet_count = 0
         self.imu_packet_count = 0
-        self.dropped_point_packets = 0
-        self.obstacle_rel_pos = None
+        self.dropped_point_packets = 0  
+        self.obstacle_rel_pos = None    
 
         self.running = True
-        self.is_active = True
+        self.is_active = True           
         self.last_grid = None
 
         self._obs_history = deque(maxlen=5)
         self.enemy_trail = deque(maxlen=30)
 
-        # 演算法參數
-        self._min_dynamic_cells = getattr(config, 'MIN_DYNAMIC_CELLS', 5)
-        self._min_cluster_cells = getattr(config, 'MIN_CLUSTER_CELLS', 3)
-        self._robot_min_diameter_m = getattr(config, 'ROBOT_MIN_DIAMETER_M', 0.15)
-        self._robot_max_diameter_m = getattr(config, 'ROBOT_MAX_DIAMETER_M', 1.0)
-        self._cluster_size_cap = getattr(config, 'CLUSTER_SIZE_SCORE_CAP', 60)
+        # 動態目標演算法參數 (載入自 config)
+        self._min_dynamic_cells = getattr(config, 'MIN_DYNAMIC_CELLS', 5)     
+        self._min_cluster_cells = getattr(config, 'MIN_CLUSTER_CELLS', 3)     
+        self._robot_min_diameter_m = getattr(config, 'ROBOT_MIN_DIAMETER_M', 0.15) 
+        self._robot_max_diameter_m = getattr(config, 'ROBOT_MAX_DIAMETER_M', 1.0)  
+
+        self._cluster_size_cap = getattr(config, 'CLUSTER_SIZE_SCORE_CAP', 60) 
         self._min_velocity_for_dir_check_mps = getattr(config, 'MIN_VELOCITY_FOR_DIR_CHECK_MPS', 0.1)
+        
         self._w_track_dist = getattr(config, 'W_TRACK_DIST', 0.35)
         self._w_track_dir = getattr(config, 'W_TRACK_DIR', 0.35)
         self._w_track_size = getattr(config, 'W_TRACK_SIZE', 0.20)
         self._w_track_sensor_dist = getattr(config, 'W_TRACK_SENSOR_DIST', 0.10)
+        
         self._w_acq_sensor_dist = getattr(config, 'W_ACQ_SENSOR_DIST', 0.5)
         self._w_acq_size = getattr(config, 'W_ACQ_SIZE', 0.5)
 
         self._raw_candidate_history = deque(maxlen=15)
-        self._last_accepted_pos = None
+        self._last_accepted_pos = None   
         self._last_accepted_time = 0.0
         self._track_velocity = None
         self._velocity_ema_alpha = getattr(config, 'TRACK_VELOCITY_EMA_ALPHA', 0.5)
+        
         self._track_lost_timeout_s = getattr(config, 'TRACK_LOST_TIMEOUT_S', 1.0)
         self._max_track_speed_mps = getattr(config, 'MAX_TRACK_SPEED_MPS', 4.0)
         self._jump_margin_m = getattr(config, 'JUMP_MARGIN_M', 0.3)
         self._movement_window_s = getattr(config, 'MOVEMENT_WINDOW_S', 0.6)
         self._min_move_m = getattr(config, 'MIN_ENEMY_MOVE_M', 0.15)
+
         self.point_history = deque(maxlen=150)
 
+        # DWA 避障參數
         self.search_radius_m = getattr(config, 'DETECTION_RADIUS_M', 2.5)
         self.safe_dist_m = getattr(config, 'SAFE_DISTANCE_M', 1.2)
         self.robot_safe_radius_m = getattr(config, 'ROBOT_SAFE_RADIUS_M', 0.5)
         self.max_vx = getattr(config, 'MAX_VX', 100)
         self.max_vy = getattr(config, 'MAX_VY', 100)
-        self.min_vx = getattr(config, 'MIN_VX', -self.max_vx)
+        self.min_vx = getattr(config, 'MIN_VX', -self.max_vx) 
 
         self._heartbeat_sock = None
 
@@ -225,7 +203,7 @@ class LidarAvoidance(threading.Thread):
         if len(valid_pts) < 5:
             return self._smoothed_obstacle(None)
 
-        grid_size = 0.1
+        grid_size = 0.1 
         grid_coords = np.floor(valid_pts[:, :2] / grid_size).astype(int)
 
         cell_to_points = {}
@@ -281,7 +259,7 @@ class LidarAvoidance(threading.Thread):
             extent_y = (max(ys) - min(ys) + 1) * grid_size
             diameter = np.hypot(extent_x, extent_y)
             if not (self._robot_min_diameter_m <= diameter <= self._robot_max_diameter_m):
-                continue
+                continue 
 
             cluster_pts = [p for cell in comp for p in cell_to_points.get(cell, [])]
             if not cluster_pts:
@@ -294,9 +272,9 @@ class LidarAvoidance(threading.Thread):
 
         now = time.time()
         track_active = (self._last_accepted_pos is not None and
-                         now - self._last_accepted_time <= self._track_lost_timeout_s)
+                        now - self._last_accepted_time <= self._track_lost_timeout_s)
         have_velocity = (track_active and self._track_velocity is not None and
-                          np.hypot(*self._track_velocity) > self._min_velocity_for_dir_check_mps)
+                         np.hypot(*self._track_velocity) > self._min_velocity_for_dir_check_mps)
 
         best_score, best_centroid = -1.0, None
         for c in candidates:
@@ -316,11 +294,11 @@ class LidarAvoidance(threading.Thread):
                     if disp_mag > 1e-6:
                         vel = np.array(self._track_velocity)
                         cos_sim = float(np.dot(disp / disp_mag, vel / np.linalg.norm(vel)))
-                        dir_score = (cos_sim + 1.0) / 2.0
+                        dir_score = (cos_sim + 1.0) / 2.0 
                     else:
-                        dir_score = 0.5
+                        dir_score = 0.5 
                 else:
-                    dir_score = 0.5
+                    dir_score = 0.5 
 
                 score = (self._w_track_dist * track_dist_score +
                          self._w_track_dir * dir_score +
@@ -337,6 +315,7 @@ class LidarAvoidance(threading.Thread):
 
     def _validate_candidate(self, raw_candidate):
         now = time.time()
+
         if (self._last_accepted_pos is not None and
                 now - self._last_accepted_time > self._track_lost_timeout_s):
             self._last_accepted_pos = None
@@ -365,7 +344,7 @@ class LidarAvoidance(threading.Thread):
         newest_pos = self._raw_candidate_history[-1][1]
         moved_dist = np.hypot(newest_pos[0] - oldest_pos[0], newest_pos[1] - oldest_pos[1])
         if moved_dist < self._min_move_m:
-            return None
+            return None 
 
         if prev_pos is not None:
             dt = max(now - prev_time, 1e-3)
