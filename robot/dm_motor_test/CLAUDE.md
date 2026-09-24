@@ -268,6 +268,19 @@ SN65HVD230 / TCAN332，40-pin header）。屆時要自己用 `python-can` 按協
 
 CAN 匯流排兩端需 120Ω 終端電阻（達妙調試板與馬達端通常內建）。
 
+雙馬達檢查工具：04_dual_check.py
+
+預設執行方式是唯讀：探測兩顆馬達、讀取參數與回饋，不使能馬達。
+
+    python3 04_dual_check.py
+
+確認機構已固定後，才使用 --enable；它只會在目前位置 hold。
+
+    python3 04_dual_check.py --enable --duration 10
+
+工具預設使用 yaw ESC_ID 0x03、pitch ESC_ID 0x01，並自動讀取每顆馬達的
+MST_ID。沒有 --enable 時不會使能馬達。
+
 ## CAN 協定速查
 
 | 功能 | CAN ID | 資料 |
