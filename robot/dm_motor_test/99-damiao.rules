@@ -1,0 +1,7 @@
+# 達妙 USB-to-CAN 調試板 (HDSC CDC Device)
+# 安裝：
+#   sudo cp 99-damiao.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+# 之後裝置固定出現在 /dev/damiao，不受 ttyACM 編號變動影響。
+SUBSYSTEM=="tty", ATTRS{idVendor}=="2e88", ATTRS{idProduct}=="4603", \
+    SYMLINK+="damiao", MODE="0660", GROUP="dialout"
