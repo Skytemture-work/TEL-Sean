@@ -1,26 +1,74 @@
-// CH2的前後相反!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-#include <IBusBM.h>
+// 不使用 IBusBM 函式庫，直接在程式內解析 FlySky iBUS
+// 適用 ESP32 Arduino Core 3.x
 
-IBusBM ibus;
+// =====================
+// FlySky iBUS (自行解析)
+// =====================
+#define IBUS_RX 13
+#define IBUS_TX 14
+#define IBUS_CH_NUM 14
+#define IBUS_TIMEOUT 500   // ms，超過這時間沒收到封包就視為失聯
+
 HardwareSerial ibusSerial(1);
+
+uint16_t ibusCh[IBUS_CH_NUM];
+unsigned long lastIbusTime = 0;
+
+// 讀取並解析 iBUS 封包 (32 bytes: 0x20 0x40 + 14ch*2 + checksum 2)
+void ibusUpdate() {
+  static uint8_t buf[32];
+  static uint8_t idx = 0;
+
+  while (ibusSerial.available() > 0) {
+    uint8_t b = (uint8_t)ibusSerial.read();
+
+    if (idx == 0) {
+      if (b != 0x20) continue;          // 等待標頭 0x20
+      buf[idx++] = b;
+      continue;
+    }
+    if (idx == 1) {
+      if (b != 0x40) {                  // 第二個 byte 必須是 0x40
+        idx = (b == 0x20) ? 1 : 0;      // 若又是 0x20，當作新的標頭
+        continue;
+      }
+      buf[idx++] = b;
+      continue;
+    }
+
+    buf[idx++] = b;
+
+    if (idx == 32) {
+      idx = 0;
+
+      // checksum = 0xFFFF - 前 30 bytes 總和
+      uint16_t sum = 0xFFFF;
+      for (uint8_t i = 0; i < 30; i++) sum -= buf[i];
+      uint16_t rxSum = buf[30] | (buf[31] << 8);
+
+      if (sum == rxSum) {
+        for (uint8_t i = 0; i < IBUS_CH_NUM; i++) {
+          ibusCh[i] = buf[2 + i * 2] | (buf[3 + i * 2] << 8);
+        }
+        lastIbusTime = millis();
+      }
+    }
+  }
+}
 
 // =====================
 // Xavier UART (Serial2)
 // =====================
-#define XAVIER_RX 16
-#define XAVIER_TX 17
+// 注意：原本的 16/17 與 RL_DIR / RR_PWM 衝突，這裡改到 8/9
+// 請依你實際接線修改
+#define XAVIER_RX 1
+#define XAVIER_TX 2
 HardwareSerial xavierSerial(2);
-
-// =====================
-// FlySky iBUS
-// =====================
-#define IBUS_RX 13
-#define IBUS_TX 14
 
 #define DEADZONE 50
 
 // =====================
-// GB42 四輪腳位 (未更改)
+// GB42 四輪腳位
 // =====================
 // Front Left
 #define FL_PWM 4
@@ -37,11 +85,6 @@ HardwareSerial xavierSerial(2);
 // Rear Right
 #define RR_PWM 17
 #define RR_DIR 18
-
-#define FL_CH 0
-#define FR_CH 1
-#define RL_CH 2
-#define RR_CH 3
 
 #define PWM_FREQ 20000
 #define PWM_RESOLUTION 8
@@ -63,20 +106,24 @@ int auto_fire = 0;
 int auto_speed = 0;
 
 unsigned long lastXavierTime = 0; // 超時保護計時
-String xavierRxBuffer = "";      // 串口接收緩衝區
+String xavierRxBuffer = "";       // 串口接收緩衝區
 
 // =====================
-// iBUS安全讀取 (未更改)
+// iBUS 安全讀取
 // =====================
 int safeRead(int ch){
-  int v = ibus.readChannel(ch);
+  // 遙控器失聯 -> 回傳中位
+  if (millis() - lastIbusTime > IBUS_TIMEOUT)
+    return 1500;
+
+  int v = ibusCh[ch];
   if(v < 900 || v > 2100)
     return 1500;
   return v;
 }
 
 // =====================
-// Deadzone (未更改)
+// Deadzone
 // =====================
 int applyDeadzone(int v){
   if(abs(v - 1500) < DEADZONE)
@@ -85,7 +132,14 @@ int applyDeadzone(int v){
 }
 
 // =====================
-// 油門 0~100 (未更改)
+// 開關 -> 0 / 1 (2段開關，>1500 視為 ON)
+// =====================
+int toSwitch(int v){
+  return (v > 1500) ? 1 : 0;
+}
+
+// =====================
+// 油門 0~100
 // =====================
 int throttleMap(int v){
   v = constrain(v, 1000, 2000);
@@ -95,7 +149,7 @@ int throttleMap(int v){
 }
 
 // =====================
-// 搖桿 正向 -100~100 (未更改)
+// 搖桿 正向 -100~100
 // =====================
 int joystickNormal(int v){
   v = constrain(v, 1000, 2000);
@@ -103,7 +157,7 @@ int joystickNormal(int v){
 }
 
 // =====================
-// 搖桿 反向 -100~100 (未更改)
+// 搖桿 反向 -100~100
 // =====================
 int joystickReverse(int v){
   v = constrain(v, 1000, 2000);
@@ -111,21 +165,21 @@ int joystickReverse(int v){
 }
 
 // =====================
-// 馬達控制 (未更改)
+// 馬達控制 (Core 3.x：ledcWrite 第一個參數是「腳位」)
 // =====================
-void motorControl(int dirPin, int channel, int speed){
+void motorControl(int dirPin, int pwmPin, int speed){
   speed = constrain(speed, -255, 255);
 
   if(speed > 0){
     digitalWrite(dirPin, HIGH);
-    ledcWrite(channel, speed);
+    ledcWrite(pwmPin, speed);
   }
   else if(speed < 0){
     digitalWrite(dirPin, LOW);
-    ledcWrite(channel, abs(speed));
+    ledcWrite(pwmPin, abs(speed));
   }
   else{
-    ledcWrite(channel, 0);
+    ledcWrite(pwmPin, 0);
   }
 }
 
@@ -138,11 +192,15 @@ void driveMecanum(int forward, int strafe, int rotate, int throttle) {
   int RL = rotate - strafe - forward;
   int RR = rotate - strafe + forward;
 
-  // 限制
-  FL = constrain(FL, -100, 100);
-  FR = constrain(FR, -100, 100);
-  RL = constrain(RL, -100, 100);
-  RR = constrain(RR, -100, 100);
+  // 等比例縮放：斜向 (前後+平移) 時數值可能超過 100，
+  // 直接 constrain 會讓方向跑掉，所以以最大值為基準整體縮小
+  int maxV = max(max(abs(FL), abs(FR)), max(abs(RL), abs(RR)));
+  if (maxV > 100) {
+    FL = FL * 100 / maxV;
+    FR = FR * 100 / maxV;
+    RL = RL * 100 / maxV;
+    RR = RR * 100 / maxV;
+  }
 
   // 油門倍率
   FL = FL * throttle / 100;
@@ -157,10 +215,10 @@ void driveMecanum(int forward, int strafe, int rotate, int throttle) {
   RR = map(RR, -100, 100, -255, 255);
 
   // 四輪輸出
-  motorControl(FL_DIR, FL_CH, FL);
-  motorControl(FR_DIR, FR_CH, FR);
-  motorControl(RL_DIR, RL_CH, RL);
-  motorControl(RR_DIR, RR_CH, RR);
+  motorControl(FL_DIR, FL_PWM, FL);
+  motorControl(FR_DIR, FR_PWM, FR);
+  motorControl(RL_DIR, RL_PWM, RL);
+  motorControl(RR_DIR, RR_PWM, RR);
 }
 
 // =====================
@@ -210,9 +268,9 @@ void setup(){
   // Xavier UART (Serial2)
   xavierSerial.begin(115200, SERIAL_8N1, XAVIER_RX, XAVIER_TX);
 
-  // iBUS
+  // iBUS (自行解析，不用函式庫)
   ibusSerial.begin(115200, SERIAL_8N1, IBUS_RX, IBUS_TX);
-  ibus.begin(ibusSerial);
+  for (int i = 0; i < IBUS_CH_NUM; i++) ibusCh[i] = 1500;
 
   // DIR
   pinMode(FL_DIR, OUTPUT);
@@ -220,16 +278,11 @@ void setup(){
   pinMode(RL_DIR, OUTPUT);
   pinMode(RR_DIR, OUTPUT);
 
-  // PWM
-  ledcSetup(FL_CH, PWM_FREQ, PWM_RESOLUTION);
-  ledcSetup(FR_CH, PWM_FREQ, PWM_RESOLUTION);
-  ledcSetup(RL_CH, PWM_FREQ, PWM_RESOLUTION);
-  ledcSetup(RR_CH, PWM_FREQ, PWM_RESOLUTION);
-
-  ledcAttachPin(FL_PWM, FL_CH);
-  ledcAttachPin(FR_PWM, FR_CH);
-  ledcAttachPin(RL_PWM, RL_CH);
-  ledcAttachPin(RR_PWM, RR_CH);
+  // PWM (ESP32 Core 3.x)
+  ledcAttach(FL_PWM, PWM_FREQ, PWM_RESOLUTION);
+  ledcAttach(FR_PWM, PWM_FREQ, PWM_RESOLUTION);
+  ledcAttach(RL_PWM, PWM_FREQ, PWM_RESOLUTION);
+  ledcAttach(RR_PWM, PWM_FREQ, PWM_RESOLUTION);
 
   Serial.println("MECANUM & XAVIER UART READY");
 }
@@ -240,29 +293,35 @@ void setup(){
 void loop(){
 
   // ==========================================
+  // 0. 更新 iBUS 資料
+  // ==========================================
+  ibusUpdate();
+
+  // ==========================================
   // 1. 讀取遙控器 iBUS 通道資料 (CH1 ~ CH10)
   // ==========================================
-  int ch1 = applyDeadzone(safeRead(0)); // CH1: 右搖桿左右
+  int ch1 = applyDeadzone(safeRead(3)); // CH1: 右搖桿左右
   int ch2 = applyDeadzone(safeRead(1)); // CH2: 右搖桿上下
   int ch3 = applyDeadzone(safeRead(2)); // CH3: 左搖桿上下 (油門)
-  int ch4 = applyDeadzone(safeRead(3)); // CH4: 左搖桿左右
-  int ch5 = safeRead(4);                // SW1: 射擊安全開關
-  int ch6 = safeRead(5);                // SW2: 模式切換 (Manual / Auto)
-  int ch7 = safeRead(6);                // SW3: 切換 (底盤 / 砲台)
-  int ch8 = safeRead(7);                // SW4: 射擊模式 (OFF / SINGLE / BURST)
-  int ch10 = safeRead(9);               // VRB: 射擊速度旋鈕
+  int ch4 = applyDeadzone(safeRead(0)); // CH4: 左搖桿左右
+  // ===== Switch =====
+  int vrB = safeRead(5);                // VRB: 射擊速度旋鈕
+  int swA = toSwitch(safeRead(6));      // CH7: 模式切換 (Manual / Auto)
+  int swB = safeRead(7);                // SW2: 切換 (底盤 / 砲台)
+  int swC = safeRead(8);                // SW4: 射擊模式 (OFF / SINGLE / BURST)
+  int swD = safeRead(9);               // SW1: 射擊安全開關
 
   // 判斷 SW2: 控制模式切換 ('M' 或 'A')
-  currentMode = (ch6 > 1500) ? 'A' : 'M';
+  currentMode = (swA == 1) ? 'M' : 'A';
 
-  // 判斷 SW3: 手動時 CH1/CH2 用途切換
-  bool isTurretControl = (ch7 > 1500);
+  // 判斷 SW2: 手動時 CH1/CH2 用途切換 (底盤 / 砲台)
+  bool isTurretControl = (swB > 1500);
 
   // 判斷 SW1: 射擊安全允許
-  int fire_allow = (ch5 > 1500) ? 1 : 0;
+  int fire_allow = (swD > 1500) ? 1 : 0;
 
   // 讀取 VRB 轉速 (0 ~ 100)
-  int speed_val = map(constrain(ch10, 1000, 2000), 1000, 2000, 0, 100);
+  int speed_val = map(constrain(vrB, 1000, 2000), 1000, 2000, 0, 100);
 
   // 計算油門倍率 (0 ~ 100)
   int throttle = throttleMap(ch3);
@@ -270,14 +329,14 @@ void loop(){
   // 手動控制變數宣告
   int forward = 0;
   int strafe = 0;
-  int rotate = joystickNormal(ch4);
+  int rotate = joystickNormal(ch4);  // 左搖桿(油門桿)左右 = 旋轉
 
   if (!isTurretControl) {
-    // SW3 = 底盤控制模式
-    forward = joystickReverse(ch2);
+    // SW2 = 底盤控制模式：右搖桿 前後/左右/斜向
+    forward = joystickReverse(ch2);  // CH2 前後與遙控器相反，沿用原本手動程式寫法
     strafe = joystickNormal(ch1);
   } else {
-    // SW3 = 砲台控制模式 (搖桿輸入轉換為 0~100 控制量，可根據需求微調)
+    // SW2 = 砲台控制模式
     manual_yaw = map(constrain(ch1, 1000, 2000), 1000, 2000, 0, 100);
     manual_pitch = map(constrain(ch2, 1000, 2000), 1000, 2000, 0, 100);
   }
@@ -301,14 +360,13 @@ void loop(){
   if (currentMode == 'M') {
     // 【手動模式】: 由 ESP32 解析遙控器直接驅動底盤
     driveMecanum(forward, strafe, rotate, throttle);
-  } 
+  }
   else if (currentMode == 'A') {
     // 【自動模式】: 聽從 Xavier 發送的 VX, VY, WZ 控制指令
     // 超時安全保護：若超過 500ms 沒收到 Xavier 封包，底盤停等
     if (millis() - lastXavierTime > 500) {
       driveMecanum(0, 0, 0, 0);
     } else {
-      // auto_vx = 前後, auto_vy = 左右平移, auto_wz = 旋轉
       driveMecanum(auto_vx, auto_vy, auto_wz, 100);
     }
   }
@@ -316,7 +374,6 @@ void loop(){
   // ==========================================
   // 4. 定期發送狀態封包給 Xavier (E,MODE,VX,VY,WZ,YAW,PITCH,FIRE,SPEED\n)
   // ==========================================
-  // 決定要送給 Xavier 的 YAW, PITCH, FIRE, SPEED
   int send_vx = (currentMode == 'M') ? forward : auto_vx;
   int send_vy = (currentMode == 'M') ? strafe : auto_vy;
   int send_wz = (currentMode == 'M') ? rotate : auto_wz;
@@ -336,6 +393,9 @@ void loop(){
 
   xavierSerial.print(txPacket);
 
+  // Debug：顯示實際送給 Xavier 的資料
+  Serial.print("TX->Xavier: ");
+  Serial.print(txPacket);
   // Debug 訊息
   Serial.print("Mode:"); Serial.print(currentMode);
   Serial.print("\tThrottle:"); Serial.print(throttle);
@@ -344,4 +404,22 @@ void loop(){
   Serial.print("\tRotate:"); Serial.println(rotate);
 
   delay(20); // 50Hz 控制週期
+  // ===== 輸出（完全不改你的順序）=====
+
+  Serial.print("\tSWA:");
+  Serial.print(swA);
+
+  Serial.print("\tswC:");
+  Serial.print(swC);
+
+  Serial.print("\tswB:");
+  Serial.print(swB);
+
+  Serial.print("\tswD:");
+  Serial.print(swD);
+
+  Serial.print("\tvrB:");
+  Serial.println(vrB);
+
+  delay(20);
 }
