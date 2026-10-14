@@ -12,6 +12,7 @@ from typing import Optional
 
 from . import ballistics
 from .config import TurretConfig
+from .geometry import aim_angles_from_target
 
 
 @dataclass(frozen=True)
@@ -21,8 +22,8 @@ class TargetPixel:
     u_px: float
     v_px: float
     confidence: float = 1.0
-    # Range to the target in metres.  None means "unknown", which disables the
-    # parallax and gravity corrections -- and blocks firing when the config
+    # Optical-axis depth to the target in metres.  None means "unknown", which
+    # disables the axis geometry and gravity corrections -- and blocks firing when the config
     # says those corrections matter.
     distance_m: Optional[float] = None
 
@@ -47,6 +48,9 @@ class AimCommand:
     # Why the shot is not available, for logging.  None when it is fine.
     blocked_reason: Optional[str] = None
     distance_m: Optional[float] = None
+    # Distances after transforming the target into the two joint frames.
+    yaw_axis_distance_m: Optional[float] = None
+    pitch_axis_distance_m: Optional[float] = None
     stable: bool = False
     fire_allowed: bool = False
 
@@ -117,31 +121,83 @@ class AimingController:
                 target_pitch_rad=None,
             )
 
-        yaw_error, pitch_error = self.pixel_to_error(target)
         blocked_reason = None
+        geometry_result = None
+        if self.config.use_axis_geometry and not self.config.camera_on_turret:
+            # A base-fixed camera must use the target's 3-D position.  The
+            # virtual screen test disables this branch because its apparent
+            # hole size is not a physical range measurement.
+            if target.distance_m is None and self.config.require_distance_to_fire:
+                blocked_reason = "no range to target; axis geometry is unavailable"
+                yaw_error, pitch_error = self.pixel_to_error(target)
+            elif target.distance_m is None:
+                # Explicit diagnostic fallback.  Normal field configuration
+                # keeps require_distance_to_fire=True.
+                yaw_error, pitch_error = self.pixel_to_error(target)
+            else:
+                geometry_config = self.config
+                if not self.config.compensate_parallax:
+                    # Keep camera alignment, but intentionally remove the
+                    # camera-to-axis translation from the calculation.
+                    from dataclasses import replace
 
-        # Re-aim from the muzzle and add the drop compensation.  Both need the
-        # range; without it we fall back to the straight-line assumption and
-        # (if the config says those corrections matter) refuse to fire.
-        missing_range = self.config.needs_distance and target.distance_m is None
-        if missing_range and self.config.require_distance_to_fire:
-            blocked_reason = "no range to target; parallax/drop cannot be applied"
+                    geometry_config = replace(
+                        self.config,
+                        yaw_axis_offset_x_m=0.0,
+                        yaw_axis_offset_y_m=0.0,
+                        yaw_axis_offset_z_m=0.0,
+                        pitch_axis_offset_x_m=0.0,
+                        pitch_axis_offset_y_m=0.0,
+                        pitch_axis_offset_z_m=0.0,
+                    )
+                try:
+                    wanted_yaw, wanted_pitch, geometry_result = aim_angles_from_target(
+                        target.u_px,
+                        target.v_px,
+                        target.distance_m,
+                        geometry_config,
+                    )
+                    yaw_error = wanted_yaw - self.config.yaw_zero_rad
+                    pitch_error = wanted_pitch - self.config.pitch_zero_rad
+
+                    if self.config.compensate_gravity:
+                        horizontal = math.hypot(
+                            geometry_result.target_from_pitch_axis.x,
+                            geometry_result.target_from_pitch_axis.z,
+                        )
+                        pitch_for_projectile = ballistics.gravity_pitch(
+                            horizontal,
+                            geometry_result.target_from_pitch_axis.y,
+                            self.config.muzzle_speed_m_s,
+                            self.config.gravity_m_s2,
+                        )
+                        pitch_error = self.config.pitch_sign * pitch_for_projectile
+                except (ValueError, ballistics.OutOfRange) as exc:
+                    blocked_reason = str(exc)
+                    yaw_error, pitch_error = self.pixel_to_error(target)
         else:
-            # solve_aim returns the bearing unchanged when distance is None, so
-            # this is the deliberate straight-line fallback.
-            try:
-                yaw_error, pitch_error = ballistics.solve_aim(
-                    yaw_error,
-                    pitch_error,
-                    target.distance_m,
-                    muzzle_offset=self.config.muzzle_offset,
-                    muzzle_speed_m_s=self.config.muzzle_speed_m_s,
-                    gravity_m_s2=self.config.gravity_m_s2,
-                    compensate_parallax=self.config.compensate_parallax,
-                    compensate_gravity=self.config.compensate_gravity,
-                )
-            except ballistics.OutOfRange as exc:
-                blocked_reason = str(exc)
+            yaw_error, pitch_error = self.pixel_to_error(target)
+            # Legacy/camera-on-turret path: re-aim from the muzzle and add the
+            # drop compensation.  Both need the range.
+            missing_range = self.config.needs_distance and target.distance_m is None
+            if missing_range and self.config.require_distance_to_fire:
+                blocked_reason = "no range to target; parallax/drop cannot be applied"
+            else:
+                # solve_aim returns the bearing unchanged when distance is
+                # None, so this is the deliberate straight-line fallback.
+                try:
+                    yaw_error, pitch_error = ballistics.solve_aim(
+                        yaw_error,
+                        pitch_error,
+                        target.distance_m,
+                        muzzle_offset=self.config.muzzle_offset,
+                        muzzle_speed_m_s=self.config.muzzle_speed_m_s,
+                        gravity_m_s2=self.config.gravity_m_s2,
+                        compensate_parallax=self.config.compensate_parallax,
+                        compensate_gravity=self.config.compensate_gravity,
+                    )
+                except ballistics.OutOfRange as exc:
+                    blocked_reason = str(exc)
 
         if self.config.camera_on_turret:
             # The error is relative to where the turret already points.
@@ -207,6 +263,12 @@ class AimingController:
             target_reachable=reachable,
             blocked_reason=blocked_reason,
             distance_m=target.distance_m,
+            yaw_axis_distance_m=(
+                geometry_result.yaw_axis_distance_m if geometry_result is not None else None
+            ),
+            pitch_axis_distance_m=(
+                geometry_result.pitch_axis_distance_m if geometry_result is not None else None
+            ),
             stable=stable,
             # The launcher should still have a separate physical safety gate.
             fire_allowed=stable,
