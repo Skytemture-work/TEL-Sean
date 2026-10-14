@@ -153,12 +153,15 @@ class DamiaoSerialBackend:
         baud: int = DEFAULT_BAUD,
         dm_path: Optional[Path] = None,
         enable_on_start: bool = True,
+        startup_hold_s: float = 0.5,
     ):
         import serial
 
         mode = mode.lower()
         if mode not in ("posvel", "mit"):
             raise ValueError("mode must be 'posvel' or 'mit'")
+        if startup_hold_s < 0.0:
+            raise ValueError("startup_hold_s must be non-negative")
         if mode == "mit" and kd <= 0.0:
             # Documented in the vendor manual: kd=0 in MIT position control
             # oscillates and can run away.
@@ -184,6 +187,7 @@ class DamiaoSerialBackend:
         self.mode = mode
         self.kp = kp
         self.kd = kd
+        self.startup_hold_s = startup_hold_s
 
         motor_type = getattr(DM_CAN.DM_Motor_Type, motor_type_name)
         self._motor_type = motor_type
@@ -297,10 +301,33 @@ class DamiaoSerialBackend:
     # ------------------------------------------------------------ lifecycle
 
     def enable(self) -> None:
+        # Capture the actual pose before enabling.  Sending the first control
+        # frame only after enable can otherwise create a sudden torque/position
+        # error from a stale feedback sample.  Pre-loading the current pose and
+        # holding it briefly makes startup much softer, especially in MIT mode.
+        self.refresh()
+        startup_positions = {}
+        for motor_id in self._motors:
+            state = self.get_state(motor_id)
+            if state is None:
+                raise RuntimeError(f"no feedback from motor 0x{motor_id:02X} before enable")
+            startup_positions[motor_id] = state.position_rad
+
         for motor in self._motors.values():
             self._mc.enable(motor)
         self._enabled = True
-        time.sleep(0.1)
+
+        deadline = time.monotonic() + self.startup_hold_s
+        while time.monotonic() < deadline:
+            for motor_id, motor in self._motors.items():
+                position = startup_positions[motor_id]
+                if self.mode == "posvel":
+                    self._mc.control_Pos_Vel(motor, position, 0.2)
+                else:
+                    self._mc.controlMIT(motor, self.kp, self.kd, position, 0.0, 0.0)
+                self._last[motor_id] = PositionCommand(motor_id, position, 0.2)
+            self.refresh()
+            time.sleep(0.005)
 
     def disable(self) -> None:
         for motor in self._motors.values():
