@@ -7,7 +7,7 @@ through the list.
 
 Ranging comes free because the hole diameters are known:
 
-    distance = focal_length_px * real_diameter_m / apparent_width_px
+    optical_depth = focal_length_px * real_diameter_m / apparent_width_px
 
 That is what unblocks the parallax and drop corrections in ``ballistics``.
 """
@@ -15,6 +15,11 @@ That is what unblocks the parallax and drop corrections in ``ballistics``.
 from __future__ import annotations
 
 import math
+import itertools
+from typing import Tuple
+
+import cv2
+import numpy as np
 from dataclasses import dataclass, replace
 from typing import Dict, List, Optional, Sequence
 
@@ -24,6 +29,8 @@ from .aiming import TargetPixel
 _EXPECTED_SIZE_RATIO = 2.0
 # How far the measured ratio may stray before we refuse to split the clusters.
 _RATIO_TOLERANCE = 0.45
+_EXPECTED_SMALL_COUNT = 3
+_EXPECTED_LARGE_COUNT = 9
 
 
 @dataclass(frozen=True)
@@ -55,7 +62,7 @@ class BoardTarget:
 
 
 def distance_from_size(size_px: float, diameter_m: float, focal_px: float) -> float:
-    """Range to a circle of known diameter from its apparent size."""
+    """Optical-axis depth to a circle of known diameter from its size."""
     if size_px <= 0:
         raise ValueError("size_px must be positive")
     if diameter_m <= 0:
@@ -97,7 +104,11 @@ def classify_by_size(
     large_mean = sum(t.size_px for t in large) / len(large)
     ratio = large_mean / small_mean if small_mean > 0 else 0.0
 
-    if abs(ratio - _EXPECTED_SIZE_RATIO) > _RATIO_TOLERANCE:
+    if (
+        len(small) != _EXPECTED_SMALL_COUNT
+        or len(large) != _EXPECTED_LARGE_COUNT
+        or abs(ratio - _EXPECTED_SIZE_RATIO) > _RATIO_TOLERANCE
+    ):
         # One size only (or a bad frame).  Leave the diameter unknown so the
         # aiming layer refuses to fire rather than ranging off a wrong guess.
         return [replace(t, diameter_m=None) for t in targets]
@@ -109,6 +120,186 @@ def classify_by_size(
         assignment[id(target)] = large_diameter_m
 
     return [replace(t, diameter_m=assignment[id(t)]) for t in ordered]
+
+
+def select_board_targets(
+    targets: Sequence[BoardTarget], require_size_ratio: bool = True
+) -> List[BoardTarget]:
+    """Keep the best geometrically valid 3x4 board from YOLO candidates.
+
+    YOLO can return background false positives.  The official target gives us
+    a strong prior: exactly 12 holes, three vertical columns of four, and a
+    3-small/9-large size split with an approximately 2:1 diameter ratio.
+    When there are more than 12 candidates, try small subsets of the highest
+    confidence boxes and keep the one with the best confidence and geometry.
+    """
+    if len(targets) <= 12:
+        return list(targets)
+
+    candidates = sorted(targets, key=lambda target: target.confidence, reverse=True)[:16]
+    best = None
+    best_score = None
+    for subset in itertools.combinations(candidates, 12):
+        identified = assign_hole_ids(subset)
+        if len(identified) != 12 or any(target.hole_id is None for target in identified):
+            continue
+
+        sizes = sorted(target.size_px for target in subset)
+        small_mean = sum(sizes[:3]) / 3.0
+        large_mean = sum(sizes[3:]) / 9.0
+        if small_mean <= 0:
+            continue
+        ratio_error = abs((large_mean / small_mean) - _EXPECTED_SIZE_RATIO)
+        if require_size_ratio and ratio_error > _RATIO_TOLERANCE:
+            continue
+
+        confidence = sum(target.confidence for target in subset) / 12.0
+        # Prefer confidence, then a clean 2:1 size split.
+        score = confidence - ratio_error * 0.25
+        if best_score is None or score > best_score:
+            best = list(subset)
+            best_score = score
+
+    return best or []
+
+
+def build_virtual_plan(
+    targets: Sequence[BoardTarget],
+    small_diameter_m: float,
+    large_diameter_m: float,
+    large_first: bool = True,
+    left_to_right: bool = True,
+    bottom_to_top: bool = True,
+) -> "EngagementPlan":
+    """Build a plan for a screen/virtual board with non-real hole scale.
+
+    The official row layout still determines small versus large; apparent
+    pixel size is deliberately ignored because a displayed image is not a
+    physical 20/40 cm target at a known range.
+    """
+    selected = select_board_targets(targets, require_size_ratio=False)
+    identified = assign_hole_ids(selected)
+    if len(identified) != 12 or any(target.hole_id is None for target in identified):
+        return EngagementPlan([])
+    classified = [
+        replace(
+            target,
+            diameter_m=small_diameter_m if target.row == 3 else large_diameter_m,
+            distance_m=None,
+        )
+        for target in identified
+    ]
+    return EngagementPlan(
+        order_targets(
+            classified,
+            large_first=large_first,
+            left_to_right=left_to_right,
+            bottom_to_top=bottom_to_top,
+        )
+    )
+
+
+def _cluster_1d(values: Sequence[float], count: int) -> List[float]:
+    """Small dependency-free 1-D k-means used for partial board fitting."""
+    ordered = sorted(values)
+    centers = [ordered[round(i * (len(ordered) - 1) / (count - 1))] for i in range(count)]
+    for _ in range(20):
+        groups = [[] for _ in centers]
+        for value in values:
+            index = min(range(count), key=lambda i: abs(value - centers[i]))
+            groups[index].append(value)
+        new_centers = [sum(group) / len(group) if group else centers[i] for i, group in enumerate(groups)]
+        if max(abs(a - b) for a, b in zip(centers, new_centers)) < 1e-3:
+            break
+        centers = new_centers
+    return sorted(centers)
+
+
+def build_virtual_plan_from_partial(
+    targets: Sequence[BoardTarget],
+    small_diameter_m: float,
+    large_diameter_m: float,
+    large_first: bool = True,
+    left_to_right: bool = True,
+    bottom_to_top: bool = True,
+) -> "EngagementPlan":
+    """Infer missing virtual-board holes from a partial 3x4 grid.
+
+    At least six candidates are required.  Candidate points are assigned to
+    three x-columns and four y-rows, then a homography maps the official 12
+    normalized positions into the camera image.  This is for screen testing:
+    it intentionally does not use apparent hole size or range.
+    """
+    if len(targets) < 6:
+        return EngagementPlan([])
+    candidates = sorted(targets, key=lambda target: target.confidence, reverse=True)[:20]
+    x_centers = _cluster_1d([target.u_px for target in candidates], 3)
+    y_centers = _cluster_1d([target.v_px for target in candidates], 4)
+    cells = {}
+    for target in candidates:
+        column = min(range(3), key=lambda i: abs(target.u_px - x_centers[i]))
+        row = min(range(4), key=lambda i: abs(target.v_px - y_centers[i]))
+        cell = (column, row)
+        old = cells.get(cell)
+        if old is None or target.confidence > old.confidence:
+            cells[cell] = target
+    if len(cells) < 6:
+        return EngagementPlan([])
+
+    canonical = []
+    observed = []
+    for (column, row), target in cells.items():
+        canonical.append((0.20 + 0.30 * column, 0.125 + 0.25 * row))
+        observed.append((target.u_px, target.v_px))
+    if len(canonical) < 4:
+        return EngagementPlan([])
+    matrix, _ = cv2.findHomography(
+        np.asarray(canonical, dtype=np.float32),
+        np.asarray(observed, dtype=np.float32),
+        cv2.RANSAC,
+        30.0,
+    )
+    if matrix is None:
+        return EngagementPlan([])
+
+    official_ids = {
+        (0, 0): "H10", (1, 0): "H11", (2, 0): "H12",
+        (0, 1): "H03", (1, 1): "H06", (2, 1): "H09",
+        (0, 2): "H02", (1, 2): "H05", (2, 2): "H08",
+        (0, 3): "H01", (1, 3): "H04", (2, 3): "H07",
+    }
+    points = np.asarray(
+        [[0.20 + 0.30 * column, 0.125 + 0.25 * row] for row in range(4) for column in range(3)],
+        dtype=np.float32,
+    ).reshape(-1, 1, 2)
+    projected = cv2.perspectiveTransform(points, matrix).reshape(-1, 2)
+    inferred = []
+    index = 0
+    for row in range(4):
+        for column in range(3):
+            inferred.append(
+                BoardTarget(
+                    u_px=float(projected[index, 0]),
+                    v_px=float(projected[index, 1]),
+                    width_px=1.0,
+                    height_px=1.0,
+                    confidence=1.0,
+                    diameter_m=small_diameter_m if row == 0 else large_diameter_m,
+                    distance_m=None,
+                    column=column,
+                    row=3 - row,
+                    hole_id=official_ids[(column, row)],
+                )
+            )
+            index += 1
+    return EngagementPlan(
+        order_targets(
+            inferred,
+            large_first=large_first,
+            left_to_right=left_to_right,
+            bottom_to_top=bottom_to_top,
+        )
+    )
 
 
 def apply_ranging(targets: Sequence[BoardTarget], focal_px: float) -> List[BoardTarget]:
@@ -237,9 +428,14 @@ def build_plan(
     bottom_to_top: bool = True,
 ) -> "EngagementPlan":
     """Classify, range and order one detection of the board."""
-    classified = classify_by_size(targets, small_diameter_m, large_diameter_m)
+    selected = select_board_targets(targets, require_size_ratio=True)
+    classified = classify_by_size(selected, small_diameter_m, large_diameter_m)
+    if len(classified) != 12 or any(target.diameter_m is None for target in classified):
+        return EngagementPlan([])
     ranged = apply_ranging(classified, focal_px)
     identified = assign_hole_ids(ranged)
+    if len(identified) != 12 or any(target.hole_id is None for target in identified):
+        return EngagementPlan([])
     return EngagementPlan(
         order_targets(
             identified,

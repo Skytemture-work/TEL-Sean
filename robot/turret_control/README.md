@@ -37,12 +37,22 @@
 YOLO 若只有一個類別，`classify_by_size()` 會用「大孔是小孔的 2 倍」把兩種尺寸分開；
 比例不對時（例如畫面只有一種尺寸）會標成未知，讓開火閘門擋下，而不是亂猜距離。
 
+### 🟢 相機固定在車身 = 三維關節幾何
+
+實機的 `use_axis_geometry=True` 會把每個孔的像素與測距結果轉成相機座標，
+再扣除相機到**水平關節**的固定偏移，並換算成水平關節與垂直關節的絕對目標角度。
+因此車子停在場上不同位置時，不需要假設靶板在固定像素或固定距離；每一幀會依靶板
+目前的距離重新計算角度。`geometry.py` 也會補償水平關節與垂直關節不重合造成的近距離視差。
+
+螢幕測試的 `--virtual-board` 會自動關閉這段幾何，因為螢幕上的孔徑不代表真實 20/40 cm。
+
 ## 模組
 
 | 檔案 | 說明 |
 |---|---|
 | `config.py` | 所有參數。**大部分仍是暫時值**，見下方 |
 | `aiming.py` | 像素 → 角度，含穩定判定與開火閘門 |
+| `geometry.py` | 相機座標 → 水平／垂直關節座標與絕對馬達角度 |
 | `ballistics.py` | 視差修正 + 重力彈道求解（純數學） |
 | `backends.py` | `MockMotorBackend`（安全模擬）與 `DamiaoSerialBackend`（實機） |
 | `controller.py` | 接合瞄準與馬達輸出 |
@@ -136,7 +146,10 @@ python3 -m unittest discover -s tests -t .
 | `yaw_zero_rad` / `pitch_zero_rad` | 0.0 | 機械零點對位 |
 | `yaw_sign` / `pitch_sign` | 1 | 馬達裝上去後看轉向 |
 | `yaw_min/max`、`pitch_min/max` | ±80° / −20°~35° | 機構實際行程 |
-| `muzzle_offset_x/y/z_m` | 0.0 | 量相機到發射口的距離 |
+| `camera_to_yaw_yaw/pitch_rad` | 0.0 | 炮塔零點時，相機光軸相對水平軸的偏角 |
+| `yaw_axis_offset_x/y/z_m` | 0.0 | 量相機原點到水平關節原點，使用相機座標 |
+| `pitch_axis_offset_x/y/z_m` | 0.0 | 量水平關節到垂直關節，使用水平零點座標 |
+| `muzzle_offset_x/y/z_m` | 0.0 | 舊版彈道補償用：量相機到發射口的距離 |
 | `muzzle_speed_m_s` | 20.0 | 實際測球速 |
 
 **距離已經有解**：用已知孔徑反推（見上面）。但這需要 YOLO 的框寬夠準 ——

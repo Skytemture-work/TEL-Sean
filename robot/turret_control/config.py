@@ -27,6 +27,30 @@ class TurretConfig:
     #   the pixel error going to zero is what "on target" means.
     camera_on_turret: bool = False
 
+    # Use the actual camera -> yaw-axis -> pitch-axis geometry for a
+    # base-fixed camera.  The virtual screen test turns this off because a
+    # displayed target has no real-world range.
+    use_axis_geometry: bool = True
+
+    # Camera optical axis direction when both motor axes are at their
+    # calibrated zero.  Positive yaw points the camera view to the right of
+    # the yaw-zero forward direction; positive pitch points it upward.
+    camera_to_yaw_yaw_rad: float = 0.0
+    camera_to_yaw_pitch_rad: float = 0.0
+
+    # Position of the horizontal rotation axis, measured from the camera
+    # origin and expressed in camera coordinates (+x right, +y up, +z forward).
+    # Measure these on the vehicle after the camera is mounted.
+    yaw_axis_offset_x_m: float = 0.0
+    yaw_axis_offset_y_m: float = 0.0
+    yaw_axis_offset_z_m: float = 0.0
+
+    # Position of the vertical rotation axis from the horizontal axis at yaw
+    # zero, expressed in yaw-zero coordinates.  Most mounts have x ~= 0.
+    pitch_axis_offset_x_m: float = 0.0
+    pitch_axis_offset_y_m: float = 0.0
+    pitch_axis_offset_z_m: float = 0.0
+
     # Mechanical zero: direction of the launcher when the motor is at zero.
     yaw_zero_rad: float = 0.0
     pitch_zero_rad: float = 0.0
@@ -125,10 +149,24 @@ class TurretConfig:
             raise ValueError("hole diameters must be positive")
         if self.small_hole_diameter_m >= self.large_hole_diameter_m:
             raise ValueError("small_hole_diameter_m must be smaller than large")
+        geometry_values = (
+            self.camera_to_yaw_yaw_rad,
+            self.camera_to_yaw_pitch_rad,
+            self.yaw_axis_offset_x_m,
+            self.yaw_axis_offset_y_m,
+            self.yaw_axis_offset_z_m,
+            self.pitch_axis_offset_x_m,
+            self.pitch_axis_offset_y_m,
+            self.pitch_axis_offset_z_m,
+        )
+        if not all(math.isfinite(value) for value in geometry_values):
+            raise ValueError("camera and axis geometry values must be finite")
 
     @property
     def needs_distance(self) -> bool:
         """True when a correction cannot be applied without the target range."""
+        if self.use_axis_geometry and not self.camera_on_turret:
+            return True
         if self.compensate_gravity:
             return True
         return self.compensate_parallax and self.muzzle_offset != (0.0, 0.0, 0.0)
@@ -136,3 +174,19 @@ class TurretConfig:
     @property
     def muzzle_offset(self) -> tuple:
         return (self.muzzle_offset_x_m, self.muzzle_offset_y_m, self.muzzle_offset_z_m)
+
+    @property
+    def yaw_axis_offset(self) -> tuple:
+        return (
+            self.yaw_axis_offset_x_m,
+            self.yaw_axis_offset_y_m,
+            self.yaw_axis_offset_z_m,
+        )
+
+    @property
+    def pitch_axis_offset(self) -> tuple:
+        return (
+            self.pitch_axis_offset_x_m,
+            self.pitch_axis_offset_y_m,
+            self.pitch_axis_offset_z_m,
+        )

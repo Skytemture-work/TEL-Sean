@@ -3,6 +3,7 @@
 from .aiming import AimCommand, AimingController, TargetPixel
 from .controller import TurretController
 from .config import TurretConfig
+from .geometry import AxisAim, aim_angles_from_target, target_to_axis_aim
 
 __all__ = [
     "AimCommand",
@@ -10,4 +11,7 @@ __all__ = [
     "TargetPixel",
     "TurretController",
     "TurretConfig",
+    "AxisAim",
+    "aim_angles_from_target",
+    "target_to_axis_aim",
 ]
