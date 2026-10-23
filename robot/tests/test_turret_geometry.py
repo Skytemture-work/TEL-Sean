@@ -10,6 +10,10 @@ class TurretGeometryTests(unittest.TestCase):
         config = TurretConfig(
             image_width_px=1280,
             image_height_px=720,
+            yaw_zero_rad=0.0,
+            yaw_sign=1,
+            pitch_zero_rad=0.0,
+            pitch_sign=1,
             compensate_gravity=False,
         )
         yaw, pitch, result = aim_angles_from_target(640.0, 360.0, 5.0, config)
@@ -21,6 +25,10 @@ class TurretGeometryTests(unittest.TestCase):
         config = TurretConfig(
             image_width_px=1280,
             image_height_px=720,
+            yaw_zero_rad=0.0,
+            yaw_sign=1,
+            pitch_zero_rad=0.0,
+            pitch_sign=1,
             compensate_gravity=False,
         )
         yaw, pitch, _ = aim_angles_from_target(990.0, 10.0, 5.0, config)

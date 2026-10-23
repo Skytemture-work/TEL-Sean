@@ -27,6 +27,8 @@ class PositionCommand:
     motor_id: int
     position_rad: float
     max_speed_rad_s: float
+    velocity_rad_s: float = 0.0
+    torque_nm: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -37,6 +39,8 @@ class MotorState:
     position_rad: float
     velocity_rad_s: float
     torque_nm: float
+    # DAMIAO feedback ERR nibble: 0=disabled, 1=enabled, 8..E=fault.
+    err: Optional[int] = None
 
 
 class MotorBackend(Protocol):
@@ -197,6 +201,7 @@ class DamiaoSerialBackend:
         self._mc = DM_CAN.MotorControl(self._serial)
 
         self._motors: Dict[int, object] = {}
+        self._last: Dict[int, PositionCommand] = {}
         try:
             self._probe_and_build(motor_ids, master_ids)
             self._switch_modes()
@@ -206,8 +211,6 @@ class DamiaoSerialBackend:
         except Exception:
             self._serial.close()
             raise
-
-        self._last: Dict[int, PositionCommand] = {}
 
     # ---------------------------------------------------------------- setup
 
@@ -321,11 +324,7 @@ class DamiaoSerialBackend:
         while time.monotonic() < deadline:
             for motor_id, motor in self._motors.items():
                 position = startup_positions[motor_id]
-                if self.mode == "posvel":
-                    self._mc.control_Pos_Vel(motor, position, 0.2)
-                else:
-                    self._mc.controlMIT(motor, self.kp, self.kd, position, 0.0, 0.0)
-                self._last[motor_id] = PositionCommand(motor_id, position, 0.2)
+                self._send_target(motor_id, position, 0.2)
             self.refresh()
             time.sleep(0.005)
 
@@ -343,18 +342,69 @@ class DamiaoSerialBackend:
 
     # -------------------------------------------------------------- control
 
-    def set_position(self, motor_id: int, position_rad: float, max_speed_rad_s: float) -> None:
+    def _send_target(
+        self,
+        motor_id: int,
+        position_rad: float,
+        max_speed_rad_s: float,
+        velocity_rad_s: float = 0.0,
+        torque_nm: float = 0.0,
+    ) -> None:
+        """Send one frame without waiting for a serial response.
+
+        Several targets can therefore be put on the CAN bus back-to-back and
+        one feedback read can be done after the whole control cycle.  Waiting
+        after every axis command was the source of the visible stop-and-go
+        motion on the USB-CAN adapter.
+        """
         motor = self._motors.get(motor_id)
         if motor is None:
             raise KeyError(f"motor id {motor_id} was not configured; have {sorted(self._motors)}")
 
         speed = min(abs(max_speed_rad_s), self.vmax)
+        velocity = max(-self.vmax, min(self.vmax, float(velocity_rad_s)))
+        torque = max(-self.tmax, min(self.tmax, float(torque_nm)))
         if self.mode == "posvel":
-            self._mc.control_Pos_Vel(motor, float(position_rad), speed)
+            self._mc.control_Pos_Vel(motor, float(position_rad), speed, receive=False)
         else:
-            self._mc.controlMIT(motor, self.kp, self.kd, float(position_rad), 0.0, 0.0)
+            self._mc.controlMIT(
+                motor,
+                self.kp,
+                self.kd,
+                float(position_rad),
+                velocity,
+                torque,
+                receive=False,
+            )
 
-        self._last[motor_id] = PositionCommand(motor_id, float(position_rad), speed)
+        self._last[motor_id] = PositionCommand(
+            motor_id,
+            float(position_rad),
+            speed,
+            velocity,
+            torque,
+        )
+
+    def set_position(self, motor_id: int, position_rad: float, max_speed_rad_s: float) -> None:
+        """Queue a position command; call ``refresh()`` once per cycle."""
+        self._send_target(motor_id, position_rad, max_speed_rad_s)
+
+    def send_target(
+        self,
+        motor_id: int,
+        position_rad: float,
+        max_speed_rad_s: float,
+        velocity_rad_s: float = 0.0,
+        torque_nm: float = 0.0,
+    ) -> None:
+        """Queue a target with MIT velocity and torque feed-forward."""
+        self._send_target(
+            motor_id,
+            position_rad,
+            max_speed_rad_s,
+            velocity_rad_s,
+            torque_nm,
+        )
 
     def hold(self) -> None:
         """Re-send the last target for every motor.
@@ -375,16 +425,21 @@ class DamiaoSerialBackend:
             else:
                 position, speed = command.position_rad, command.max_speed_rad_s
 
-            if self.mode == "posvel":
-                self._mc.control_Pos_Vel(motor, position, speed)
-            else:
-                self._mc.controlMIT(motor, self.kp, self.kd, position, 0.0, 0.0)
+            self._send_target(
+                motor_id,
+                position,
+                speed,
+                command.velocity_rad_s if command is not None else 0.0,
+                command.torque_nm if command is not None else 0.0,
+            )
+        self._mc.recv()
 
     # ------------------------------------------------------------- feedback
 
     def refresh(self) -> None:
         for motor in self._motors.values():
-            self._mc.refresh_motor_status(motor)
+            self._mc.refresh_motor_status(motor, receive=False)
+        self._mc.recv()
 
     def get_state(self, motor_id: int) -> Optional[MotorState]:
         motor = self._motors.get(motor_id)
@@ -395,6 +450,7 @@ class DamiaoSerialBackend:
             position_rad=motor.getPosition(),
             velocity_rad_s=motor.getVelocity(),
             torque_nm=motor.getTorque(),
+            err=motor.getError(),
         )
 
     # ---------------------------------------------------------------- close

@@ -6,6 +6,26 @@ must be measured on the real mechanism before using the CAN backend.
 
 from dataclasses import dataclass
 import math
+from pathlib import Path
+
+from .pitch import load_pitch_calibration, load_yaw_calibration
+
+
+_DEFAULT_STARTUP_POSE = Path(__file__).with_name("startup_pose.json")
+_DEFAULT_YAW_CALIBRATION = load_yaw_calibration(_DEFAULT_STARTUP_POSE)
+_DEFAULT_PITCH_CALIBRATION = load_pitch_calibration(_DEFAULT_STARTUP_POSE)
+_DEFAULT_YAW_LIMITS = sorted(
+    (
+        _DEFAULT_YAW_CALIBRATION.motor_from_muzzle(math.radians(-35.0)),
+        _DEFAULT_YAW_CALIBRATION.motor_from_muzzle(math.radians(35.0)),
+    )
+)
+_DEFAULT_PITCH_LIMITS = sorted(
+    (
+        _DEFAULT_PITCH_CALIBRATION.motor_from_muzzle(0.0),
+        _DEFAULT_PITCH_CALIBRATION.motor_from_muzzle(math.radians(45.0)),
+    )
+)
 
 
 @dataclass(frozen=True)
@@ -52,18 +72,26 @@ class TurretConfig:
     pitch_axis_offset_z_m: float = 0.0
 
     # Mechanical zero: direction of the launcher when the motor is at zero.
-    yaw_zero_rad: float = 0.0
-    pitch_zero_rad: float = 0.0
+    # Defaults are read from startup_pose.json so a manual origin capture also
+    # applies to the autonomous controller on its next launch.
+    yaw_zero_rad: float = _DEFAULT_YAW_CALIBRATION.motor_zero_rad
+    pitch_zero_rad: float = _DEFAULT_PITCH_CALIBRATION.motor_zero_rad
 
     # Change these to -1 if the installed motor direction is reversed.
-    yaw_sign: int = 1
-    pitch_sign: int = 1
+    # Motor feedback decreases when the turret turns physically right.
+    yaw_sign: int = _DEFAULT_YAW_CALIBRATION.motor_sign
+    # Motor feedback increases while this mechanism lowers the muzzle.
+    pitch_sign: int = _DEFAULT_PITCH_CALIBRATION.motor_sign
 
     # Mechanical safety limits.  These are deliberately conservative defaults.
-    yaw_min_rad: float = math.radians(-80.0)
-    yaw_max_rad: float = math.radians(80.0)
-    pitch_min_rad: float = math.radians(-20.0)
-    pitch_max_rad: float = math.radians(35.0)
+    # Numeric encoder limits: physical +35 deg right is the lower coordinate,
+    # physical -35 deg left is the upper coordinate because yaw_sign=-1.
+    yaw_min_rad: float = _DEFAULT_YAW_LIMITS[0]
+    yaw_max_rad: float = _DEFAULT_YAW_LIMITS[1]
+    # Numeric motor-space limits corresponding to physical muzzle 45..0 deg.
+    # (pitch_sign=-1, so the upper muzzle pose has the lower motor coordinate.)
+    pitch_min_rad: float = _DEFAULT_PITCH_LIMITS[0]
+    pitch_max_rad: float = _DEFAULT_PITCH_LIMITS[1]
 
     # Position-mode command limit.  This is not the baseball launch speed.
     max_motor_speed_rad_s: float = 1.0

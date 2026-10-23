@@ -18,6 +18,9 @@ class Motor:
         self.state_q = float(0)
         self.state_dq = float(0)
         self.state_tau = float(0)
+        # Feedback D[1] is ID | (ERR << 4).  Keep ERR instead of dropping it
+        # so callers can distinguish the commanded state from the real state.
+        self.state_err = None
         self.SlaveID = SlaveID
         self.MasterID = MasterID
         self.MotorType = MotorType
@@ -25,10 +28,12 @@ class Motor:
         self.NowControlMode = Control_Type.MIT
         self.temp_param_dict = {}
 
-    def recv_data(self, q: float, dq: float, tau: float):
+    def recv_data(self, q: float, dq: float, tau: float, err=None):
         self.state_q = q
         self.state_dq = dq
         self.state_tau = tau
+        if err is not None:
+            self.state_err = int(err)
 
     def getPosition(self):
         """
@@ -50,6 +55,10 @@ class Motor:
         :return: the torque of the motor 电机力矩
         """
         return self.state_tau
+
+    def getError(self):
+        """Return the motor ERR nibble from the latest feedback frame."""
+        return self.state_err
 
     def getParam(self, RID):
         """
@@ -87,7 +96,16 @@ class MotorControl:
             serial_device.close()
         self.serial_.open()
 
-    def controlMIT(self, DM_Motor, kp: float, kd: float, q: float, dq: float, tau: float):
+    def controlMIT(
+        self,
+        DM_Motor,
+        kp: float,
+        kd: float,
+        q: float,
+        dq: float,
+        tau: float,
+        receive: bool = True,
+    ):
         """
         MIT Control Mode Function 达妙电机MIT控制模式函数
         :param DM_Motor: Motor object 电机对象
@@ -96,6 +114,7 @@ class MotorControl:
         :param q:  position  期望位置
         :param dq:  velocity  期望速度
         :param tau: torque  期望力矩
+        :param receive: whether to read feedback immediately after sending
         :return: None
         """
         if DM_Motor.SlaveID not in self.motors_map:
@@ -120,7 +139,8 @@ class MotorControl:
         data_buf[6] = ((kd_uint & 0xf) << 4) | ((tau_uint >> 8) & 0xf)
         data_buf[7] = tau_uint & 0xff
         self.__send_data(DM_Motor.SlaveID, data_buf)
-        self.recv()  # receive the data from serial port
+        if receive:
+            self.recv()  # receive the data from serial port
 
     def control_delay(self, DM_Motor, kp: float, kd: float, q: float, dq: float, tau: float, delay: float):
         """
@@ -136,12 +156,13 @@ class MotorControl:
         self.controlMIT(DM_Motor, kp, kd, q, dq, tau)
         sleep(delay)
 
-    def control_Pos_Vel(self, Motor, P_desired: float, V_desired: float):
+    def control_Pos_Vel(self, Motor, P_desired: float, V_desired: float, receive: bool = True):
         """
         control the motor in position and velocity control mode 电机位置速度控制模式
         :param Motor: Motor object 电机对象
         :param P_desired: desired position 期望位置
         :param V_desired: desired velocity 期望速度
+        :param receive: whether to read feedback immediately after sending
         :return: None
         """
         if Motor.SlaveID not in self.motors_map:
@@ -155,13 +176,15 @@ class MotorControl:
         data_buf[4:8] = V_desired_uint8s
         self.__send_data(motorid, data_buf)
         # time.sleep(0.001)
-        self.recv()  # receive the data from serial port
+        if receive:
+            self.recv()  # receive the data from serial port
 
-    def control_Vel(self, Motor, Vel_desired):
+    def control_Vel(self, Motor, Vel_desired, receive: bool = True):
         """
         control the motor in velocity control mode 电机速度控制模式
         :param Motor: Motor object 电机对象
         :param Vel_desired: desired velocity 期望速度
+        :param receive: whether to read feedback immediately after sending
         """
         if Motor.SlaveID not in self.motors_map:
             print("control_VEL ERROR : Motor ID not found")
@@ -171,7 +194,8 @@ class MotorControl:
         Vel_desired_uint8s = float_to_uint8s(Vel_desired)
         data_buf[0:4] = Vel_desired_uint8s
         self.__send_data(motorid, data_buf)
-        self.recv()  # receive the data from serial port
+        if receive:
+            self.recv()  # receive the data from serial port
 
     def control_pos_force(self, Motor, Pos_des: float, Vel_des, i_des):
         """
@@ -259,6 +283,11 @@ class MotorControl:
 
     def __process_packet(self, data, CANID, CMD):
         if CMD == 0x11:
+            # Feedback D[0] is ID | ERR<<4.  D[1] starts the position field.
+            # The configured motor IDs on this robot are in the low nibble
+            # (0x01 and 0x03), while ERR is the high nibble (0=disabled,
+            # 1=enabled, 8..E=fault states).
+            feedback_err = int(data[0]) >> 4
             if CANID != 0x00:
                 if CANID in self.motors_map:
                     q_uint = np.uint16((np.uint16(data[1]) << 8) | data[2])
@@ -271,7 +300,7 @@ class MotorControl:
                     recv_q = uint_to_float(q_uint, -Q_MAX, Q_MAX, 16)
                     recv_dq = uint_to_float(dq_uint, -DQ_MAX, DQ_MAX, 12)
                     recv_tau = uint_to_float(tau_uint, -TAU_MAX, TAU_MAX, 12)
-                    self.motors_map[CANID].recv_data(recv_q, recv_dq, recv_tau)
+                    self.motors_map[CANID].recv_data(recv_q, recv_dq, recv_tau, feedback_err)
             else:
                 MasterID=data[0] & 0x0f
                 if MasterID in self.motors_map:
@@ -285,7 +314,7 @@ class MotorControl:
                     recv_q = uint_to_float(q_uint, -Q_MAX, Q_MAX, 16)
                     recv_dq = uint_to_float(dq_uint, -DQ_MAX, DQ_MAX, 12)
                     recv_tau = uint_to_float(tau_uint, -TAU_MAX, TAU_MAX, 12)
-                    self.motors_map[MasterID].recv_data(recv_q, recv_dq, recv_tau)
+                    self.motors_map[MasterID].recv_data(recv_q, recv_dq, recv_tau, feedback_err)
 
 
     def __process_set_param_packet(self, data, CANID, CMD):
@@ -405,7 +434,7 @@ class MotorControl:
         self.Limit_Param[Motor_Type][1] = VMAX
         self.Limit_Param[Motor_Type][2] = TMAX
 
-    def refresh_motor_status(self,Motor):
+    def refresh_motor_status(self, Motor, receive: bool = True):
         """
         get the motor status 获得电机状态
         """
@@ -413,7 +442,8 @@ class MotorControl:
         can_id_h = (Motor.SlaveID >> 8) & 0xff  #id high 8 bits
         data_buf = np.array([np.uint8(can_id_l), np.uint8(can_id_h), 0xCC, 0x00, 0x00, 0x00, 0x00, 0x00], np.uint8)
         self.__send_data(0x7FF, data_buf)
-        self.recv()  # receive the data from serial port
+        if receive:
+            self.recv()  # receive the data from serial port
 
     def change_motor_param(self, Motor, RID, data):
         """

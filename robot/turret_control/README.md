@@ -82,6 +82,23 @@ from __future__ import annotations
 ## 執行
 
 ```bash
+# 連續平滑移動（MIT：位置 + 速度前饋，實機前確認急停可用）
+python3 -m turret_control.run_manual_move --yaw 10 --pitch 15 --speed 0.30
+# 若垂直軸受機構重量影響而有靜摩擦，可逐步小量調整力矩前饋
+python3 -m turret_control.run_manual_move --pitch 15 --pitch-tau-ff -3.0
+
+# 砲塔雙軸手動控制面板：預設失能，直接輸入實體角度（度）
+python3 -m turret_control.run_vertical_panel
+# SSH／無螢幕環境可強制使用終端介面
+python3 -m turret_control.run_vertical_panel --cli
+# 例如在 CLI 輸入 `set 15`，砲口會平滑移到 +15°
+# `yaw 30` 向右 30°，`yaw -20` 向左 20°
+# `aim 20 15` 讓水平與垂直在同一控制週期開始移向 +20° / +15°
+# `enable` 後會直接詢問垂直、水平目標；之後輸入 `move` 可再次開啟相同問答
+# CLI 的 `enable` 與 `disable` 會直接執行，不需要再輸入 `yes`
+# 垂直軸預設使用實機已驗證可移動的位置－速度模式；必要時才覆寫為 MIT
+python3 -m turret_control.run_vertical_panel --cli --control-mode mit
+
 # 角度模擬（不碰硬體）
 python3 -m turret_control.run_demo --u 900 --v 200 --distance 5
 
@@ -101,8 +118,47 @@ python3 -m turret_control.run_yolo_demo --board --device cpu --zed-uvc
 # 預覽視窗按 p 可在終端列印目前完整計畫，按 q/Esc 離開
 
 # 測試
-python3 -m unittest discover -s tests -t .
+python3 -m unittest discover -s tests
 ```
+
+垂直面板預設使用實機已驗證可移動的 `posvel` 位置－速度模式，外層仍使用加速度限制的
+連續軌跡（預設速度 `0.06 rad/s`、加速度 `0.05 rad/s²`），並將命令最大領先實際位置限在 10°，
+避免機構落後時累積大量位置誤差後突然跳動。預設 `kp=50`、`kd=1.5`、
+重力補償前饋 `0 Nm`（非零值會在使能後 1.5 秒漸增，必須先實機確認方向）；若 2 秒內移動不到 0.25°，
+會顯示停滯警告但保留原目標，不再偷偷改成目前位置。終端與面板會同時顯示實際扭矩及
+命令－回饋誤差，方便區分控制命令、負載與馬達回饋。每次使能只會先保持當前位置，
+必須再輸入一次目標才會移動。
+
+面板輸入的是**物理砲口仰角**，換算式為
+`馬達角 = 水平砲口馬達角 + 方向 × 機構比例 × 砲口仰角`。
+校正值放在 `startup_pose.json`：目前水平砲口約為 `+0.249997 rad`、方向為 `-1`、
+直驅比例為 `1.0`。若日後加入連桿或齒輪，請先更新
+`motor_rad_per_muzzle_rad`；也可用 `--pitch-sign` 和
+`--motor-rad-per-muzzle-rad` 暫時覆寫。砲口仰角安全範圍固定為 `0°～45°`；
+`--min-angle`／`--max-angle` 只能在這個範圍內再縮小，不能放寬。
+畫面中的馬達角是編碼器**絕對座標**，正負號不是移動方向；例如砲口從
+`+15°` 回到 `0°` 時，垂直馬達目標會增加約 `15°`，砲口則持續向下回到水平。
+若在前一個目標尚未到達時改目標，控制器會先按加速度上限煞車，再連續反轉。
+
+同一程序會同時保持水平與垂直兩顆馬達。水平輸入是以目前正前方校正點為 `0°` 的
+絕對角度，正值向右、負值向左，固定限制為 `-35°～+35°`（總行程 70°）。水平安全聯鎖使用垂直馬達
+實際回饋：砲口仰角 `≤35°` 才允許水平移動。高於 `35°` 時若收到水平目標，控制器會
+先降低垂直；回饋確認到達 `35.0°` 或更低後，水平立即開始、垂直繼續同時移動。
+若最終垂直目標仍高於 `35°`，會先以 `34.5°` 作為安全中繼點；確認水平與垂直都到達
+中繼姿態後，再回到最終垂直角度。`home` 使用相同流程回到水平 `0°`、垂直原點 `45°`。
+實機方向校正為 `yaw_sign=-1`：
+馬達編碼器角度減少時，砲塔實際向右。
+
+CLI 的 `aim <水平角度> <垂直角度>` 在目前與目標垂直角度都不高於 `35°` 時，會讓兩軸在
+下一個 200 Hz 控制週期一起開始平滑作動；需要跨越高角度區時則自動改用上述三階段避讓流程。
+`enable` 與 `disable` 會在輸入後直接執行，不會再要求輸入 `yes`；其中 `disable`
+可能讓垂直軸下墜，輸入前仍需先支撐機構。一般的 `set`、`yaw`、`aim` 也都不需要確認。
+
+若機械原點有偏差，可在 CLI 輸入 `calibrate`。程式會先要求確認並失能兩軸；確認
+兩顆 ERR 都是 0 後，手動把機構放到「水平 0°、垂直初始 45°」，再輸入
+`capture-origin` 並二次確認。程式只更新軟體校正檔，不改馬達內部零點；舊的
+`startup_pose.json` 會備份成 `startup_pose.json.bak`。擷取後維持失能，必須等人員
+離開機構才可重新 `enable`。
 
 `--board` 模式只開相機與 YOLO，不開 CAN、不建立馬達控制器；必須偵測到 12
 個孔且尺寸分類成功，畫面才會顯示 `BOARD READY`。這是接上真機構前的影像流程驗證。
@@ -143,9 +199,9 @@ python3 -m unittest discover -s tests -t .
 | 參數 | 現值 | 要怎麼得到 |
 |---|---|---|
 | `focal_length_x/y_px` | 700.0 | 相機標定 |
-| `yaw_zero_rad` / `pitch_zero_rad` | 0.0 | 機械零點對位 |
-| `yaw_sign` / `pitch_sign` | 1 | 馬達裝上去後看轉向 |
-| `yaw_min/max`、`pitch_min/max` | ±80° / −20°~35° | 機構實際行程 |
+| `yaw_zero_rad` / `pitch_zero_rad` | 由 `startup_pose.json` 載入 | 手動校正後於下次啟動自動套用 |
+| `yaw_sign` / `pitch_sign` | 1 / −1 | 垂直方向已確認為馬達角增加時砲口下降 |
+| `yaw_min/max`、`pitch_min/max` | ±80° / 砲口 0°~45° | 垂直範圍已依需求固定；水平仍須確認機構實際行程 |
 | `camera_to_yaw_yaw/pitch_rad` | 0.0 | 炮塔零點時，相機光軸相對水平軸的偏角 |
 | `yaw_axis_offset_x/y/z_m` | 0.0 | 量相機原點到水平關節原點，使用相機座標 |
 | `pitch_axis_offset_x/y/z_m` | 0.0 | 量水平關節到垂直關節，使用水平零點座標 |

@@ -1,12 +1,13 @@
 """Interactive manual move for the two DAMIAO turret motors.
 
-Positive angles are the controller's positive direction; negative angles move
-the opposite way.  Angles are relative to the current feedback position.
+Yaw is relative to the current feedback position.  Pitch is the absolute
+physical muzzle elevation and is limited to 0..45 degrees.
 
 Examples::
 
     python3 -m turret_control.run_manual_move
-    python3 -m turret_control.run_manual_move --yaw 180 --pitch 90
+    python3 -m turret_control.run_manual_move --yaw 180 --pitch 15
+    python3 -m turret_control.run_manual_move --pitch 0
 """
 
 from __future__ import annotations
@@ -14,9 +15,17 @@ from __future__ import annotations
 import argparse
 import math
 import time
+from pathlib import Path
 from typing import Optional
 
 from .backends import DamiaoSerialBackend
+from .pitch import load_pitch_calibration
+from .trajectory import smoothstep_sample
+
+
+DEFAULT_STARTUP_POSE = Path(__file__).with_name("startup_pose.json")
+MIN_MUZZLE_ELEVATION_DEG = 0.0
+MAX_MUZZLE_ELEVATION_DEG = 45.0
 
 
 def angle_or_prompt(value: Optional[float], label: str) -> float:
@@ -33,23 +42,37 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="輸入水平／垂直角度，讓兩顆馬達同步轉動")
     parser.add_argument("--port", default="/dev/ttyACM0")
     parser.add_argument("--yaw", type=float, help="水平相對角度，單位度")
-    parser.add_argument("--pitch", type=float, help="垂直相對角度，單位度")
+    parser.add_argument("--pitch", type=float, help="物理砲口絕對仰角，0 到 45 度")
+    parser.add_argument("--startup-pose", type=Path, default=DEFAULT_STARTUP_POSE)
     parser.add_argument("--speed", type=float, default=0.30, help="最大速度 rad/s")
+    parser.add_argument("--kp", type=float, default=30.0, help="MIT 位置增益")
+    parser.add_argument("--kd", type=float, default=1.0, help="MIT 速度阻尼")
+    parser.add_argument("--yaw-tau-ff", type=float, default=0.0, help="水平力矩前饋 Nm")
+    parser.add_argument("--pitch-tau-ff", type=float, default=0.0, help="垂直力矩前饋 Nm")
     args = parser.parse_args()
 
     yaw_deg = angle_or_prompt(args.yaw, "水平")
-    pitch_deg = angle_or_prompt(args.pitch, "垂直")
+    pitch_deg = angle_or_prompt(args.pitch, "垂直砲口目標")
     if args.speed <= 0:
         raise SystemExit("--speed 必須大於 0")
+    if args.kp < 0 or args.kd <= 0:
+        raise SystemExit("--kp 必須 >= 0，--kd 必須 > 0")
+    if not math.isfinite(pitch_deg) or not (
+        MIN_MUZZLE_ELEVATION_DEG
+        <= pitch_deg
+        <= MAX_MUZZLE_ELEVATION_DEG
+    ):
+        raise SystemExit("垂直砲口仰角必須在 0° 到 45° 之間")
 
     yaw_delta = math.radians(yaw_deg)
-    pitch_delta = math.radians(pitch_deg)
+    pitch_calibration = load_pitch_calibration(args.startup_pose)
+    pitch_target = pitch_calibration.motor_from_muzzle(math.radians(pitch_deg))
     motors = DamiaoSerialBackend(
         motor_ids=[0x03, 0x01],
         port=args.port,
         mode="mit",
-        kp=5.0,
-        kd=1.0,
+        kp=args.kp,
+        kd=args.kd,
         enable_on_start=False,
     )
     try:
@@ -60,24 +83,50 @@ def main() -> None:
             raise RuntimeError("讀不到兩顆馬達回饋")
 
         start = {0x03: yaw.position_rad, 0x01: pitch.position_rad}
-        target = {0x03: start[0x03] + yaw_delta, 0x01: start[0x01] + pitch_delta}
+        target = {0x03: start[0x03] + yaw_delta, 0x01: pitch_target}
+        pitch_delta = target[0x01] - start[0x01]
         print(
-            f"水平 {yaw_deg:+.1f}°，垂直 {pitch_deg:+.1f}°；"
-            f"速度上限 {args.speed:.2f} rad/s"
+            f"水平相對 {yaw_deg:+.1f}°，砲口目標 {pitch_deg:+.1f}°；"
+            f"垂直馬達目標 {pitch_target:+.6f} rad；"
+            f"速度上限 {args.speed:.2f} rad/s；"
+            f"力矩前饋 yaw={args.yaw_tau_ff:+.2f} Nm，pitch={args.pitch_tau_ff:+.2f} Nm"
         )
         input("確認機構安全後按 Enter 開始，Ctrl+C 可停止：")
 
         motors.enable()
-        duration = max(abs(yaw_delta), abs(pitch_delta)) / args.speed + 1.0
+        # smoothstep's peak speed is 1.5 * distance / duration.  The 1.5
+        # factor keeps the requested dq feed-forward within --speed.
+        duration = max(
+            1.5 * max(abs(yaw_delta), abs(pitch_delta)) / args.speed,
+            0.25,
+        )
         start_time = time.monotonic()
         next_tick = start_time
-        while time.monotonic() - start_time < duration:
+        while True:
             elapsed = time.monotonic() - start_time
-            progress = min(elapsed / max(duration - 1.0, 0.1), 1.0)
-            smooth = progress * progress * (3.0 - 2.0 * progress)
-            motors.set_position(0x03, start[0x03] + yaw_delta * smooth, args.speed)
-            motors.set_position(0x01, start[0x01] + pitch_delta * smooth, args.speed)
+            yaw_position, yaw_velocity = smoothstep_sample(
+                start[0x03], target[0x03], elapsed, duration
+            )
+            pitch_position, pitch_velocity = smoothstep_sample(
+                start[0x01], target[0x01], elapsed, duration
+            )
+            motors.send_target(
+                0x03,
+                yaw_position,
+                args.speed,
+                velocity_rad_s=yaw_velocity,
+                torque_nm=args.yaw_tau_ff,
+            )
+            motors.send_target(
+                0x01,
+                pitch_position,
+                args.speed,
+                velocity_rad_s=pitch_velocity,
+                torque_nm=args.pitch_tau_ff,
+            )
             motors.refresh()
+            if elapsed >= duration:
+                break
             next_tick += 0.005
             delay = next_tick - time.monotonic()
             if delay > 0:
@@ -86,8 +135,12 @@ def main() -> None:
                 next_tick = time.monotonic()
 
         for _ in range(40):
-            motors.set_position(0x03, target[0x03], args.speed)
-            motors.set_position(0x01, target[0x01], args.speed)
+            motors.send_target(
+                0x03, target[0x03], args.speed, torque_nm=args.yaw_tau_ff
+            )
+            motors.send_target(
+                0x01, target[0x01], args.speed, torque_nm=args.pitch_tau_ff
+            )
             motors.refresh()
             time.sleep(0.005)
         print("完成，兩顆馬達維持目標位置。")
