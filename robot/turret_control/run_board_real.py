@@ -135,6 +135,7 @@ def main() -> None:
         kp=5.0,
         kd=1.0,
         enable_on_start=False,
+        position_limits=config.motor_limits,
     )
     turret = TurretController(config, motors)
     driver = BoardEngagement(config, turret, shot_cooldown_s=args.cooldown)

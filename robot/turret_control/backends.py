@@ -10,11 +10,23 @@ vendor library ``DM_CAN.py``, which is already verified working on this AGX.
 
 from __future__ import annotations
 
+import math
 import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Protocol, Sequence
+from typing import Dict, Iterable, List, Mapping, Optional, Protocol, Sequence, Tuple
+
+from .limits import (
+    WorkspaceLimit,
+    clamp_motor_position,
+    clamp_workspace_target,
+    load_motor_limits,
+    load_workspace_limit,
+    workspace_base_contains,
+    workspace_contains,
+    workspace_in_home_corridor,
+)
 
 DEFAULT_BAUD = 921600
 
@@ -158,6 +170,8 @@ class DamiaoSerialBackend:
         dm_path: Optional[Path] = None,
         enable_on_start: bool = True,
         startup_hold_s: float = 0.5,
+        position_limits: Optional[Mapping[int, Tuple[float, float]]] = None,
+        workspace: Optional[WorkspaceLimit] = None,
     ):
         import serial
 
@@ -192,6 +206,36 @@ class DamiaoSerialBackend:
         self.kp = kp
         self.kd = kd
         self.startup_hold_s = startup_hold_s
+        if position_limits is None:
+            try:
+                position_limits = load_motor_limits()
+            except FileNotFoundError as exc:
+                raise RuntimeError(
+                    "mechanism_limits.json is missing; run "
+                    "turret_control.run_limit_calibration before enabling motors"
+                ) from exc
+        self._position_limits = {
+            int(motor_id): (float(bounds[0]), float(bounds[1]))
+            for motor_id, bounds in position_limits.items()
+        }
+        for motor_id, bounds in self._position_limits.items():
+            if bounds[0] >= bounds[1] or not all(math.isfinite(value) for value in bounds):
+                raise ValueError(f"invalid motor position limits for 0x{motor_id:02X}")
+        self._last_limit_notice: Dict[int, Tuple[float, float]] = {}
+        if workspace is None:
+            workspace = load_workspace_limit()
+        self._workspace = workspace
+        if self._workspace is not None:
+            required_ids = {
+                self._workspace.yaw_motor_id,
+                self._workspace.pitch_motor_id,
+            }
+            if not required_ids.issubset(set(motor_ids)):
+                raise RuntimeError(
+                    "non-rectangular workspace needs both yaw and pitch motors; "
+                    "do not control either axis without the other feedback"
+                )
+        self._last_workspace_notice: Optional[Tuple[float, float, float]] = None
 
         motor_type = getattr(DM_CAN.DM_Motor_Type, motor_type_name)
         self._motor_type = motor_type
@@ -312,9 +356,20 @@ class DamiaoSerialBackend:
         startup_positions = {}
         for motor_id in self._motors:
             state = self.get_state(motor_id)
-            if state is None:
+            if state is None or state.err is None:
                 raise RuntimeError(f"no feedback from motor 0x{motor_id:02X} before enable")
             startup_positions[motor_id] = state.position_rad
+
+        workspace = getattr(self, "_workspace", None)
+        if workspace is not None and not workspace_contains(
+            workspace,
+            startup_positions[workspace.yaw_motor_id],
+            startup_positions[workspace.pitch_motor_id],
+        ):
+            raise RuntimeError(
+                "current yaw/pitch pose is outside the recorded safe workspace; "
+                "move it by hand to the recorded interior before enabling"
+            )
 
         for motor in self._motors.values():
             self._mc.enable(motor)
@@ -322,9 +377,12 @@ class DamiaoSerialBackend:
 
         deadline = time.monotonic() + self.startup_hold_s
         while time.monotonic() < deadline:
-            for motor_id, motor in self._motors.items():
-                position = startup_positions[motor_id]
-                self._send_target(motor_id, position, 0.2)
+            self.send_targets(
+                {
+                    motor_id: (position, 0.2, 0.0, 0.0)
+                    for motor_id, position in startup_positions.items()
+                }
+            )
             self.refresh()
             time.sleep(0.005)
 
@@ -361,17 +419,36 @@ class DamiaoSerialBackend:
         if motor is None:
             raise KeyError(f"motor id {motor_id} was not configured; have {sorted(self._motors)}")
 
+        position = float(position_rad)
+        limits = self._position_limits.get(motor_id)
+        if limits is not None:
+            position, clipped = clamp_motor_position(position, limits)
+            if clipped:
+                now = time.monotonic()
+                previous = self._last_limit_notice.get(motor_id)
+                if (
+                    previous is None
+                    or abs(previous[0] - position) > 1e-9
+                    or now - previous[1] > 2.0
+                ):
+                    print(
+                        f"[SAFETY LIMIT] motor 0x{motor_id:02X}: "
+                        f"target {position_rad:+.6f} rad -> {position:+.6f} rad",
+                        flush=True,
+                    )
+                self._last_limit_notice[motor_id] = (position, now)
+
         speed = min(abs(max_speed_rad_s), self.vmax)
         velocity = max(-self.vmax, min(self.vmax, float(velocity_rad_s)))
         torque = max(-self.tmax, min(self.tmax, float(torque_nm)))
         if self.mode == "posvel":
-            self._mc.control_Pos_Vel(motor, float(position_rad), speed, receive=False)
+            self._mc.control_Pos_Vel(motor, position, speed, receive=False)
         else:
             self._mc.controlMIT(
                 motor,
                 self.kp,
                 self.kd,
-                float(position_rad),
+                position,
                 velocity,
                 torque,
                 receive=False,
@@ -379,15 +456,152 @@ class DamiaoSerialBackend:
 
         self._last[motor_id] = PositionCommand(
             motor_id,
-            float(position_rad),
+            position,
             speed,
             velocity,
             torque,
         )
 
+    def send_targets(
+        self,
+        targets: Mapping[int, Tuple[float, float, float, float]],
+    ) -> None:
+        """Send a coordinated batch of yaw/pitch targets.
+
+        Values are ``(position_rad, speed_rad_s, velocity_rad_s, torque_nm)``.
+        With a traced workspace present, both axes are checked together and an
+        unsafe pair is stopped at the first recorded boundary instead of being
+        independently clamped into an unsafe rectangle.
+        """
+
+        prepared: Dict[int, Tuple[float, float, float, float]] = {}
+        for motor_id, values in targets.items():
+            if len(values) != 4:
+                raise ValueError("each target must be (position, speed, velocity, torque)")
+            position, speed, velocity, torque = values
+            if motor_id not in self._motors:
+                raise KeyError(
+                    f"motor id {motor_id} was not configured; have {sorted(self._motors)}"
+                )
+            limits = self._position_limits.get(motor_id)
+            if limits is not None:
+                position, _ = clamp_motor_position(float(position), limits)
+            prepared[motor_id] = (position, speed, velocity, torque)
+
+        workspace = getattr(self, "_workspace", None)
+        if workspace is not None:
+            yaw_id = workspace.yaw_motor_id
+            pitch_id = workspace.pitch_motor_id
+
+            def previous_position(motor_id: int, anchor_index: int) -> float:
+                # While enabled, safety decisions must use actual feedback.
+                # Commanded position can be far ahead of a gravity-loaded axis;
+                # using it here could unlock yaw before pitch has really lowered.
+                if getattr(self, "_enabled", False):
+                    state = self.get_state(motor_id)
+                    if (
+                        state is not None
+                        and state.err is not None
+                        and state.err < 0x8
+                        and math.isfinite(state.position_rad)
+                    ):
+                        return state.position_rad
+                command = self._last.get(motor_id)
+                if command is not None:
+                    return command.position_rad
+                state = self.get_state(motor_id)
+                if (
+                    state is not None
+                    and state.err is not None
+                    and math.isfinite(state.position_rad)
+                ):
+                    return state.position_rad
+                return workspace.anchor[anchor_index]
+
+            def fallback_target(motor_id: int, anchor_index: int) -> Tuple[float, float, float, float]:
+                command = self._last.get(motor_id)
+                if command is not None:
+                    return (
+                        command.position_rad,
+                        command.max_speed_rad_s,
+                        command.velocity_rad_s,
+                        command.torque_nm,
+                    )
+                return (previous_position(motor_id, anchor_index), 0.2, 0.0, 0.0)
+
+            if yaw_id not in prepared:
+                prepared[yaw_id] = fallback_target(yaw_id, 0)
+            if pitch_id not in prepared:
+                prepared[pitch_id] = fallback_target(pitch_id, 1)
+            previous_yaw = previous_position(yaw_id, 0)
+            previous_pitch = previous_position(pitch_id, 1)
+            requested_yaw = prepared[yaw_id][0]
+            requested_pitch = prepared[pitch_id][0]
+            original_requested_yaw = requested_yaw
+            original_requested_pitch = requested_pitch
+            staged_for_home = False
+            corridor = workspace.home_corridor
+            if corridor is not None:
+                previous_in_corridor = workspace_in_home_corridor(
+                    workspace, previous_yaw, previous_pitch
+                )
+                requested_in_corridor = workspace_in_home_corridor(
+                    workspace, requested_yaw, requested_pitch
+                )
+                previous_in_base = workspace_base_contains(
+                    workspace, previous_yaw, previous_pitch
+                )
+                yaw_is_centered = (
+                    abs(previous_yaw - corridor.yaw_center_rad)
+                    <= corridor.yaw_tolerance_rad
+                )
+                if previous_in_corridor and not previous_in_base and not requested_in_corridor:
+                    # Leaving 45-degree home: lower vertically into the traced
+                    # base before permitting any horizontal movement.
+                    requested_yaw = corridor.yaw_center_rad
+                    staged_for_home = True
+                elif requested_in_corridor and not previous_in_corridor and not yaw_is_centered:
+                    # Returning home: center yaw at the current safe low pitch,
+                    # then permit the vertical rise on a later control cycle.
+                    requested_yaw = corridor.yaw_center_rad
+                    requested_pitch = previous_pitch
+                    staged_for_home = True
+            (safe_yaw, safe_pitch), clipped = clamp_workspace_target(
+                workspace,
+                previous_yaw,
+                previous_pitch,
+                requested_yaw,
+                requested_pitch,
+            )
+            clipped = clipped or staged_for_home
+            if clipped:
+                now = time.monotonic()
+                notice = getattr(self, "_last_workspace_notice", None)
+                if (
+                    notice is None
+                    or abs(notice[0] - safe_yaw) > math.radians(0.25)
+                    or abs(notice[1] - safe_pitch) > math.radians(0.25)
+                    or now - notice[2] > 2.0
+                ):
+                    print(
+                        "[SAFETY WORKSPACE] yaw/pitch target "
+                        f"({original_requested_yaw:+.6f}, {original_requested_pitch:+.6f}) -> "
+                        f"({safe_yaw:+.6f}, {safe_pitch:+.6f})",
+                        flush=True,
+                    )
+                self._last_workspace_notice = (safe_yaw, safe_pitch, now)
+            yaw_values = prepared[yaw_id]
+            pitch_values = prepared[pitch_id]
+            prepared[yaw_id] = (safe_yaw, yaw_values[1], yaw_values[2], yaw_values[3])
+            prepared[pitch_id] = (safe_pitch, pitch_values[1], pitch_values[2], pitch_values[3])
+
+        for motor_id in sorted(prepared):
+            position, speed, velocity, torque = prepared[motor_id]
+            self._send_target(motor_id, position, speed, velocity, torque)
+
     def set_position(self, motor_id: int, position_rad: float, max_speed_rad_s: float) -> None:
         """Queue a position command; call ``refresh()`` once per cycle."""
-        self._send_target(motor_id, position_rad, max_speed_rad_s)
+        self.send_targets({motor_id: (position_rad, max_speed_rad_s, 0.0, 0.0)})
 
     def send_target(
         self,
@@ -398,12 +612,15 @@ class DamiaoSerialBackend:
         torque_nm: float = 0.0,
     ) -> None:
         """Queue a target with MIT velocity and torque feed-forward."""
-        self._send_target(
-            motor_id,
-            position_rad,
-            max_speed_rad_s,
-            velocity_rad_s,
-            torque_nm,
+        self.send_targets(
+            {
+                motor_id: (
+                    position_rad,
+                    max_speed_rad_s,
+                    velocity_rad_s,
+                    torque_nm,
+                )
+            }
         )
 
     def hold(self) -> None:
@@ -414,24 +631,24 @@ class DamiaoSerialBackend:
         must call this on every tick where no new target is available instead
         of simply sending nothing.
         """
+        targets = {}
         for motor_id, motor in self._motors.items():
             command = self._last.get(motor_id)
             if command is None:
                 self.refresh()
                 state = self.get_state(motor_id)
-                if state is None:
+                if state is None or state.err is None:
                     continue
-                position, speed = state.position_rad, 0.5
+                targets[motor_id] = (state.position_rad, 0.5, 0.0, 0.0)
             else:
-                position, speed = command.position_rad, command.max_speed_rad_s
-
-            self._send_target(
-                motor_id,
-                position,
-                speed,
-                command.velocity_rad_s if command is not None else 0.0,
-                command.torque_nm if command is not None else 0.0,
-            )
+                targets[motor_id] = (
+                    command.position_rad,
+                    command.max_speed_rad_s,
+                    command.velocity_rad_s,
+                    command.torque_nm,
+                )
+        if targets:
+            self.send_targets(targets)
         self._mc.recv()
 
     # ------------------------------------------------------------- feedback
@@ -455,24 +672,29 @@ class DamiaoSerialBackend:
 
     # ---------------------------------------------------------------- close
 
-    def close(self) -> None:
+    def close(self, send_hold: bool = True) -> None:
         """Ramp the command to the present pose, then disable and close.
 
         Disabling drops an unbalanced vertical axis, so this only removes the
         software hold; the mechanism still needs its own counterweight or
         mechanical stop.
+
+        ``send_hold=False`` is used by manual calibration, where the motors
+        are already disabled and the program must not send any position frame
+        while the operator is moving the mechanism by hand.
         """
         try:
             self.refresh()
-            for motor_id, motor in self._motors.items():
-                state = self.get_state(motor_id)
-                if state is None:
-                    continue
+            if send_hold:
+                targets = {}
+                for motor_id, motor in self._motors.items():
+                    state = self.get_state(motor_id)
+                    if state is None or state.err is None:
+                        continue
+                    targets[motor_id] = (state.position_rad, 0.5, 0.0, 0.0)
                 for _ in range(20):
-                    if self.mode == "posvel":
-                        self._mc.control_Pos_Vel(motor, state.position_rad, 0.5)
-                    else:
-                        self._mc.controlMIT(motor, self.kp, self.kd, state.position_rad, 0.0, 0.0)
+                    if targets:
+                        self.send_targets(targets)
                     time.sleep(0.005)
             self.disable()
         finally:

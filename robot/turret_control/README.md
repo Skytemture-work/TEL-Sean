@@ -55,6 +55,8 @@ YOLO 若只有一個類別，`classify_by_size()` 會用「大孔是小孔的 2 
 | `geometry.py` | 相機座標 → 水平／垂直關節座標與絕對馬達角度 |
 | `ballistics.py` | 視差修正 + 重力彈道求解（純數學） |
 | `backends.py` | `MockMotorBackend`（安全模擬）與 `DamiaoSerialBackend`（實機） |
+| `limits.py` | 馬達座標安全範圍讀寫與最後一道軟體限位 |
+| `run_limit_calibration.py` | 失能後手動示教 home 與水平／垂直安全活動範圍 |
 | `controller.py` | 接合瞄準與馬達輸出 |
 | `control_loop.py` | 200 Hz 固定頻率迴圈 + 偵測執行緒 |
 | `board.py` | 靶板模型：測距、尺寸分類、接戰排序 |
@@ -99,6 +101,14 @@ python3 -m turret_control.run_vertical_panel --cli
 # 垂直軸預設使用實機已驗證可移動的位置－速度模式；必要時才覆寫為 MIT
 python3 -m turret_control.run_vertical_panel --cli --control-mode mit
 
+# 手動示教：失能兩顆馬達；完成 home 後，用手沿安全外框走一圈
+# 程式先收集 30 秒；若尚未回到起點會繼續錄，直到閉合或再過 30 秒
+# 原始樣本會先自動存到 mechanism_limits_trace_latest.json，再進行輪廓驗證
+# 預設從整個輪廓向內保留 0.5 個馬達角度，不會把工作區錯當成長方形
+python3 -m turret_control.run_limit_calibration
+# 若只重測活動範圍、不更新 home 原點：
+python3 -m turret_control.run_limit_calibration --skip-origin
+
 # 角度模擬（不碰硬體）
 python3 -m turret_control.run_demo --u 900 --v 200 --distance 5
 
@@ -134,14 +144,15 @@ python3 -m unittest discover -s tests
 校正值放在 `startup_pose.json`：目前水平砲口約為 `+0.249997 rad`、方向為 `-1`、
 直驅比例為 `1.0`。若日後加入連桿或齒輪，請先更新
 `motor_rad_per_muzzle_rad`；也可用 `--pitch-sign` 和
-`--motor-rad-per-muzzle-rad` 暫時覆寫。砲口仰角安全範圍固定為 `0°～45°`；
-`--min-angle`／`--max-angle` 只能在這個範圍內再縮小，不能放寬。
+`--motor-rad-per-muzzle-rad` 暫時覆寫。砲口仰角安全範圍會由
+`mechanism_limits.json` 的馬達端點換算；`--min-angle`／`--max-angle` 只能再縮小，不能放寬。
 畫面中的馬達角是編碼器**絕對座標**，正負號不是移動方向；例如砲口從
 `+15°` 回到 `0°` 時，垂直馬達目標會增加約 `15°`，砲口則持續向下回到水平。
 若在前一個目標尚未到達時改目標，控制器會先按加速度上限煞車，再連續反轉。
 
 同一程序會同時保持水平與垂直兩顆馬達。水平輸入是以目前正前方校正點為 `0°` 的
-絕對角度，正值向右、負值向左，固定限制為 `-35°～+35°`（總行程 70°）。水平安全聯鎖使用垂直馬達
+絕對角度，正值向右、負值向左，限制會由 `mechanism_limits.json` 的水平馬達端點換算（目前暫值為
+`-35°～+35°`）。水平安全聯鎖使用垂直馬達
 實際回饋：砲口仰角 `≤35°` 才允許水平移動。高於 `35°` 時若收到水平目標，控制器會
 先降低垂直；回饋確認到達 `35.0°` 或更低後，水平立即開始、垂直繼續同時移動。
 若最終垂直目標仍高於 `35°`，會先以 `34.5°` 作為安全中繼點；確認水平與垂直都到達
@@ -154,7 +165,8 @@ CLI 的 `aim <水平角度> <垂直角度>` 在目前與目標垂直角度都不
 `enable` 與 `disable` 會在輸入後直接執行，不會再要求輸入 `yes`；其中 `disable`
 可能讓垂直軸下墜，輸入前仍需先支撐機構。一般的 `set`、`yaw`、`aim` 也都不需要確認。
 
-若機械原點有偏差，可在 CLI 輸入 `calibrate`。程式會先要求確認並失能兩軸；確認
+若機械原點有偏差，可在 CLI 輸入 `calibrate`，或使用上面的
+`run_limit_calibration` 一次記錄 home 與安全範圍。程式會先要求確認並失能兩軸；確認
 兩顆 ERR 都是 0 後，手動把機構放到「水平 0°、垂直初始 45°」，再輸入
 `capture-origin` 並二次確認。程式只更新軟體校正檔，不改馬達內部零點；舊的
 `startup_pose.json` 會備份成 `startup_pose.json.bak`。擷取後維持失能，必須等人員
@@ -175,15 +187,18 @@ CLI 的 `aim <水平角度> <垂直角度>` 在目前與目標垂直角度都不
 `fired` 代表射擊 callback 回報「球已送出」，不是相機確認球已穿過孔洞；命中確認仍需
 另外接射後影像或感測器。
 
-## 三個不可以拿掉的安全性質
+## 不可以拿掉的安全性質
 
 **1. 每一圈都要送馬達命令。** 馬達有通訊丟失防護，停止送命令會自動失能；
 垂直軸沒有煞車，失能就直接掉下來。沒有目標時要 `hold()`，不是什麼都不做。
 
-**2. 射擊要有冷卻。** 迴圈 200 Hz，`fire_allowed` 會連續成立 —— 不擋的話一秒射 200 發。
+**2. 每個實機位置命令都會在 DAMIAO backend 最後檢查 `mechanism_limits.json`。**
+超出各軸範圍或描繪出的 yaw/pitch 多邊形工作區時，目標會停在第一個安全邊界內；這是軟體保護，不能取代急停、機械止擋或人員支撐。
+
+**3. 射擊要有冷卻。** 迴圈 200 Hz，`fire_allowed` 會連續成立 —— 不擋的話一秒射 200 發。
 `BoardEngagement` 的 `shot_cooldown_s` 負責這件事，別拿掉。
 
-**3. 開火閘門 fail closed。** 下列任一條成立就不開火：
+**4. 開火閘門 fail closed。** 下列任一條成立就不開火：
 
 - 沒有目標或信心度不足
 - 馬達還沒到位（看回饋，不是看像素誤差）
@@ -201,7 +216,7 @@ CLI 的 `aim <水平角度> <垂直角度>` 在目前與目標垂直角度都不
 | `focal_length_x/y_px` | 700.0 | 相機標定 |
 | `yaw_zero_rad` / `pitch_zero_rad` | 由 `startup_pose.json` 載入 | 手動校正後於下次啟動自動套用 |
 | `yaw_sign` / `pitch_sign` | 1 / −1 | 垂直方向已確認為馬達角增加時砲口下降 |
-| `yaw_min/max`、`pitch_min/max` | ±80° / 砲口 0°~45° | 垂直範圍已依需求固定；水平仍須確認機構實際行程 |
+| `mechanism_limits.json` 的 yaw/pitch 工作區 | 目前是由舊校正推導的保守暫值 | 請用 `run_limit_calibration` 沿安全外框手動描邊 30 秒重測 |
 | `camera_to_yaw_yaw/pitch_rad` | 0.0 | 炮塔零點時，相機光軸相對水平軸的偏角 |
 | `yaw_axis_offset_x/y/z_m` | 0.0 | 量相機原點到水平關節原點，使用相機座標 |
 | `pitch_axis_offset_x/y/z_m` | 0.0 | 量水平關節到垂直關節，使用水平零點座標 |

@@ -7,24 +7,53 @@ must be measured on the real mechanism before using the CAN backend.
 from dataclasses import dataclass
 import math
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Dict, Tuple
 
+from .limits import DEFAULT_LIMITS_PATH, load_axis_limits
 from .pitch import load_pitch_calibration, load_yaw_calibration
 
 
 _DEFAULT_STARTUP_POSE = Path(__file__).with_name("startup_pose.json")
 _DEFAULT_YAW_CALIBRATION = load_yaw_calibration(_DEFAULT_STARTUP_POSE)
 _DEFAULT_PITCH_CALIBRATION = load_pitch_calibration(_DEFAULT_STARTUP_POSE)
-_DEFAULT_YAW_LIMITS = sorted(
-    (
-        _DEFAULT_YAW_CALIBRATION.motor_from_muzzle(math.radians(-35.0)),
-        _DEFAULT_YAW_CALIBRATION.motor_from_muzzle(math.radians(35.0)),
-    )
+try:
+    _DEFAULT_AXIS_LIMITS = load_axis_limits(DEFAULT_LIMITS_PATH)
+except FileNotFoundError:
+    # Keep the old conservative behavior if a checkout predates the limits
+    # file.  New checkouts include the file and the manual capture tool replaces
+    # it with measured motor-space endpoints.
+    _DEFAULT_AXIS_LIMITS = {
+        "yaw": SimpleNamespace(
+            min_rad=min(
+                _DEFAULT_YAW_CALIBRATION.motor_from_muzzle(math.radians(-35.0)),
+                _DEFAULT_YAW_CALIBRATION.motor_from_muzzle(math.radians(35.0)),
+            ),
+            max_rad=max(
+                _DEFAULT_YAW_CALIBRATION.motor_from_muzzle(math.radians(-35.0)),
+                _DEFAULT_YAW_CALIBRATION.motor_from_muzzle(math.radians(35.0)),
+            ),
+            motor_id=0x03,
+        ),
+        "pitch": SimpleNamespace(
+            min_rad=min(
+                _DEFAULT_PITCH_CALIBRATION.motor_from_muzzle(0.0),
+                _DEFAULT_PITCH_CALIBRATION.motor_from_muzzle(math.radians(45.0)),
+            ),
+            max_rad=max(
+                _DEFAULT_PITCH_CALIBRATION.motor_from_muzzle(0.0),
+                _DEFAULT_PITCH_CALIBRATION.motor_from_muzzle(math.radians(45.0)),
+            ),
+            motor_id=0x01,
+        ),
+    }
+_DEFAULT_YAW_LIMITS = (
+    _DEFAULT_AXIS_LIMITS["yaw"].min_rad,
+    _DEFAULT_AXIS_LIMITS["yaw"].max_rad,
 )
-_DEFAULT_PITCH_LIMITS = sorted(
-    (
-        _DEFAULT_PITCH_CALIBRATION.motor_from_muzzle(0.0),
-        _DEFAULT_PITCH_CALIBRATION.motor_from_muzzle(math.radians(45.0)),
-    )
+_DEFAULT_PITCH_LIMITS = (
+    _DEFAULT_AXIS_LIMITS["pitch"].min_rad,
+    _DEFAULT_AXIS_LIMITS["pitch"].max_rad,
 )
 
 
@@ -202,6 +231,14 @@ class TurretConfig:
     @property
     def muzzle_offset(self) -> tuple:
         return (self.muzzle_offset_x_m, self.muzzle_offset_y_m, self.muzzle_offset_z_m)
+
+    @property
+    def motor_limits(self) -> Dict[int, Tuple[float, float]]:
+        """Absolute motor-position limits for the final backend safety check."""
+        return {
+            self.yaw_motor_id: (self.yaw_min_rad, self.yaw_max_rad),
+            self.pitch_motor_id: (self.pitch_min_rad, self.pitch_max_rad),
+        }
 
     @property
     def yaw_axis_offset(self) -> tuple:

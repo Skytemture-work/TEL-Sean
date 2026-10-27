@@ -1,108 +1,172 @@
-
 #!/usr/bin/env python3
-import struct
+# -*- coding: utf-8 -*-
+
 import time
 import can
 
-# =========================
-# CAN 設定
-# =========================
-CAN_INTERFACE = "socketcan"
-CAN_CHANNEL = "can0"
-CAN_BITRATE = 500000       # 必須與控制器設定一致
-VESC_ID = 1                # 請改成 MKS 實際設定的 ID
+from mks_servo_can import MksServo
+from mks_servo_can.mks_enums import (
+    Enable,
+    Direction,
+    WorkMode,
+    SuccessStatus,
+)
 
-# VESC CAN Packet ID
-CAN_PACKET_SET_RPM = 3
-CAN_PACKET_STATUS = 9
+# ===== 使用者設定 =====
+CAN_INTERFACE = "can0"
+MOTOR_CAN_ID = 1
 
-# 初次測試請使用低速，確認馬達與控制方向
-MAX_TEST_ERPM = 1000
+MOVE_PULSES = 800       # 相對移動脈衝數
+TARGET_SPEED_RPM = 30   # 先用低速測試
+ACCELERATION = 2
+POLL_INTERVAL = 0.3
+MOVE_TIMEOUT = 30       # 最長等待秒數
 
+def enable_motor_compat(servo, enabled=True):
+    """相容目前安裝的套件 enable_motor 參數問題。"""
+    method_globals = servo.enable_motor.__func__.__globals__
+    commands = method_globals["MksCommands"]
 
-def send_erpm(bus, erpm):
-    """傳送目標電氣轉速 ERPM。"""
-    can_id = (CAN_PACKET_SET_RPM << 8) | VESC_ID
+    value = Enable.Enable.value if enabled else Enable.Disable.value
 
-    msg = can.Message(
-        arbitration_id=can_id,
-        is_extended_id=True,
-        data=struct.pack(">i", int(erpm))
+    return servo.set_generic_status(
+        commands.ENABLE_MOTOR_COMMAND,
+        [value]
     )
-    bus.send(msg)
-    print(f"[TX] Target ERPM = {erpm}")
-
-
-def receive_status(bus):
-    """讀取 VESC STATUS 回報。"""
-    msg = bus.recv(timeout=0.1)
-
-    if msg is None or not msg.is_extended_id:
-        return
-
-    packet_id = (msg.arbitration_id >> 8) & 0xFF
-    controller_id = msg.arbitration_id & 0xFF
-
-    if controller_id != VESC_ID:
-        return
-
-    if packet_id != CAN_PACKET_STATUS or len(msg.data) < 8:
-        return
-
-    # VESC STATUS:
-    # 4 bytes ERPM, 2 bytes current, 2 bytes duty
-    erpm = struct.unpack(">i", bytes(msg.data[0:4]))[0]
-    current = struct.unpack(">h", bytes(msg.data[4:6]))[0] / 10.0
-    duty = struct.unpack(">h", bytes(msg.data[6:8]))[0] / 1000.0
-
-    print(
-        f"[RX] ERPM={erpm:>8} | "
-        f"Current={current:>6.1f} A | "
-        f"Duty={duty * 100:>6.1f}%"
-    )
-
 
 def main():
-    bus = can.Bus(
-        interface=CAN_INTERFACE,
-        channel=CAN_CHANNEL,
-        bitrate=CAN_BITRATE
-    )
-
-    print("MKS CAN Motor Controller")
-    print("輸入目標 ERPM，例如 500；輸入 0 停止。")
+    bus = None
+    notifier = None
+    servo = None
+    move_started = False
 
     try:
+        bus = can.Bus(
+            interface="socketcan",
+            channel=CAN_INTERFACE
+        )
+        notifier = can.Notifier(bus, [])
+        servo = MksServo(bus, notifier, MOTOR_CAN_ID)
+
+        # 1. 設定工作模式
+        result = servo.set_work_mode(WorkMode.SrvFoc)
+        print("工作模式：", result)
+
+        if result != SuccessStatus.Success:
+            raise RuntimeError("設定工作模式失敗")
+
+        time.sleep(0.5)
+
+        # 2. 啟用馬達
+        result = enable_motor_compat(servo, True)
+        print("啟用結果：", result)
+
+        if result != SuccessStatus.Success:
+            raise RuntimeError("啟用馬達失敗")
+
+        time.sleep(0.5)
+
+        # 3. 讀取移動前回授
+        encoder_before = servo.read_encoder_value_addition()
+        speed_before = servo.read_motor_speed()
+
+        print("\n===== 移動前 =====")
+        print("累積編碼器值：", encoder_before)
+        print("實際轉速 RPM：", speed_before)
+
+        if encoder_before is None:
+            raise RuntimeError("讀取初始編碼器值失敗")
+
+        # 4. 執行有限脈衝的相對位置移動
+        print("\n開始移動 {} 脈衝".format(MOVE_PULSES))
+
+        result = servo.run_motor_relative_motion_by_pulses(
+            Direction.CW,
+            TARGET_SPEED_RPM,
+            ACCELERATION,
+            MOVE_PULSES
+        )
+        print("移動指令回傳：", result)
+
+        if result is None:
+            raise RuntimeError("沒有收到有效的移動指令回覆")
+
+        move_started = True
+        start_time = time.monotonic()
+
+        # 5. 持續讀取回授，直到停止或逾時
         while True:
-            text = input("\nTarget ERPM > ").strip()
+            elapsed = time.monotonic() - start_time
 
-            try:
-                target = int(text)
-            except ValueError:
-                print("請輸入整數 ERPM。")
-                continue
+            encoder_now = servo.read_encoder_value_addition()
+            speed_now = servo.read_motor_speed()
+            running = servo.is_motor_running()
 
-            if abs(target) > MAX_TEST_ERPM:
-                print(f"測試階段請限制在 ±{MAX_TEST_ERPM} ERPM。")
-                continue
+            if encoder_now is None:
+                print("警告：本次編碼器讀取失敗")
+            else:
+                delta = encoder_now - encoder_before
+                print(
+                    "時間={:.1f}s | Encoder={} | 位移={} | "
+                    "RPM={} | 運轉中={}".format(
+                        elapsed,
+                        encoder_now,
+                        delta,
+                        speed_now,
+                        running
+                    )
+                )
 
-            send_erpm(bus, target)
+            if not running:
+                print("\n馬達回報已停止。")
+                break
 
-            # 接收約 2 秒的狀態回報
-            deadline = time.monotonic() + 2.0
-            while time.monotonic() < deadline:
-                receive_status(bus)
+            if elapsed >= MOVE_TIMEOUT:
+                print("\n逾時：嘗試停止相對位置移動。")
+                servo.stop_motor_relative_motion_by_pulses(
+                    ACCELERATION
+                )
+                break
+
+            time.sleep(POLL_INTERVAL)
+
+        # 6. 讀取最終回授
+        time.sleep(0.2)
+
+        encoder_after = servo.read_encoder_value_addition()
+        speed_after = servo.read_motor_speed()
+        status_after = servo.query_motor_status()
+
+        print("\n===== 最終回授 =====")
+        print("移動前 Encoder：", encoder_before)
+        print("移動後 Encoder：", encoder_after)
+
+        if encoder_after is not None:
+            print("實際編碼器位移：", encoder_after - encoder_before)
+
+        print("最終 RPM：", speed_after)
+        print("馬達狀態：", status_after)
 
     except KeyboardInterrupt:
-        print("\n停止命令已送出。")
-        try:
-            send_erpm(bus, 0)
-        except can.CanError as exc:
-            print(f"傳送停止命令失敗：{exc}")
+        print("\n收到 Ctrl+C，嘗試停止馬達。")
+        if servo is not None and move_started:
+            try:
+                servo.stop_motor_relative_motion_by_pulses(
+                    ACCELERATION
+                )
+            except Exception as exc:
+                print("停止指令錯誤：", exc)
+
+    except Exception as exc:
+        print("\n程式錯誤：", exc)
 
     finally:
-        bus.shutdown()
+        if notifier is not None:
+            notifier.stop()
+        if bus is not None:
+            bus.shutdown()
 
+        print("CAN 連線已關閉。")
 
 if __name__ == "__main__":
     main()

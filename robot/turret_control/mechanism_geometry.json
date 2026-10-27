@@ -1,0 +1,18 @@
+{
+  "camera": {
+    "elevation_deg": 20.0,
+    "elevation_rad": 0.34906585,
+    "distance_to_horizontal_motor_axis_mm": 101.662,
+    "distance_interpretation": "Raw drawing value; confirm whether this is a horizontal projection or a straight-line optical-center-to-axis distance before applying it to control coordinates."
+  },
+  "motor_mounting": {
+    "vertical_motor_center_to_horizontal_motor_top_mm": 72.1,
+    "distance_interpretation": "Raw drawing dimension; this is not assumed to be the distance between motor rotation centers."
+  },
+  "coordinate_convention": {
+    "camera_x": "right",
+    "camera_y": "up",
+    "camera_z": "forward"
+  },
+  "note": "Mechanism geometry supplied by the user; not yet written into yaw_axis_offset or camera alignment control parameters."
+}

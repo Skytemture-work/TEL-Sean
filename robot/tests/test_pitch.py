@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from turret_control.pitch import PitchCalibration, save_manual_origin_calibration
 from turret_control.config import TurretConfig
+from turret_control.limits import load_axis_limits
 from turret_control.run_vertical_panel import (
     DEFAULT_STARTUP_POSE,
     MAX_MUZZLE_ELEVATION_DEG,
@@ -73,36 +74,38 @@ class PitchCalibrationTests(unittest.TestCase):
         muzzle_deg = math.degrees(calibration.muzzle_from_motor(initial_motor_rad))
         self.assertAlmostEqual(muzzle_deg, 45.0)
 
-    def test_global_pitch_limits_match_physical_zero_to_forty_five(self):
+    def test_global_pitch_limits_match_measured_mechanism_limits(self):
         config = TurretConfig()
         calibration = load_pitch_calibration(DEFAULT_STARTUP_POSE)
+        limits = load_axis_limits()["pitch"]
         self.assertEqual(config.pitch_sign, -1)
-        self.assertAlmostEqual(
-            config.pitch_min_rad,
-            calibration.motor_from_muzzle(math.radians(45.0)),
+        self.assertAlmostEqual(config.pitch_min_rad, limits.min_rad)
+        self.assertAlmostEqual(config.pitch_max_rad, limits.max_rad)
+        physical_limits = sorted(
+            math.degrees(calibration.muzzle_from_motor(value))
+            for value in (config.pitch_min_rad, config.pitch_max_rad)
         )
-        self.assertAlmostEqual(
-            config.pitch_max_rad,
-            calibration.motor_from_muzzle(0.0),
-        )
+        self.assertGreaterEqual(physical_limits[0], 0.0)
+        self.assertLessEqual(physical_limits[1], 45.0)
 
-    def test_horizontal_reference_and_limits_match_minus_thirty_five_to_thirty_five(self):
+    def test_horizontal_reference_and_limits_match_measured_workspace(self):
         calibration = load_yaw_calibration(DEFAULT_STARTUP_POSE)
         config = TurretConfig()
+        limits = load_axis_limits()["yaw"]
         self.assertAlmostEqual(
             calibration.motor_from_muzzle(0.0),
             config.yaw_zero_rad,
         )
         self.assertEqual(calibration.motor_sign, -1)
         self.assertEqual(config.yaw_sign, -1)
-        self.assertAlmostEqual(
-            config.yaw_min_rad,
-            calibration.motor_from_muzzle(math.radians(35.0)),
+        self.assertAlmostEqual(config.yaw_min_rad, limits.min_rad)
+        self.assertAlmostEqual(config.yaw_max_rad, limits.max_rad)
+        physical_limits = sorted(
+            math.degrees(calibration.muzzle_from_motor(value))
+            for value in (config.yaw_min_rad, config.yaw_max_rad)
         )
-        self.assertAlmostEqual(
-            config.yaw_max_rad,
-            calibration.motor_from_muzzle(math.radians(-35.0)),
-        )
+        self.assertGreaterEqual(physical_limits[0], -35.0)
+        self.assertLessEqual(physical_limits[1], 35.0)
 
     def test_horizontal_motion_uses_clearance_sequence_above_thirty_five_degrees(self):
         pitch = PitchCalibration(motor_zero_rad=0.2, motor_sign=-1)

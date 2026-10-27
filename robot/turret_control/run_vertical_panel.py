@@ -25,6 +25,7 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 
 from .backends import DamiaoSerialBackend
+from .limits import load_motor_limits
 from .pitch import (
     PitchCalibration,
     load_pitch_calibration,
@@ -111,6 +112,7 @@ class MotorWorker:
         max_yaw_deg: float = MAX_TURRET_YAW_DEG,
         max_pitch_for_yaw_deg: float = MAX_PITCH_FOR_YAW_DEG,
         yaw_clearance_pitch_deg: float = YAW_CLEARANCE_PITCH_DEG,
+        position_limits=None,
     ):
         self.port = port
         self.pitch_calibration = pitch_calibration
@@ -169,6 +171,7 @@ class MotorWorker:
                 "水平避讓角度必須位於垂直軟限制下限與水平安全角度之間"
             )
         self.yaw_clearance_pitch_rad = math.radians(yaw_clearance_pitch_deg)
+        self.position_limits = dict(position_limits or load_motor_limits())
         # The mechanism rule is strictly "above 35 degrees is forbidden".
         # Command 34.5 degrees for a little settling margin, but release yaw as
         # soon as measured pitch reaches the valid 35.0-degree boundary.
@@ -797,6 +800,7 @@ class MotorWorker:
                 kd=self.kd,
                 enable_on_start=False,
                 startup_hold_s=0.5,
+                position_limits=self.position_limits,
             )
             # The USB-CAN read is non-blocking by design.  Give the adapter a
             # few cycles to return the first feedback frame before showing it.
@@ -922,21 +926,22 @@ class MotorWorker:
 
                     torque_ramp = min(1.0, max(0.0, (now - self._enabled_at) / self.torque_ramp_s))
                     active_torque_ff = self.torque_ff_nm * torque_ramp
-                    self._motors.send_target(
-                        PITCH_MOTOR_ID,
-                        position,
-                        self.speed_rad_s,
-                        velocity_rad_s=velocity,
-                        torque_nm=active_torque_ff,
-                    )
+                    targets = {
+                        PITCH_MOTOR_ID: (
+                            position,
+                            self.speed_rad_s,
+                            velocity,
+                            active_torque_ff,
+                        )
+                    }
                     if yaw_position is not None:
-                        self._motors.send_target(
-                            YAW_MOTOR_ID,
+                        targets[YAW_MOTOR_ID] = (
                             yaw_position,
                             self.speed_rad_s,
-                            velocity_rad_s=yaw_velocity,
-                            torque_nm=0.0,
+                            yaw_velocity,
+                            0.0,
                         )
+                    self._motors.send_targets(targets)
                     self._last_command_rad = position
                     self._command_velocity_rad_s = velocity
                     if yaw_position is not None:
@@ -1741,16 +1746,16 @@ def main() -> None:
         "--min-offset",
         dest="min_angle",
         type=float,
-        default=MIN_MUZZLE_ELEVATION_DEG,
-        help="砲口仰角軟限制下限，度；只能設在 0 到 45 度內",
+        default=None,
+        help="砲口仰角軟限制下限，度；預設使用 mechanism_limits.json",
     )
     parser.add_argument(
         "--max-angle",
         "--max-offset",
         dest="max_angle",
         type=float,
-        default=MAX_MUZZLE_ELEVATION_DEG,
-        help="砲口仰角軟限制上限，度；只能設在 0 到 45 度內",
+        default=None,
+        help="砲口仰角軟限制上限，度；預設使用 mechanism_limits.json",
     )
     parser.add_argument("--cli", action="store_true", help="強制使用終端控制介面")
     args = parser.parse_args()
@@ -1784,8 +1789,6 @@ def main() -> None:
             args.max_tracking_error,
             args.stall_timeout,
             args.torque_ff,
-            args.min_angle,
-            args.max_angle,
             *(
                 (args.motor_rad_per_muzzle_rad,)
                 if args.motor_rad_per_muzzle_rad is not None
@@ -1794,18 +1797,6 @@ def main() -> None:
         )
     ):
         raise SystemExit("所有控制參數都必須是有限數字")
-    if args.min_angle >= args.max_angle:
-        raise SystemExit("--min-angle 必須小於 --max-angle")
-    if (
-        args.min_angle < MIN_MUZZLE_ELEVATION_DEG
-        or args.max_angle > MAX_MUZZLE_ELEVATION_DEG
-    ):
-        raise SystemExit(
-            "砲口仰角安全範圍固定為 "
-            f"{MIN_MUZZLE_ELEVATION_DEG:.1f}° 到 "
-            f"{MAX_MUZZLE_ELEVATION_DEG:.1f}°"
-        )
-
     stored_calibration = load_pitch_calibration(args.startup_pose)
     yaw_calibration = load_yaw_calibration(args.startup_pose)
     pitch_calibration = PitchCalibration(
@@ -1820,6 +1811,50 @@ def main() -> None:
             if args.pitch_sign is not None
             else stored_calibration.motor_sign
         ),
+    )
+    position_limits = load_motor_limits()
+
+    def physical_bounds(calibration, motor_id, absolute_min, absolute_max):
+        motor_min, motor_max = position_limits[motor_id]
+        physical = sorted(
+            math.degrees(calibration.muzzle_from_motor(value))
+            for value in (motor_min, motor_max)
+        )
+        return max(absolute_min, physical[0]), min(absolute_max, physical[1])
+
+    pitch_safe_min, pitch_safe_max = physical_bounds(
+        pitch_calibration,
+        PITCH_MOTOR_ID,
+        MIN_MUZZLE_ELEVATION_DEG,
+        MAX_MUZZLE_ELEVATION_DEG,
+    )
+    yaw_safe_min, yaw_safe_max = physical_bounds(
+        yaw_calibration,
+        YAW_MOTOR_ID,
+        MIN_TURRET_YAW_DEG,
+        MAX_TURRET_YAW_DEG,
+    )
+    if pitch_safe_min >= pitch_safe_max or yaw_safe_min >= yaw_safe_max:
+        raise SystemExit("mechanism_limits.json 與 startup_pose.json 無法形成有效物理範圍")
+
+    if args.min_angle is None:
+        args.min_angle = pitch_safe_min
+    if args.max_angle is None:
+        args.max_angle = pitch_safe_max
+    if not all(math.isfinite(value) for value in (args.min_angle, args.max_angle)):
+        raise SystemExit("--min-angle 與 --max-angle 必須是有限數字")
+    if args.min_angle >= args.max_angle:
+        raise SystemExit("--min-angle 必須小於 --max-angle")
+    if args.min_angle < pitch_safe_min or args.max_angle > pitch_safe_max:
+        raise SystemExit(
+            "面板角度不能超過 mechanism_limits.json 的實測範圍："
+            f"{pitch_safe_min:.2f}° 到 {pitch_safe_max:.2f}°"
+        )
+
+    max_pitch_for_yaw_deg = min(MAX_PITCH_FOR_YAW_DEG, args.max_angle)
+    yaw_clearance_pitch_deg = max(
+        args.min_angle,
+        max_pitch_for_yaw_deg - YAW_RELEASE_MARGIN_DEG,
     )
     worker = MotorWorker(
         port=args.port,
@@ -1836,9 +1871,11 @@ def main() -> None:
         max_muzzle_deg=args.max_angle,
         control_mode=args.control_mode,
         yaw_calibration=yaw_calibration,
-        min_yaw_deg=MIN_TURRET_YAW_DEG,
-        max_yaw_deg=MAX_TURRET_YAW_DEG,
-        max_pitch_for_yaw_deg=MAX_PITCH_FOR_YAW_DEG,
+        min_yaw_deg=yaw_safe_min,
+        max_yaw_deg=yaw_safe_max,
+        max_pitch_for_yaw_deg=max_pitch_for_yaw_deg,
+        yaw_clearance_pitch_deg=yaw_clearance_pitch_deg,
+        position_limits=position_limits,
     )
 
     if args.cli or (os.name != "nt" and not os.environ.get("DISPLAY")):

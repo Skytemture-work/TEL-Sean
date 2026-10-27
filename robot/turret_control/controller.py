@@ -39,16 +39,35 @@ class TurretController:
 
         if command.has_target:
             # The values are guaranteed non-None when has_target is true.
-            self.motors.set_position(
-                self.config.yaw_motor_id,
-                command.target_yaw_rad,
-                self.config.max_motor_speed_rad_s,
-            )
-            self.motors.set_position(
-                self.config.pitch_motor_id,
-                command.target_pitch_rad,
-                self.config.max_motor_speed_rad_s,
-            )
+            send_targets = getattr(self.motors, "send_targets", None)
+            if callable(send_targets):
+                send_targets(
+                    {
+                        self.config.yaw_motor_id: (
+                            command.target_yaw_rad,
+                            self.config.max_motor_speed_rad_s,
+                            0.0,
+                            0.0,
+                        ),
+                        self.config.pitch_motor_id: (
+                            command.target_pitch_rad,
+                            self.config.max_motor_speed_rad_s,
+                            0.0,
+                            0.0,
+                        ),
+                    }
+                )
+            else:
+                self.motors.set_position(
+                    self.config.yaw_motor_id,
+                    command.target_yaw_rad,
+                    self.config.max_motor_speed_rad_s,
+                )
+                self.motors.set_position(
+                    self.config.pitch_motor_id,
+                    command.target_pitch_rad,
+                    self.config.max_motor_speed_rad_s,
+                )
         else:
             self.motors.hold()
 

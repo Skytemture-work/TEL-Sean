@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Optional
 
 from .backends import DamiaoSerialBackend
+from .limits import load_motor_limits
 from .pitch import load_pitch_calibration
 from .trajectory import smoothstep_sample
 
@@ -74,6 +75,7 @@ def main() -> None:
         kp=args.kp,
         kd=args.kd,
         enable_on_start=False,
+        position_limits=load_motor_limits(),
     )
     try:
         motors.refresh()
@@ -110,19 +112,21 @@ def main() -> None:
             pitch_position, pitch_velocity = smoothstep_sample(
                 start[0x01], target[0x01], elapsed, duration
             )
-            motors.send_target(
-                0x03,
-                yaw_position,
-                args.speed,
-                velocity_rad_s=yaw_velocity,
-                torque_nm=args.yaw_tau_ff,
-            )
-            motors.send_target(
-                0x01,
-                pitch_position,
-                args.speed,
-                velocity_rad_s=pitch_velocity,
-                torque_nm=args.pitch_tau_ff,
+            motors.send_targets(
+                {
+                    0x03: (
+                        yaw_position,
+                        args.speed,
+                        yaw_velocity,
+                        args.yaw_tau_ff,
+                    ),
+                    0x01: (
+                        pitch_position,
+                        args.speed,
+                        pitch_velocity,
+                        args.pitch_tau_ff,
+                    ),
+                }
             )
             motors.refresh()
             if elapsed >= duration:
@@ -135,11 +139,11 @@ def main() -> None:
                 next_tick = time.monotonic()
 
         for _ in range(40):
-            motors.send_target(
-                0x03, target[0x03], args.speed, torque_nm=args.yaw_tau_ff
-            )
-            motors.send_target(
-                0x01, target[0x01], args.speed, torque_nm=args.pitch_tau_ff
+            motors.send_targets(
+                {
+                    0x03: (target[0x03], args.speed, 0.0, args.yaw_tau_ff),
+                    0x01: (target[0x01], args.speed, 0.0, args.pitch_tau_ff),
+                }
             )
             motors.refresh()
             time.sleep(0.005)
