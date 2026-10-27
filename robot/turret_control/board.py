@@ -318,6 +318,21 @@ def apply_ranging(targets: Sequence[BoardTarget], focal_px: float) -> List[Board
     return out
 
 
+def _matches_board_size_layout(
+    targets: Sequence[BoardTarget],
+    small_diameter_m: float,
+    large_diameter_m: float,
+) -> bool:
+    """Check that the measured size classes are in the official board rows."""
+    for target in targets:
+        if target.row is None or target.diameter_m is None:
+            return False
+        expected = small_diameter_m if target.row == 3 else large_diameter_m
+        if not math.isclose(target.diameter_m, expected, rel_tol=0.0, abs_tol=1e-9):
+            return False
+    return True
+
+
 def assign_columns(
     targets: Sequence[BoardTarget], tolerance_px: Optional[float] = None
 ) -> List[BoardTarget]:
@@ -360,7 +375,12 @@ def assign_hole_ids(targets: Sequence[BoardTarget]) -> List[BoardTarget]:
     A partial detection is not guessed.  Every target keeps ``hole_id=None``
     until all three columns contain exactly four detections.
     """
-    prepared = assign_columns(targets)
+    # Keep an already-established column assignment.  This matters for the
+    # partial-board homography path, whose inferred points intentionally use a
+    # placeholder box size and therefore cannot be reclustered by box width.
+    prepared = list(targets)
+    if any(target.column is None for target in prepared):
+        prepared = assign_columns(prepared)
     if not prepared:
         return []
 
@@ -399,7 +419,12 @@ def order_targets(
 
     Pixel v grows downward, so "bottom first" is descending v.
     """
-    prepared = assign_columns(targets)
+    # Keep an already-established column assignment.  This matters for the
+    # partial-board homography path, whose inferred points intentionally use a
+    # placeholder box size and therefore cannot be reclustered by box width.
+    prepared = list(targets)
+    if any(target.column is None for target in prepared):
+        prepared = assign_columns(prepared)
 
     diameters = sorted({t.diameter_m for t in prepared if t.diameter_m is not None})
     # Rank 0 engages first.
@@ -435,6 +460,10 @@ def build_plan(
     ranged = apply_ranging(classified, focal_px)
     identified = assign_hole_ids(ranged)
     if len(identified) != 12 or any(target.hole_id is None for target in identified):
+        return EngagementPlan([])
+    if not _matches_board_size_layout(
+        identified, small_diameter_m, large_diameter_m
+    ):
         return EngagementPlan([])
     return EngagementPlan(
         order_targets(
