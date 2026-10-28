@@ -24,6 +24,7 @@ from .board_surface import detect_dark_board_surface, filter_targets_to_surface
 from .config import TurretConfig
 from .controller import TurretController
 from .detection import boxes_to_board_targets, select_best_box
+from .scoring_light import detect_score_light_scores
 
 
 REPO_MODEL = Path(__file__).resolve().parent.parent / "best_v2.pt"
@@ -156,6 +157,19 @@ def run_board_preview(
                     2,
                 )
             _draw_board_plan(display, plan)
+            score_scores = detect_score_light_scores(
+                inference_frame,
+                plan,
+                board_surface.quad if board_surface is not None else None,
+                inner_radius_cm=(
+                    config.score_light_hole_radius_cm
+                    + config.score_light_edge_gap_cm
+                ),
+                strip_width_cm=config.score_light_strip_width_cm,
+                search_tolerance_cm=config.score_light_search_tolerance_cm,
+                min_saturation=config.score_light_min_saturation,
+                min_value=config.score_light_min_value,
+            )
             if ready:
                 status = f"BOARD READY: {len(detected)}/{len(raw_detected)} in board"
                 status_color = (0, 220, 0)
@@ -173,6 +187,20 @@ def run_board_preview(
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.65,
                 status_color,
+                2,
+                cv2.LINE_AA,
+            )
+            score_text = " ".join(
+                f"{hole_id}:{score_scores.get(hole_id, 0.0):.2f}"
+                for hole_id in ("H10", "H11", "H12")
+            )
+            cv2.putText(
+                display,
+                f"RED LIGHT {score_text}",
+                (12, 56),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (0, 0, 255),
                 2,
                 cv2.LINE_AA,
             )

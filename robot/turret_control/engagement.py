@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import json
 from pathlib import Path
@@ -64,6 +64,8 @@ class BoardEngagement:
         self._clock = clock
         self._last_shot_at: Optional[float] = None
         self._target_started_at: Optional[float] = None
+        self._firing_enabled = True
+        self._firing_blocked_reason: Optional[str] = None
         self.shots = 0
         self.events: List[Dict[str, Any]] = []
         self.event_log_path = Path(event_log_path) if event_log_path is not None else None
@@ -75,6 +77,23 @@ class BoardEngagement:
     def set_plan(self, plan: EngagementPlan) -> None:
         self.plan = plan
         self._target_started_at = self._clock()
+
+    def set_firing_enabled(
+        self,
+        enabled: bool,
+        reason: Optional[str] = None,
+    ) -> None:
+        """Apply an external safety gate without stopping motor tracking.
+
+        Live board-pose tracking uses this while the robot or camera is still
+        moving.  The target continues to update and the motors continue to
+        aim, but neither firing nor target timeout may advance the plan.
+        """
+
+        self._firing_enabled = bool(enabled)
+        self._firing_blocked_reason = None if enabled else (
+            reason or "external firing safety gate"
+        )
 
     def update(self) -> EngagementStatus:
         """One tick.  Always drives the motors, target or not."""
@@ -97,6 +116,17 @@ class BoardEngagement:
 
         target = self.plan.current()
         command = self.turret.update(target.to_pixel())
+        if not self._firing_enabled:
+            command = replace(
+                command,
+                fire_allowed=False,
+                blocked_reason=(
+                    command.blocked_reason or self._firing_blocked_reason
+                ),
+            )
+            # Time spent driving or waiting for a valid pose is not a failed
+            # target attempt.  Restart the timeout window once firing is safe.
+            self._target_started_at = now
 
         status = EngagementStatus(
             command=command,
@@ -123,7 +153,7 @@ class BoardEngagement:
                 status.finished = self.plan.finished
                 return status
 
-        if self._timed_out(now):
+        if self._firing_enabled and self._timed_out(now):
             plan_index = self.plan.index
             skipped_target = target
             self.plan.skip()

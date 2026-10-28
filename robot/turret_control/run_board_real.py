@@ -1,6 +1,7 @@
-"""Real-camera, real-motor 3x4 board aiming run.
+"""Real-camera, real-motor target-board aiming run.
 
-This controls the two DAMIAO motors and advances through the 12-hole plan.
+This controls the two DAMIAO motors and can build the upper/lower-half
+maximum-score plans from the 2026-09-03 rules.
 Firing is deliberately operator-confirmed with the ``f`` key; the launcher
 callback is the integration point for the real firing actuator.
 """
@@ -23,14 +24,26 @@ from .board import (
     build_virtual_plan,
     build_virtual_plan_from_partial,
     estimate_board_distance_from_targets,
+    EngagementPlan,
 )
 from .board_surface import detect_dark_board_surface, filter_targets_to_surface
+from .board_pose import (
+    BoardPoseTracker,
+    project_targets_from_pose,
+    update_plan_geometry,
+)
 from .config import TurretConfig
 from .controller import TurretController
 from .detection import boxes_to_board_targets
 from .engagement import BoardEngagement
 from .fixed_board import calibrate_layout, load_layout
 from .run_yolo_demo import DEFAULT_MODEL, _draw_board_plan, _inference_frame
+from .scoring_light import ScoreRoundController
+from .scoring_strategy import (
+    MATCH_PHASES,
+    append_reallocated_grid_shots,
+    build_max_score_strategy,
+)
 
 
 class _LiveFrame:
@@ -102,6 +115,17 @@ def main() -> None:
         type=Path,
         help="第一次完整偵測到 12 孔時儲存固定版面 JSON",
     )
+    parser.add_argument(
+        "--score-mode",
+        action="store_true",
+        help="2026 計分策略：按 G 開始，鎖定亮燈孔並建立最高分射擊計畫",
+    )
+    parser.add_argument(
+        "--match-phase",
+        choices=MATCH_PHASES,
+        default="upper",
+        help="比賽半場；決定 27/18 球上限與最大得分射擊順序",
+    )
     args = parser.parse_args()
 
     try:
@@ -119,7 +143,22 @@ def main() -> None:
             require_distance_to_fire=False,
         )
         print("虛擬靶模式：只依畫面位置瞄準，已關閉距離／視差／重力補正。", flush=True)
-    elif config.use_axis_geometry:
+    if args.score_mode:
+        print(
+            f"特殊得分燈模式（{args.match_phase}）：比賽哨聲時按 G，"
+            "程式會鎖定紅燈孔 60 秒。",
+            flush=True,
+        )
+    if not args.virtual_board and (
+        config.camera_principal_x_px is None
+        or config.camera_principal_y_px is None
+    ):
+        print(
+            "提醒：相機主點仍使用畫面中心暫值；正式自動瞄準前請填入相機標定的 "
+            "fx/fy/cx/cy 與畸變參數。",
+            flush=True,
+        )
+    if not args.virtual_board and config.use_axis_geometry:
         if config.yaw_axis_offset == (0.0, 0.0, 0.0) and (
             config.pitch_axis_offset_x_m,
             config.pitch_axis_offset_y_m,
@@ -134,6 +173,9 @@ def main() -> None:
     camera = cv2.VideoCapture(args.camera)
     if not camera.isOpened():
         raise SystemExit(f"無法開啟 /dev/video{args.camera}")
+    requested_width = config.image_width_px * (2 if args.zed_uvc else 1)
+    camera.set(cv2.CAP_PROP_FRAME_WIDTH, requested_width)
+    camera.set(cv2.CAP_PROP_FRAME_HEIGHT, config.image_height_px)
 
     motors = DamiaoSerialBackend(
         motor_ids=[config.yaw_motor_id, config.pitch_motor_id],
@@ -146,7 +188,26 @@ def main() -> None:
     )
     turret = TurretController(config, motors)
     driver = BoardEngagement(config, turret, shot_cooldown_s=args.cooldown)
+    pose_tracker = BoardPoseTracker(config)
     plan = None
+    board_plan = None
+    score_round = ScoreRoundController(
+        duration_s=config.score_light_duration_s,
+        confirm_frames=config.score_light_confirm_frames,
+        min_score=config.score_light_min_score,
+        min_margin=config.score_light_min_margin,
+        inner_radius_cm=(
+            config.score_light_hole_radius_cm
+            + config.score_light_edge_gap_cm
+        ),
+        strip_width_cm=config.score_light_strip_width_cm,
+        search_tolerance_cm=config.score_light_search_tolerance_cm,
+        min_saturation=config.score_light_min_saturation,
+        min_value=config.score_light_min_value,
+    )
+    strategy_round_id = None
+    expiry_processed_round_id = None
+    last_bonus_hole_id = None
     fire_requested = False
 
     def operator_fire(_target) -> bool:
@@ -158,7 +219,7 @@ def main() -> None:
         return True
 
     driver.fire = operator_fire
-    window = "REAL BOARD AIM - F confirm / S skip / Q quit"
+    window = "REAL BOARD AIM - F confirm / S skip / G score start / Q quit"
     if not args.headless:
         cv2.namedWindow(window, cv2.WINDOW_NORMAL)
     live = _LiveFrame() if args.web_port else None
@@ -168,13 +229,19 @@ def main() -> None:
         web_server = ThreadingHTTPServer(("0.0.0.0", args.web_port), _LiveHandler)
         threading.Thread(target=web_server.serve_forever, daemon=True).start()
         print(f"Mac 瀏覽器開啟：http://<robot-ip>:{args.web_port}", flush=True)
-    last_state = None
     last_report = 0.0
     last_target_id = None
     if args.layout:
-        plan = load_layout(args.layout)
-        driver.set_plan(plan)
+        board_plan = load_layout(args.layout)
+        if not args.score_mode:
+            plan = board_plan
+            driver.set_plan(plan)
         print(f"已載入固定靶板版面：{args.layout}", flush=True)
+    if args.score_mode:
+        # Hold position until the whistle and red-light selection establish a
+        # legal competition firing plan.
+        plan = EngagementPlan([])
+        driver.set_plan(plan)
 
     try:
         motors.enable()
@@ -182,8 +249,13 @@ def main() -> None:
             ok, frame = camera.read()
             if not ok:
                 break
+            vision_frame = _inference_frame(frame, args.zed_uvc)
+            frame_size_ok = (
+                vision_frame.shape[1] == config.image_width_px
+                and vision_frame.shape[0] == config.image_height_px
+            )
             result = model.predict(
-                _inference_frame(frame, args.zed_uvc),
+                vision_frame,
                 imgsz=args.imgsz,
                 conf=args.conf,
                 device=args.device,
@@ -191,7 +263,7 @@ def main() -> None:
             )[0]
             raw_detected = boxes_to_board_targets(result, args.conf)
             board_surface = detect_dark_board_surface(
-                frame,
+                vision_frame,
                 value_threshold=config.board_dark_value_threshold,
                 min_area_fraction=config.board_min_area_fraction,
                 targets=raw_detected,
@@ -217,20 +289,51 @@ def main() -> None:
                     bottom_to_top=config.engage_bottom_to_top,
                 )
             now = time.monotonic()
-            if now - last_report >= 2.0:
-                print(
-                    f"YOLO 候選孔：靶面內 {len(detected)} / 原始 {len(raw_detected)}",
-                    flush=True,
-                )
-                last_report = now
             candidate_plan = None
             inferred_plan_used = False
-            if plan is None:
-                if quad_plan is not None and len(quad_plan) == 12:
-                    candidate_plan = quad_plan
+            # Build a fresh geometric reference every frame.  This reference
+            # follows the board when the robot moves; the active firing plan is
+            # deliberately kept as a separate object so its shot index and
+            # duplicate scoring shots are never reset.
+            if quad_plan is not None and len(quad_plan) == 12:
+                candidate_plan = quad_plan
+                inferred_plan_used = True
+            elif args.virtual_board:
+                if len(detected) == 12:
+                    candidate_plan = build_virtual_plan(
+                        detected,
+                        config.small_hole_diameter_m,
+                        config.large_hole_diameter_m,
+                        config.engage_large_first,
+                        config.engage_left_to_right,
+                        config.engage_bottom_to_top,
+                        config.board_position_tolerance_cm,
+                    )
+                elif len(detected) >= 4:
+                    candidate_plan = build_virtual_plan_from_partial(
+                        detected,
+                        config.small_hole_diameter_m,
+                        config.large_hole_diameter_m,
+                        config.engage_large_first,
+                        config.engage_left_to_right,
+                        config.engage_bottom_to_top,
+                        focal_px=config.focal_length_x_px,
+                        position_tolerance_cm=config.board_position_tolerance_cm,
+                    )
                     inferred_plan_used = True
-                elif args.virtual_board:
-                    if len(detected) == 12:
+            else:
+                if len(detected) == 12:
+                    candidate_plan = build_plan(
+                        detected,
+                        config.focal_length_x_px,
+                        config.small_hole_diameter_m,
+                        config.large_hole_diameter_m,
+                        config.engage_large_first,
+                        config.engage_left_to_right,
+                        config.engage_bottom_to_top,
+                        config.board_position_tolerance_cm,
+                    )
+                    if len(candidate_plan) != 12:
                         candidate_plan = build_virtual_plan(
                             detected,
                             config.small_hole_diameter_m,
@@ -240,64 +343,33 @@ def main() -> None:
                             config.engage_bottom_to_top,
                             config.board_position_tolerance_cm,
                         )
-                    elif len(detected) >= 4:
-                        candidate_plan = build_virtual_plan_from_partial(
-                            detected,
-                            config.small_hole_diameter_m,
-                            config.large_hole_diameter_m,
-                            config.engage_large_first,
-                            config.engage_left_to_right,
-                            config.engage_bottom_to_top,
-                            focal_px=config.focal_length_x_px,
-                            position_tolerance_cm=config.board_position_tolerance_cm,
-                        )
-                        inferred_plan_used = True
-                else:
-                    if len(detected) == 12:
-                        candidate_plan = build_plan(
-                            detected,
-                            config.focal_length_x_px,
-                            config.small_hole_diameter_m,
-                            config.large_hole_diameter_m,
-                            config.engage_large_first,
-                            config.engage_left_to_right,
-                            config.engage_bottom_to_top,
-                            config.board_position_tolerance_cm,
-                        )
-                        if len(candidate_plan) != 12:
-                            candidate_plan = build_virtual_plan(
-                                detected,
-                                config.small_hole_diameter_m,
-                                config.large_hole_diameter_m,
-                                config.engage_large_first,
-                                config.engage_left_to_right,
-                                config.engage_bottom_to_top,
-                                config.board_position_tolerance_cm,
-                            )
-                    # Normal field mode also accepts a geometrically valid
-                    # partial board.  It is treated as a complete target plan
-                    # so lighting-related missed holes do not stop the match.
-                    if (
-                        (candidate_plan is None or len(candidate_plan) != 12)
-                        and len(detected) >= 4
-                    ):
-                        candidate_plan = build_virtual_plan_from_partial(
-                            detected,
-                            config.small_hole_diameter_m,
-                            config.large_hole_diameter_m,
-                            config.engage_large_first,
-                            config.engage_left_to_right,
-                            config.engage_bottom_to_top,
-                            focal_px=config.focal_length_x_px,
-                            position_tolerance_cm=config.board_position_tolerance_cm,
-                        )
-                        inferred_plan_used = True
-                
-            if candidate_plan is not None and len(candidate_plan) == 12 and all(t.hole_id is not None for t in candidate_plan.targets):
-                plan = candidate_plan
-                if last_state != tuple(t.hole_id for t in plan.targets):
+                # Lighting can hide one or more holes.  Four non-collinear
+                # centres are enough to recover the official metric layout.
+                if (
+                    (candidate_plan is None or len(candidate_plan) != 12)
+                    and len(detected) >= 4
+                ):
+                    candidate_plan = build_virtual_plan_from_partial(
+                        detected,
+                        config.small_hole_diameter_m,
+                        config.large_hole_diameter_m,
+                        config.engage_large_first,
+                        config.engage_left_to_right,
+                        config.engage_bottom_to_top,
+                        focal_px=config.focal_length_x_px,
+                        position_tolerance_cm=config.board_position_tolerance_cm,
+                    )
+                    inferred_plan_used = True
+
+            if (
+                candidate_plan is not None
+                and len(candidate_plan) == 12
+                and all(t.hole_id is not None for t in candidate_plan.targets)
+            ):
+                board_plan = candidate_plan
+                if not args.score_mode and plan is None:
+                    plan = candidate_plan
                     driver.set_plan(plan)
-                    last_state = tuple(t.hole_id for t in plan.targets)
                     plan_source = "推算" if inferred_plan_used else "實測"
                     print(
                         f"{plan_source}靶板計畫建立："
@@ -308,7 +380,165 @@ def main() -> None:
                         calibrate_layout(detected, config, args.calibrate_layout)
                         print(f"已保存固定靶板版面：{args.calibrate_layout}", flush=True)
 
+            pose = None
+            pose_ready = args.virtual_board and frame_size_ok
+            if not frame_size_ok:
+                driver.set_firing_enabled(
+                    False,
+                    "camera frame size does not match calibrated intrinsics",
+                )
+            elif args.virtual_board:
+                driver.set_firing_enabled(True)
+            else:
+                pose_reference = board_plan or plan
+                pose = pose_tracker.update(
+                    detected,
+                    pose_reference,
+                    board_surface.quad if board_surface is not None else None,
+                    now=now,
+                )
+                if pose is not None and pose_reference is not None:
+                    live_targets = project_targets_from_pose(
+                        pose_reference,
+                        pose,
+                        config,
+                    )
+                    update_plan_geometry(board_plan, live_targets)
+                    if plan is not board_plan:
+                        update_plan_geometry(plan, live_targets)
+                pose_ready = (
+                    pose is not None
+                    and pose.stable
+                    and pose_tracker.is_fresh(now)
+                )
+                driver.set_firing_enabled(
+                    pose_ready,
+                    None if pose_ready else "board pose moving, stale or unstable",
+                )
+
+            # An operator confirmation belongs to the exact stable pose in
+            # which it was given.  Never keep it latched across robot motion or
+            # a lost visual pose and fire later without a fresh confirmation.
+            if not pose_ready:
+                fire_requested = False
+
+            if now - last_report >= 2.0:
+                pose_report = "virtual"
+                if not args.virtual_board:
+                    if pose is None:
+                        pose_report = "invalid"
+                    else:
+                        pose_report = (
+                            f"{'stable' if pose_ready else 'settling'} "
+                            f"n={pose.correspondence_count} "
+                            f"rmse={pose.reprojection_error_px:.1f}px"
+                        )
+                print(
+                    f"YOLO 候選孔：靶面內 {len(detected)} / 原始 {len(raw_detected)}；"
+                    f"PnP={pose_report}；"
+                    f"frame={vision_frame.shape[1]}x{vision_frame.shape[0]}"
+                    f"/{config.image_width_px}x{config.image_height_px}",
+                    flush=True,
+                )
+                last_report = now
+
+            score_state = None
+            if args.score_mode:
+                reference_plan = board_plan or plan
+                score_state = score_round.update(
+                    vision_frame,
+                    reference_plan,
+                    board_surface.quad if board_surface is not None else None,
+                )
+                if (
+                    score_state.phase == "active"
+                    and score_state.active_hole_id is not None
+                    and strategy_round_id != score_round.round_id
+                    and reference_plan is not None
+                ):
+                    try:
+                        strategy = build_max_score_strategy(
+                            reference_plan,
+                            score_state.active_hole_id,
+                            args.match_phase,
+                        )
+                    except ValueError as exc:
+                        print(f"無法建立最大得分射擊計畫：{exc}", flush=True)
+                    else:
+                        plan = strategy.plan
+                        driver.set_plan(plan)
+                        strategy_round_id = score_round.round_id
+                        expiry_processed_round_id = None
+                        last_bonus_hole_id = score_state.active_hole_id
+                        print(
+                            f"指定得分孔鎖定：{last_bonus_hole_id}；"
+                            f"{strategy.total_balls} 球最佳計畫，"
+                            f"理論最高 {strategy.theoretical_max_points} 分。",
+                            flush=True,
+                        )
+                        print("射擊順序：" + " ".join(strategy.hole_ids), flush=True)
+
+                if (
+                    score_state.phase == "expired"
+                    and expiry_processed_round_id != score_round.round_id
+                ):
+                    skipped_bonus = 0
+                    while (
+                        plan is not None
+                        and plan.current() is not None
+                        and plan.current().hole_id in ("H10", "H11", "H12")
+                    ):
+                        plan.skip()
+                        skipped_bonus += 1
+                    if skipped_bonus:
+                        # The 60-second LED window has closed.  Keep all
+                        # remaining 2-point grid shots, but never send a late
+                        # ball to the expired bonus hole.  The skipped balls
+                        # are still physically available, so reallocate them.
+                        try:
+                            replacements = append_reallocated_grid_shots(
+                                plan,
+                                board_plan,
+                                args.match_phase,
+                                skipped_bonus,
+                            )
+                        except ValueError as exc:
+                            replacements = ()
+                            print(f"加分球重新配置失敗：{exc}", flush=True)
+                        driver.set_plan(plan)
+                        print(
+                            f"指定得分燈已熄滅，略過 {skipped_bonus} 顆未完成加分球，"
+                            "改投九宮格："
+                            + (" ".join(replacements) if replacements else "無可用格"),
+                            flush=True,
+                        )
+                    expiry_processed_round_id = score_round.round_id
+
             status = driver.update()
+            if (
+                args.score_mode
+                and status.skipped
+                and status.target is not None
+                and status.target.hole_id in ("H10", "H11", "H12")
+                and plan is not None
+                and board_plan is not None
+            ):
+                try:
+                    replacements = append_reallocated_grid_shots(
+                        plan,
+                        board_plan,
+                        args.match_phase,
+                        1,
+                    )
+                except ValueError as exc:
+                    replacements = ()
+                    print(f"逾時加分球重新配置失敗：{exc}", flush=True)
+                if replacements:
+                    print(
+                        f"{status.target.hole_id} 逾時未發射，保留該球並改投 "
+                        f"{replacements[0]}。",
+                        flush=True,
+                    )
             target_id = status.target.hole_id if status.target is not None else None
             if target_id != last_target_id:
                 if status.target is None:
@@ -336,10 +566,80 @@ def main() -> None:
                     (0, 255, 255),
                     2,
                 )
-            if plan is not None:
-                _draw_board_plan(display, plan)
-            text = f"12-hole {'READY' if plan else 'WAIT'} | remaining={status.remaining}"
+            display_plan = board_plan if args.score_mode and board_plan is not None else plan
+            if display_plan is not None:
+                _draw_board_plan(display, display_plan)
+            if args.score_mode and status.target is not None:
+                current_point = (
+                    round(status.target.u_px),
+                    round(status.target.v_px),
+                )
+                cv2.circle(display, current_point, 20, (255, 0, 255), 3, cv2.LINE_AA)
+                cv2.putText(
+                    display,
+                    f"NEXT {status.target.hole_id}",
+                    (current_point[0] + 10, current_point[1] + 20),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55,
+                    (255, 0, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
+            if args.score_mode and score_state is not None:
+                score_label = (
+                    score_state.active_hole_id
+                    or last_bonus_hole_id
+                    or "未鎖定"
+                )
+                text = (
+                    f"SCORE {score_state.phase} {score_label} "
+                    f"{score_state.remaining_s:.1f}s | remaining={status.remaining}"
+                )
+            else:
+                text = f"12-hole {'READY' if plan else 'WAIT'} | remaining={status.remaining}"
             cv2.putText(display, text, (12, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 220, 0), 2)
+            if args.score_mode and score_state is not None:
+                score_text = " ".join(
+                    f"{hole_id}:{score_state.scores.get(hole_id, 0.0):.2f}"
+                    for hole_id in ("H10", "H11", "H12")
+                )
+                cv2.putText(
+                    display,
+                    f"RED {score_text}",
+                    (12, 56),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55,
+                    (0, 0, 255),
+                    2,
+                )
+            if not frame_size_ok:
+                pose_text = "CAMERA SIZE MISMATCH - FIRE BLOCKED"
+                pose_color = (0, 0, 255)
+            elif args.virtual_board:
+                pose_text = "POSE virtual bypass"
+                pose_color = (0, 220, 0)
+            elif pose is None:
+                pose_text = "POSE invalid - FIRE BLOCKED"
+                pose_color = (0, 165, 255)
+            else:
+                pose_text = (
+                    f"POSE {'READY' if pose_ready else 'SETTLING'} "
+                    f"n={pose.correspondence_count} "
+                    f"err={pose.reprojection_error_px:.1f}px "
+                    f"v={pose.translation_speed_m_s:.2f}m/s "
+                    f"w={pose.rotation_speed_rad_s:.2f}rad/s"
+                )
+                pose_color = (0, 220, 0) if pose_ready else (0, 165, 255)
+            cv2.putText(
+                display,
+                pose_text,
+                (12, 82 if args.score_mode else 56),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.52,
+                pose_color,
+                2,
+                cv2.LINE_AA,
+            )
             if live is not None:
                 ok_jpg, encoded = cv2.imencode(".jpg", display, [cv2.IMWRITE_JPEG_QUALITY, 80])
                 if ok_jpg:
@@ -350,7 +650,20 @@ def main() -> None:
                 cv2.imshow(window, display)
                 key = cv2.waitKey(1) & 0xFF
             if key == ord("f"):
-                fire_requested = True
+                if pose_ready:
+                    fire_requested = True
+                else:
+                    fire_requested = False
+                    print("姿態尚未穩定，已拒絕 F 發射確認。", flush=True)
+            elif key == ord("g") and args.score_mode:
+                score_round.start_round()
+                strategy_round_id = None
+                expiry_processed_round_id = None
+                last_bonus_hole_id = None
+                plan = EngagementPlan([])
+                driver.set_plan(plan)
+                fire_requested = False
+                print("已開始特殊得分回合，等待三個紅燈中的亮燈孔。", flush=True)
             elif key == ord("s") and plan is not None:
                 plan.skip()
             elif key in (ord("q"), 27):

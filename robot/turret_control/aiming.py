@@ -12,7 +12,7 @@ from typing import Optional
 
 from . import ballistics
 from .config import TurretConfig
-from .geometry import aim_angles_from_target
+from .geometry import aim_angles_from_target, normalized_image_coordinates
 
 
 @dataclass(frozen=True)
@@ -79,14 +79,13 @@ class AimingController:
         match the installed motor directions.
         """
 
-        yaw_error = math.atan2(
-            target.u_px - self.config.camera_center_x_px,
-            self.config.focal_length_x_px,
+        normalized_x, normalized_y = normalized_image_coordinates(
+            target.u_px,
+            target.v_px,
+            self.config,
         )
-        pitch_error = math.atan2(
-            self.config.camera_center_y_px - target.v_px,
-            self.config.focal_length_y_px,
-        )
+        yaw_error = math.atan2(normalized_x, 1.0)
+        pitch_error = math.atan2(normalized_y, 1.0)
         return (
             self.config.yaw_sign * yaw_error,
             self.config.pitch_sign * pitch_error,

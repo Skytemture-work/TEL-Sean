@@ -89,6 +89,49 @@ def camera_to_yaw_zero(point: Point3D, config: TurretConfig) -> Point3D:
     )
 
 
+def normalized_image_coordinates(
+    u_px: float,
+    v_px: float,
+    config: TurretConfig,
+) -> Tuple[float, float]:
+    """Return an undistorted camera ray as ``(x right, y up)`` at z=1.
+
+    This is the inverse of OpenCV's 4/5/8-coefficient Brown--Conrady camera
+    model.  Keeping it here lets both the simple bearing path and the full
+    camera-to-axis geometry consume the same calibrated ray.
+    """
+
+    distorted_x = (
+        u_px - config.camera_center_x_px
+    ) / config.focal_length_x_px
+    distorted_y = (
+        v_px - config.camera_center_y_px
+    ) / config.focal_length_y_px
+    coefficients = list(config.camera_distortion_coeffs) + [0.0] * 8
+    k1, k2, p1, p2, k3, k4, k5, k6 = coefficients[:8]
+    if not any(config.camera_distortion_coeffs):
+        return distorted_x, -distorted_y
+
+    x = distorted_x
+    y = distorted_y
+    for _ in range(8):
+        radius2 = x * x + y * y
+        radius4 = radius2 * radius2
+        radius6 = radius4 * radius2
+        numerator = 1.0 + k1 * radius2 + k2 * radius4 + k3 * radius6
+        denominator = 1.0 + k4 * radius2 + k5 * radius4 + k6 * radius6
+        if abs(denominator) < 1e-12:
+            raise ValueError("camera distortion denominator is zero")
+        radial = numerator / denominator
+        if abs(radial) < 1e-12:
+            raise ValueError("camera distortion radial scale is zero")
+        tangential_x = 2.0 * p1 * x * y + p2 * (radius2 + 2.0 * x * x)
+        tangential_y = p1 * (radius2 + 2.0 * y * y) + 2.0 * p2 * x * y
+        x = (distorted_x - tangential_x) / radial
+        y = (distorted_y - tangential_y) / radial
+    return x, -y
+
+
 def pixel_to_camera_point(
     u_px: float,
     v_px: float,
@@ -99,9 +142,10 @@ def pixel_to_camera_point(
     if distance_m <= 0:
         raise ValueError("distance_m must be positive")
     z = distance_m
+    normalized_x, normalized_y = normalized_image_coordinates(u_px, v_px, config)
     return Point3D(
-        (u_px - config.camera_center_x_px) * z / config.focal_length_x_px,
-        (config.camera_center_y_px - v_px) * z / config.focal_length_y_px,
+        normalized_x * z,
+        normalized_y * z,
         z,
     )
 
