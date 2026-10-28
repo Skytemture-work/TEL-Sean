@@ -11,8 +11,6 @@ from __future__ import annotations
 import argparse
 import time
 from dataclasses import replace
-import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import cv2
@@ -34,6 +32,11 @@ from .board_pose import (
 )
 from .config import TurretConfig
 from .controller import TurretController
+from .dashboard import (
+    DashboardState,
+    build_dashboard_snapshot,
+    start_dashboard_server,
+)
 from .detection import boxes_to_board_targets
 from .engagement import BoardEngagement
 from .fixed_board import calibrate_layout, load_layout
@@ -44,49 +47,6 @@ from .scoring_strategy import (
     append_reallocated_grid_shots,
     build_max_score_strategy,
 )
-
-
-class _LiveFrame:
-    def __init__(self):
-        self.frame = None
-        self.lock = threading.Lock()
-        self.running = True
-
-
-class _LiveHandler(BaseHTTPRequestHandler):
-    state = None
-
-    def do_GET(self):  # noqa: N802
-        if self.path == "/":
-            body = b'<meta charset="utf-8"><h2>REAL BOARD AIM</h2><img src="/stream" style="max-width:100%">'
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            return
-        if self.path != "/stream":
-            self.send_error(404)
-            return
-        self.send_response(200)
-        self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
-        self.end_headers()
-        try:
-            while self.state.running:
-                with self.state.lock:
-                    frame = self.state.frame
-                if frame:
-                    self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\n\r\n")
-                    self.wfile.write(frame)
-                    self.wfile.write(b"\r\n")
-                    self.wfile.flush()
-                time.sleep(0.05)
-        except (BrokenPipeError, ConnectionResetError):
-            pass
-
-    def log_message(self, *_args):
-        pass
-
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Real camera + real motors, 12-hole board aiming")
@@ -99,7 +59,12 @@ def main() -> None:
     parser.add_argument("--zed-uvc", action="store_true")
     parser.add_argument("--cooldown", type=float, default=1.0)
     parser.add_argument("--headless", action="store_true", help="不開 OpenCV 視窗")
-    parser.add_argument("--web-port", type=int, default=0, help="提供 Mac 瀏覽器影像串流的 port")
+    parser.add_argument(
+        "--web-port",
+        type=int,
+        default=0,
+        help="提供即時影像、孔位與砲塔資料儀表板的 port（例如 8080）",
+    )
     parser.add_argument(
         "--virtual-board",
         action="store_true",
@@ -222,13 +187,14 @@ def main() -> None:
     window = "REAL BOARD AIM - F confirm / S skip / G score start / Q quit"
     if not args.headless:
         cv2.namedWindow(window, cv2.WINDOW_NORMAL)
-    live = _LiveFrame() if args.web_port else None
+    dashboard = DashboardState() if args.web_port else None
     web_server = None
-    if live is not None:
-        _LiveHandler.state = live
-        web_server = ThreadingHTTPServer(("0.0.0.0", args.web_port), _LiveHandler)
-        threading.Thread(target=web_server.serve_forever, daemon=True).start()
-        print(f"Mac 瀏覽器開啟：http://<robot-ip>:{args.web_port}", flush=True)
+    if dashboard is not None:
+        web_server = start_dashboard_server(dashboard, args.web_port)
+        print(
+            f"即時儀表板：http://<robot-ip>:{args.web_port}",
+            flush=True,
+        )
     last_report = 0.0
     last_target_id = None
     if args.layout:
@@ -515,6 +481,8 @@ def main() -> None:
                     expiry_processed_round_id = score_round.round_id
 
             status = driver.update()
+            yaw_motor_state = motors.get_state(config.yaw_motor_id)
+            pitch_motor_state = motors.get_state(config.pitch_motor_id)
             if (
                 args.score_mode
                 and status.skipped
@@ -640,11 +608,40 @@ def main() -> None:
                 2,
                 cv2.LINE_AA,
             )
-            if live is not None:
+            if dashboard is not None:
+                dashboard.update_telemetry(
+                    build_dashboard_snapshot(
+                        plan=plan,
+                        board_plan=board_plan,
+                        engagement_status=status,
+                        config=config,
+                        pose=pose,
+                        pose_ready=pose_ready,
+                        virtual_board=args.virtual_board,
+                        frame_size_ok=frame_size_ok,
+                        raw_detection_count=len(raw_detected),
+                        board_detection_count=len(detected),
+                        board_surface_found=board_surface is not None,
+                        score_mode=args.score_mode,
+                        match_phase=args.match_phase,
+                        score_state=score_state,
+                        bonus_hole_id=last_bonus_hole_id,
+                        operator_fire_pending=fire_requested,
+                        current_yaw_motor_rad=(
+                            yaw_motor_state.position_rad
+                            if yaw_motor_state is not None
+                            else None
+                        ),
+                        current_pitch_motor_rad=(
+                            pitch_motor_state.position_rad
+                            if pitch_motor_state is not None
+                            else None
+                        ),
+                    )
+                )
                 ok_jpg, encoded = cv2.imencode(".jpg", display, [cv2.IMWRITE_JPEG_QUALITY, 80])
                 if ok_jpg:
-                    with live.lock:
-                        live.frame = encoded.tobytes()
+                    dashboard.update_frame(encoded.tobytes())
             key = -1
             if not args.headless:
                 cv2.imshow(window, display)
@@ -674,8 +671,8 @@ def main() -> None:
         camera.release()
         if not args.headless:
             cv2.destroyAllWindows()
-        if live is not None:
-            live.running = False
+        if dashboard is not None:
+            dashboard.stop()
         if web_server is not None:
             web_server.shutdown()
             web_server.server_close()

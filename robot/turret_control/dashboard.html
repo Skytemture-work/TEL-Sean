@@ -1,0 +1,749 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>TEL Vision Fire Control</title>
+  <style>
+    :root {
+      --bg: #070b12;
+      --panel: #0d1420;
+      --panel-2: #111b2a;
+      --line: #203044;
+      --text: #edf6ff;
+      --muted: #8496aa;
+      --cyan: #35d9ff;
+      --green: #48e29c;
+      --amber: #ffc85a;
+      --magenta: #ff4fd8;
+      --red: #ff6475;
+      --blue: #5a8cff;
+      --shadow: 0 18px 50px rgba(0, 0, 0, .34);
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--text);
+      background:
+        radial-gradient(circle at 8% 0%, rgba(53, 217, 255, .08), transparent 30rem),
+        radial-gradient(circle at 100% 20%, rgba(255, 79, 216, .07), transparent 28rem),
+        var(--bg);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+        "Segoe UI", "Noto Sans TC", sans-serif;
+      letter-spacing: .01em;
+    }
+
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      opacity: .16;
+      background-image:
+        linear-gradient(rgba(255, 255, 255, .018) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255, 255, 255, .018) 1px, transparent 1px);
+      background-size: 28px 28px;
+      mask-image: linear-gradient(to bottom, black, transparent 82%);
+    }
+
+    .shell {
+      width: min(1680px, calc(100% - 28px));
+      margin: 0 auto;
+      padding: 18px 0 32px;
+    }
+
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 20px;
+      margin-bottom: 14px;
+      padding: 12px 4px;
+    }
+
+    .brand { display: flex; align-items: center; gap: 13px; }
+
+    .brand-mark {
+      width: 42px;
+      height: 42px;
+      display: grid;
+      place-items: center;
+      border: 1px solid rgba(53, 217, 255, .48);
+      border-radius: 12px;
+      color: var(--cyan);
+      background: linear-gradient(145deg, rgba(53, 217, 255, .16), rgba(90, 140, 255, .04));
+      box-shadow: 0 0 28px rgba(53, 217, 255, .12), inset 0 0 18px rgba(53, 217, 255, .08);
+      font-size: 13px;
+      font-weight: 900;
+      letter-spacing: .08em;
+    }
+
+    h1 { margin: 0; font-size: clamp(19px, 2vw, 26px); letter-spacing: .04em; }
+    .subtitle { margin-top: 3px; color: var(--muted); font-size: 12px; letter-spacing: .14em; }
+
+    .connection {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      min-width: max-content;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      background: var(--red);
+      box-shadow: 0 0 0 4px rgba(255, 100, 117, .1);
+    }
+
+    .connection.online .dot {
+      background: var(--green);
+      box-shadow: 0 0 0 4px rgba(72, 226, 156, .1), 0 0 14px rgba(72, 226, 156, .55);
+    }
+
+    .summary-grid {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(120px, 1fr));
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+
+    .summary {
+      min-height: 76px;
+      padding: 13px 15px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: linear-gradient(145deg, rgba(17, 27, 42, .93), rgba(10, 16, 26, .93));
+      box-shadow: var(--shadow);
+    }
+
+    .eyebrow {
+      color: var(--muted);
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: .17em;
+      text-transform: uppercase;
+    }
+
+    .summary strong {
+      display: block;
+      margin-top: 6px;
+      font-size: 22px;
+      line-height: 1;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .summary small { display: block; margin-top: 5px; color: var(--muted); font-size: 11px; }
+
+    .workspace {
+      display: grid;
+      grid-template-columns: minmax(0, 1.65fr) minmax(360px, .85fr);
+      gap: 12px;
+      align-items: stretch;
+    }
+
+    .panel {
+      position: relative;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: linear-gradient(155deg, rgba(17, 27, 42, .96), rgba(8, 13, 22, .97));
+      box-shadow: var(--shadow);
+    }
+
+    .panel-head {
+      min-height: 48px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 12px 15px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .panel-title { font-size: 13px; font-weight: 800; letter-spacing: .08em; }
+    .panel-meta { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+
+    .video-wrap {
+      position: relative;
+      min-height: 390px;
+      aspect-ratio: 16 / 9;
+      display: grid;
+      place-items: center;
+      background: #03060a;
+    }
+
+    .video-wrap img {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      display: block;
+    }
+
+    .video-wrap::after {
+      content: "";
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      background: repeating-linear-gradient(
+        to bottom,
+        transparent 0,
+        transparent 3px,
+        rgba(255, 255, 255, .018) 4px
+      );
+      mix-blend-mode: screen;
+    }
+
+    .video-corner {
+      position: absolute;
+      z-index: 2;
+      padding: 7px 9px;
+      border-radius: 8px;
+      color: #dff9ff;
+      background: rgba(3, 8, 14, .72);
+      border: 1px solid rgba(53, 217, 255, .28);
+      backdrop-filter: blur(8px);
+      font-size: 10px;
+      letter-spacing: .08em;
+    }
+
+    .video-corner.left { left: 12px; bottom: 12px; }
+    .video-corner.right { right: 12px; bottom: 12px; }
+
+    .vision-strip {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      border-top: 1px solid var(--line);
+    }
+
+    .vision-stat { padding: 12px 14px; border-right: 1px solid var(--line); }
+    .vision-stat:last-child { border-right: 0; }
+    .vision-stat b { display: block; margin-top: 5px; font-size: 15px; font-variant-numeric: tabular-nums; }
+
+    .target-panel { padding-bottom: 14px; }
+
+    .target-hero {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 14px;
+      align-items: center;
+      padding: 18px 16px 14px;
+    }
+
+    .target-id {
+      min-width: 88px;
+      height: 88px;
+      display: grid;
+      place-items: center;
+      border: 1px solid rgba(255, 79, 216, .52);
+      border-radius: 50%;
+      color: var(--magenta);
+      background: radial-gradient(circle, rgba(255, 79, 216, .16), transparent 65%);
+      box-shadow: inset 0 0 24px rgba(255, 79, 216, .08), 0 0 25px rgba(255, 79, 216, .1);
+      font-size: 23px;
+      font-weight: 900;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .target-distance { margin-top: 5px; font-size: 31px; font-weight: 850; font-variant-numeric: tabular-nums; }
+    .target-distance span { color: var(--muted); font-size: 13px; font-weight: 600; }
+    .target-detail { margin-top: 6px; color: var(--muted); font-size: 11px; line-height: 1.7; }
+
+    .safety {
+      margin: 0 15px 13px;
+      padding: 10px 12px;
+      border: 1px solid rgba(255, 200, 90, .26);
+      border-radius: 10px;
+      color: #ffe5ac;
+      background: rgba(255, 200, 90, .07);
+      font-size: 12px;
+      line-height: 1.45;
+    }
+
+    .safety.ready {
+      border-color: rgba(72, 226, 156, .3);
+      color: #bdffe0;
+      background: rgba(72, 226, 156, .07);
+    }
+
+    .axis-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; padding: 0 15px; }
+
+    .axis-card {
+      padding: 13px;
+      border: 1px solid var(--line);
+      border-radius: 13px;
+      background: rgba(7, 12, 20, .68);
+    }
+
+    .axis-name { display: flex; align-items: center; justify-content: space-between; color: var(--muted); font-size: 11px; }
+    .axis-direction { color: var(--cyan); font-weight: 800; }
+    .axis-delta { margin-top: 8px; font-size: 22px; font-weight: 850; font-variant-numeric: tabular-nums; }
+    .axis-values { display: flex; justify-content: space-between; margin-top: 9px; color: var(--muted); font-size: 10px; line-height: 1.5; }
+    .axis-values b { display: block; color: var(--text); font-size: 13px; font-variant-numeric: tabular-nums; }
+
+    .delta-track {
+      position: relative;
+      height: 5px;
+      margin-top: 11px;
+      border-radius: 99px;
+      background: #1a2736;
+      overflow: hidden;
+    }
+
+    .delta-track::after { content: ""; position: absolute; left: 50%; top: 0; width: 1px; height: 100%; background: rgba(255,255,255,.46); }
+    .delta-fill { position: absolute; top: 0; left: 50%; height: 100%; width: 0; background: var(--cyan); transition: all .16s linear; }
+
+    .target-metrics {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 8px;
+      padding: 12px 15px 0;
+    }
+
+    .mini {
+      padding: 10px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: rgba(7, 12, 20, .5);
+    }
+
+    .mini b { display: block; margin-top: 5px; font-size: 13px; font-variant-numeric: tabular-nums; }
+
+    .lower-grid {
+      display: grid;
+      grid-template-columns: minmax(360px, .72fr) minmax(0, 1.28fr);
+      gap: 12px;
+      margin-top: 12px;
+    }
+
+    .board-content { padding: 15px; }
+
+    .board-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(78px, 1fr));
+      gap: 9px;
+    }
+
+    .hole {
+      min-height: 74px;
+      position: relative;
+      padding: 11px;
+      border: 1px solid var(--line);
+      border-radius: 13px;
+      background: rgba(5, 10, 17, .66);
+      transition: border-color .18s, background .18s, transform .18s;
+    }
+
+    .hole b { font-size: 15px; font-variant-numeric: tabular-nums; }
+    .hole-status { float: right; color: var(--muted); font-size: 9px; letter-spacing: .08em; }
+    .hole-counts { display: block; margin-top: 8px; color: var(--muted); font-size: 10px; line-height: 1.45; }
+    .hole-distance { display: block; margin-top: 3px; color: #b7c7d8; font-size: 10px; font-variant-numeric: tabular-nums; }
+    .hole.fired { border-color: rgba(72, 226, 156, .46); background: rgba(72, 226, 156, .07); }
+    .hole.fired b { color: var(--green); }
+    .hole.pending { border-color: rgba(90, 140, 255, .36); background: rgba(90, 140, 255, .055); }
+    .hole.pending b { color: #91afff; }
+    .hole.skipped { border-color: rgba(255, 100, 117, .42); background: rgba(255, 100, 117, .06); }
+    .hole.skipped b { color: var(--red); }
+    .hole.current {
+      z-index: 1;
+      border-color: rgba(255, 79, 216, .8);
+      background: rgba(255, 79, 216, .1);
+      transform: translateY(-2px);
+      box-shadow: 0 0 24px rgba(255, 79, 216, .13), inset 0 0 16px rgba(255, 79, 216, .05);
+      animation: pulse 1.5s ease-in-out infinite;
+    }
+    .hole.current b { color: var(--magenta); }
+
+    @keyframes pulse { 50% { border-color: rgba(255, 79, 216, .38); } }
+
+    .hole-lists { display: grid; gap: 10px; margin-top: 14px; }
+    .chip-row { display: grid; grid-template-columns: 76px 1fr; gap: 8px; align-items: start; }
+    .chip-label { padding-top: 5px; color: var(--muted); font-size: 10px; }
+    .chips { display: flex; flex-wrap: wrap; gap: 5px; min-height: 24px; }
+    .chip { padding: 4px 7px; border: 1px solid var(--line); border-radius: 7px; color: #c9d7e6; background: rgba(255,255,255,.025); font-size: 10px; }
+    .chip.good { border-color: rgba(72, 226, 156, .32); color: var(--green); }
+    .chip.empty { color: var(--muted); font-style: italic; }
+
+    .queue-wrap { max-height: 430px; overflow: auto; }
+    table { width: 100%; border-collapse: collapse; font-size: 11px; }
+    th { position: sticky; top: 0; z-index: 2; padding: 10px 12px; color: var(--muted); background: #0d1623; text-align: left; font-size: 9px; letter-spacing: .12em; }
+    td { padding: 9px 12px; border-top: 1px solid rgba(32, 48, 68, .72); font-variant-numeric: tabular-nums; }
+    tr.current { background: rgba(255, 79, 216, .08); color: #ffd4f6; }
+    tr.fired { color: #9eeec8; }
+    tr.skipped { color: #ff9eaa; }
+    .queue-state { font-size: 9px; letter-spacing: .06em; }
+
+    .score-box {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 10px;
+      margin: 12px 15px 0;
+      padding: 11px 12px;
+      border: 1px solid var(--line);
+      border-radius: 11px;
+      background: rgba(7, 12, 20, .62);
+    }
+    .score-box b { color: var(--red); }
+    .score-time { color: var(--amber); font-weight: 800; font-variant-numeric: tabular-nums; }
+
+    @media (max-width: 1160px) {
+      .summary-grid { grid-template-columns: repeat(3, 1fr); }
+      .workspace { grid-template-columns: 1fr; }
+      .target-panel { min-height: auto; }
+    }
+
+    @media (max-width: 780px) {
+      .shell { width: min(100% - 16px, 1680px); padding-top: 8px; }
+      .topbar { align-items: flex-start; }
+      .subtitle { display: none; }
+      .summary-grid { grid-template-columns: repeat(2, 1fr); }
+      .summary { min-height: 68px; }
+      .lower-grid { grid-template-columns: 1fr; }
+      .video-wrap { min-height: 240px; }
+      .vision-strip { grid-template-columns: repeat(2, 1fr); }
+      .vision-stat:nth-child(2) { border-right: 0; }
+      .vision-stat:nth-child(-n+2) { border-bottom: 1px solid var(--line); }
+    }
+
+    @media (max-width: 480px) {
+      .connection span:last-child { display: none; }
+      .target-hero { grid-template-columns: 72px 1fr; }
+      .target-id { min-width: 72px; height: 72px; font-size: 19px; }
+      .target-distance { font-size: 26px; }
+      .axis-grid { grid-template-columns: 1fr; }
+      .target-metrics { grid-template-columns: repeat(2, 1fr); }
+      .board-grid { gap: 6px; }
+      .hole { min-height: 68px; padding: 8px; }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark">TEL</div>
+        <div>
+          <h1>Vision Fire Control</h1>
+          <div class="subtitle">REAL-TIME TARGETING / 12-HOLE BOARD</div>
+        </div>
+      </div>
+      <div class="connection" id="connection">
+        <i class="dot"></i>
+        <span id="connectionText">等待機器人資料</span>
+        <span id="lastUpdate">—</span>
+      </div>
+    </header>
+
+    <section class="summary-grid">
+      <article class="summary"><span class="eyebrow">下一孔位</span><strong id="sumNext">—</strong><small id="sumShot">尚未建立計畫</small></article>
+      <article class="summary"><span class="eyebrow">目標距離</span><strong id="sumDistance">—</strong><small>相機光軸深度</small></article>
+      <article class="summary"><span class="eyebrow">已發射</span><strong id="sumFired">0</strong><small id="sumFiredHoles">0 個孔位</small></article>
+      <article class="summary"><span class="eyebrow">剩餘球數</span><strong id="sumRemaining">0</strong><small id="sumTotal">共 0 球</small></article>
+      <article class="summary"><span class="eyebrow">靶面姿態</span><strong id="sumPose">—</strong><small id="sumPoseMeta">等待 PnP</small></article>
+      <article class="summary"><span class="eyebrow">發射閘門</span><strong id="sumGate">鎖定</strong><small id="sumGateMeta">尚未就緒</small></article>
+    </section>
+
+    <section class="workspace">
+      <article class="panel">
+        <div class="panel-head">
+          <div class="panel-title">影像辨識畫面</div>
+          <div class="panel-meta" id="visionMeta">YOLO — / 靶面 —</div>
+        </div>
+        <div class="video-wrap">
+          <img src="/stream" alt="機器人即時辨識影像">
+          <div class="video-corner left" id="videoTarget">TARGET —</div>
+          <div class="video-corner right" id="videoPose">POSE —</div>
+        </div>
+        <div class="vision-strip">
+          <div class="vision-stat"><span class="eyebrow">原始候選</span><b id="rawDetections">—</b></div>
+          <div class="vision-stat"><span class="eyebrow">靶面內孔位</span><b id="boardDetections">—</b></div>
+          <div class="vision-stat"><span class="eyebrow">PnP 對應點</span><b id="posePoints">—</b></div>
+          <div class="vision-stat"><span class="eyebrow">重投影誤差</span><b id="poseError">—</b></div>
+        </div>
+      </article>
+
+      <aside class="panel target-panel">
+        <div class="panel-head">
+          <div class="panel-title">即將發射孔位</div>
+          <div class="panel-meta" id="modeMeta">NORMAL / —</div>
+        </div>
+        <div class="target-hero">
+          <div class="target-id" id="targetId">—</div>
+          <div>
+            <span class="eyebrow">TARGET RANGE</span>
+            <div class="target-distance"><span id="targetDistance">—</span> <span>m</span></div>
+            <div class="target-detail" id="targetDetail">像素 — / 信心度 — / 孔徑 —</div>
+          </div>
+        </div>
+
+        <div class="safety" id="safetyMessage">等待目標與姿態資料</div>
+
+        <div class="axis-grid">
+          <section class="axis-card">
+            <div class="axis-name"><span>水平 YAW</span><span class="axis-direction" id="yawDirection">—</span></div>
+            <div class="axis-delta" id="yawDelta">—</div>
+            <div class="delta-track"><i class="delta-fill" id="yawFill"></i></div>
+            <div class="axis-values">
+              <span>目前<b id="yawCurrent">—</b></span>
+              <span>目標<b id="yawTarget">—</b></span>
+            </div>
+          </section>
+          <section class="axis-card">
+            <div class="axis-name"><span>垂直 PITCH</span><span class="axis-direction" id="pitchDirection">—</span></div>
+            <div class="axis-delta" id="pitchDelta">—</div>
+            <div class="delta-track"><i class="delta-fill" id="pitchFill"></i></div>
+            <div class="axis-values">
+              <span>目前<b id="pitchCurrent">—</b></span>
+              <span>目標<b id="pitchTarget">—</b></span>
+            </div>
+          </section>
+        </div>
+
+        <div class="target-metrics">
+          <div class="mini"><span class="eyebrow">水平軸距離</span><b id="yawAxisDistance">—</b></div>
+          <div class="mini"><span class="eyebrow">垂直軸距離</span><b id="pitchAxisDistance">—</b></div>
+          <div class="mini"><span class="eyebrow">可達性</span><b id="reachable">—</b></div>
+          <div class="mini"><span class="eyebrow">水平命令偏角</span><b id="commandYaw">—</b></div>
+          <div class="mini"><span class="eyebrow">垂直命令偏角</span><b id="commandPitch">—</b></div>
+          <div class="mini"><span class="eyebrow">操作確認</span><b id="operatorConfirm">—</b></div>
+        </div>
+
+        <div class="score-box">
+          <div><span class="eyebrow">指定得分孔</span><br><b id="bonusHole">—</b></div>
+          <div class="score-time" id="scoreTime">—</div>
+        </div>
+      </aside>
+    </section>
+
+    <section class="lower-grid">
+      <article class="panel">
+        <div class="panel-head">
+          <div class="panel-title">靶面孔位狀態</div>
+          <div class="panel-meta">上方為 Ø20 / 下方為 Ø40</div>
+        </div>
+        <div class="board-content">
+          <div class="board-grid" id="boardGrid"></div>
+          <div class="hole-lists">
+            <div class="chip-row"><span class="chip-label">已發射孔位</span><div class="chips" id="firedHoles"></div></div>
+            <div class="chip-row"><span class="chip-label">未發射孔位</span><div class="chips" id="unfiredHoles"></div></div>
+            <div class="chip-row"><span class="chip-label">仍在計畫</span><div class="chips" id="pendingHoles"></div></div>
+          </div>
+        </div>
+      </article>
+
+      <article class="panel">
+        <div class="panel-head">
+          <div class="panel-title">完整射擊佇列</div>
+          <div class="panel-meta" id="queueMeta">0 / 0</div>
+        </div>
+        <div class="queue-wrap">
+          <table>
+            <thead><tr><th>順序</th><th>孔位</th><th>狀態</th><th>距離</th></tr></thead>
+            <tbody id="queueBody"></tbody>
+          </table>
+        </div>
+      </article>
+    </section>
+  </main>
+
+  <script>
+    const boardOrder = ["H10", "H11", "H12", "H03", "H06", "H09", "H02", "H05", "H08", "H01", "H04", "H07"];
+    const stateText = { current: "即將發射", fired: "已發射", pending: "待發射", skipped: "已略過", unscheduled: "未排程" };
+    const $ = id => document.getElementById(id);
+
+    function text(id, value) { $(id).textContent = value; }
+    function fmt(value, digits = 2, suffix = "") {
+      return value === null || value === undefined || Number.isNaN(Number(value))
+        ? "—"
+        : `${Number(value).toFixed(digits)}${suffix}`;
+    }
+    function integer(value) { return value === null || value === undefined ? "—" : String(value); }
+    function phaseName(value) { return value === "upper" ? "上半場" : value === "lower" ? "下半場" : "一般模式"; }
+
+    function renderAxis(prefix, axis) {
+      axis = axis || {};
+      text(`${prefix}Direction`, axis.direction || "—");
+      text(`${prefix}Delta`, axis.delta_deg === null || axis.delta_deg === undefined ? "—" : `${Math.abs(axis.delta_deg).toFixed(2)}°`);
+      text(`${prefix}Current`, fmt(axis.current_deg, 2, "°"));
+      text(`${prefix}Target`, fmt(axis.target_deg, 2, "°"));
+      const fill = $(`${prefix}Fill`);
+      const value = Math.max(-12, Math.min(12, Number(axis.delta_deg || 0)));
+      const width = Math.abs(value) / 12 * 50;
+      fill.style.width = `${width}%`;
+      fill.style.left = value >= 0 ? "50%" : `${50 - width}%`;
+      fill.style.background = Math.abs(value) < .05 ? "var(--green)" : "var(--cyan)";
+    }
+
+    function renderChips(id, values, good = false) {
+      const container = $(id);
+      container.replaceChildren();
+      if (!values || !values.length) {
+        const item = document.createElement("span");
+        item.className = "chip empty";
+        item.textContent = "無";
+        container.append(item);
+        return;
+      }
+      values.forEach(value => {
+        const item = document.createElement("span");
+        item.className = `chip${good ? " good" : ""}`;
+        item.textContent = value;
+        container.append(item);
+      });
+    }
+
+    function renderBoard(holes) {
+      const byId = new Map((holes || []).map(hole => [hole.hole_id, hole]));
+      const grid = $("boardGrid");
+      grid.replaceChildren();
+      boardOrder.forEach(holeId => {
+        const hole = byId.get(holeId) || { hole_id: holeId, state: "unscheduled", fired_shots: 0, pending_shots: 0, skipped_shots: 0 };
+        const tile = document.createElement("div");
+        tile.className = `hole ${hole.state || "unscheduled"}`;
+        const name = document.createElement("b");
+        name.textContent = holeId;
+        const status = document.createElement("span");
+        status.className = "hole-status";
+        status.textContent = stateText[hole.state] || hole.state;
+        const counts = document.createElement("span");
+        counts.className = "hole-counts";
+        counts.textContent = `已射 ${hole.fired_shots || 0} ｜ 待射 ${hole.pending_shots || 0} ｜ 略過 ${hole.skipped_shots || 0}`;
+        const distance = document.createElement("span");
+        distance.className = "hole-distance";
+        distance.textContent = `距離 ${fmt(hole.distance_m, 2, " m")}`;
+        tile.append(name, status, counts, distance);
+        grid.append(tile);
+      });
+    }
+
+    function renderQueue(plan) {
+      const body = $("queueBody");
+      body.replaceChildren();
+      const sequence = plan.sequence || [];
+      sequence.forEach(item => {
+        const row = document.createElement("tr");
+        row.className = item.state || "";
+        [
+          `#${String(item.shot_number).padStart(2, "0")}`,
+          item.hole_id,
+          stateText[item.state] || item.state,
+          fmt(item.distance_m, 2, " m")
+        ].forEach((value, index) => {
+          const cell = document.createElement("td");
+          cell.textContent = value;
+          if (index === 2) cell.className = "queue-state";
+          row.append(cell);
+        });
+        body.append(row);
+      });
+      if (!sequence.length) {
+        const row = document.createElement("tr");
+        const cell = document.createElement("td");
+        cell.colSpan = 4;
+        cell.textContent = "尚未建立射擊計畫";
+        cell.style.color = "var(--muted)";
+        row.append(cell);
+        body.append(row);
+      }
+      text("queueMeta", `${plan.fired_shots || 0} 已射 / ${plan.pending_shots || 0} 待射 / ${plan.total_shots || 0} 總計`);
+    }
+
+    function render(data) {
+      const system = data.system || {};
+      const vision = data.vision || {};
+      const pose = data.pose || {};
+      const firing = data.firing || {};
+      const target = data.target || {};
+      const plan = data.plan || {};
+      const score = data.score || {};
+
+      text("sumNext", target.hole_id || "—");
+      text("sumShot", plan.total_shots ? `第 ${Math.min((plan.index || 0) + 1, plan.total_shots)} / ${plan.total_shots} 球` : "尚未建立計畫");
+      text("sumDistance", target.distance_m === null || target.distance_m === undefined ? "—" : `${target.distance_m.toFixed(2)} m`);
+      text("sumFired", integer(plan.fired_shots || 0));
+      text("sumFiredHoles", `${(plan.fired_holes || []).length} 個孔位`);
+      text("sumRemaining", integer(plan.remaining_shots || 0));
+      text("sumTotal", `共 ${plan.total_shots || 0} 球`);
+      text("sumPose", ({ ready: "穩定", settling: "收斂中", invalid: "無效", virtual: "虛擬" })[pose.state] || "—");
+      text("sumPoseMeta", pose.reprojection_error_px === null || pose.reprojection_error_px === undefined ? "等待 PnP" : `誤差 ${pose.reprojection_error_px.toFixed(2)} px`);
+      text("sumGate", firing.allowed ? "就緒" : "鎖定");
+      text("sumGateMeta", firing.allowed ? "可接受操作確認" : "安全條件未成立");
+      $("sumGate").style.color = firing.allowed ? "var(--green)" : "var(--amber)";
+
+      text("visionMeta", `YOLO ${vision.raw_detections ?? "—"} / 靶面 ${vision.board_detections ?? "—"}`);
+      text("rawDetections", integer(vision.raw_detections));
+      text("boardDetections", integer(vision.board_detections));
+      text("posePoints", integer(pose.correspondences));
+      text("poseError", fmt(pose.reprojection_error_px, 2, " px"));
+      text("videoTarget", `TARGET ${target.hole_id || "—"}`);
+      text("videoPose", `POSE ${(pose.state || "—").toUpperCase()}`);
+
+      text("targetId", target.hole_id || "—");
+      text("targetDistance", fmt(target.distance_m, 2));
+      text("targetDetail", `像素 ${fmt(target.pixel_u, 1)}, ${fmt(target.pixel_v, 1)} / 信心度 ${fmt(target.confidence, 2)} / 孔徑 ${fmt(target.diameter_cm, 0, " cm")}`);
+      text("modeMeta", `${score.enabled ? "SCORE" : "NORMAL"} / ${phaseName(system.match_phase)}`);
+
+      const safety = $("safetyMessage");
+      if (firing.allowed) {
+        safety.textContent = firing.operator_confirmation_pending ? "發射條件成立，已收到 F 操作確認" : "瞄準條件成立；實際發射仍需操作確認與硬體安全迴路";
+        safety.className = "safety ready";
+      } else {
+        safety.textContent = firing.blocked_reason || "發射閘門鎖定";
+        safety.className = "safety";
+      }
+
+      renderAxis("yaw", target.yaw);
+      renderAxis("pitch", target.pitch);
+      text("yawAxisDistance", fmt(target.yaw_axis_distance_m, 2, " m"));
+      text("pitchAxisDistance", fmt(target.pitch_axis_distance_m, 2, " m"));
+      text("reachable", firing.reachable ? "可達" : "不可達");
+      $("reachable").style.color = firing.reachable ? "var(--green)" : "var(--red)";
+      text("commandYaw", fmt(target.command_yaw_error_deg, 2, "°"));
+      text("commandPitch", fmt(target.command_pitch_error_deg, 2, "°"));
+      text("operatorConfirm", firing.operator_confirmation_pending ? "已確認" : "等待 F");
+
+      text("bonusHole", score.active_bonus_hole || "—");
+      text("scoreTime", score.enabled ? fmt(score.remaining_s, 1, " s") : "未啟用");
+
+      renderBoard(plan.holes || []);
+      renderChips("firedHoles", plan.fired_holes || [], true);
+      renderChips("unfiredHoles", plan.unfired_holes || []);
+      renderChips("pendingHoles", plan.pending_holes || []);
+      renderQueue(plan);
+    }
+
+    function setConnection(online, message) {
+      $("connection").classList.toggle("online", online);
+      text("connectionText", message);
+    }
+
+    async function poll() {
+      try {
+        const response = await fetch("/api/status", { cache: "no-store" });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const data = await response.json();
+        const age = Date.now() - Number(data.generated_at_ms || 0);
+        const live = Boolean(data.system && data.system.online) && age < 1800;
+        setConnection(live, live ? "機器人連線正常" : "資料已逾時");
+        text("lastUpdate", age < 60000 ? `${Math.max(0, age / 1000).toFixed(1)}s` : "—");
+        render(data);
+      } catch (error) {
+        setConnection(false, "無法取得即時資料");
+        text("lastUpdate", "—");
+      } finally {
+        window.setTimeout(poll, 200);
+      }
+    }
+
+    renderBoard([]);
+    renderQueue({ sequence: [] });
+    poll();
+  </script>
+</body>
+</html>

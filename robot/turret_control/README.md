@@ -67,6 +67,7 @@ YOLO 若只有一個類別，`classify_by_size()` 會用「大孔是小孔的 2 
 | `control_loop.py` | 200 Hz 固定頻率迴圈 + 偵測執行緒 |
 | `board.py` | 靶板模型：測距、尺寸分類、接戰排序 |
 | `board_pose.py` | 每幀 PnP 靶面姿態、平滑、移動判定與 12 孔重投影 |
+| `dashboard.py` / `dashboard.html` | 區網即時影像、孔位、射擊佇列與砲塔角度儀表板 |
 | `engagement.py` | 逐孔接戰驅動，含射擊冷卻與逾時跳過 |
 | `detection.py` | YOLO 結果轉靶板目標 |
 
@@ -133,6 +134,10 @@ python3 -m turret_control.run_yolo_demo --device cpu --zed-uvc
 # 真實影像靶板預覽：偵測全部 12 孔、尺寸分類、單目測距、接戰排序
 python3 -m turret_control.run_yolo_demo --board --device cpu --zed-uvc
 # 預覽視窗按 p 可在終端列印目前完整計畫，按 q/Esc 離開
+
+# 實機自動瞄準 + 區網即時儀表板（會連接並使能真實馬達，先確認急停）
+python3 -m turret_control.run_board_real --zed-uvc --web-port 8080
+# 同一區網的電腦／平板開啟：http://<robot-ip>:8080
 
 # 測試
 python3 -m unittest discover -s tests
