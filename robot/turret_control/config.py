@@ -131,6 +131,13 @@ class TurretConfig:
     # possible: distance = focal_px * diameter_m / apparent_px.
     small_hole_diameter_m: float = 0.20
     large_hole_diameter_m: float = 0.40
+    # Allowed physical centre-position error when validating a detected grid.
+    # The official drawing and field measurement allow roughly +/-2 cm.
+    board_position_tolerance_cm: float = 2.0
+    # Dark-board ROI detector.  Tune value threshold if field illumination
+    # makes the black surface appear brighter or the background darker.
+    board_dark_value_threshold: int = 105
+    board_min_area_fraction: float = 0.04
 
     # Engagement order: every large hole first, then the small ones; columns
     # left to right; within a column bottom to top.  Column-at-a-time keeps the
@@ -206,6 +213,12 @@ class TurretConfig:
             raise ValueError("hole diameters must be positive")
         if self.small_hole_diameter_m >= self.large_hole_diameter_m:
             raise ValueError("small_hole_diameter_m must be smaller than large")
+        if self.board_position_tolerance_cm <= 0:
+            raise ValueError("board_position_tolerance_cm must be positive")
+        if not 0 <= self.board_dark_value_threshold <= 255:
+            raise ValueError("board_dark_value_threshold must be between 0 and 255")
+        if not 0.0 < self.board_min_area_fraction < 1.0:
+            raise ValueError("board_min_area_fraction must be between 0 and 1")
         geometry_values = (
             self.camera_to_yaw_yaw_rad,
             self.camera_to_yaw_pitch_rad,

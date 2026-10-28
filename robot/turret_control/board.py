@@ -21,9 +21,16 @@ from typing import Tuple
 import cv2
 import numpy as np
 from dataclasses import dataclass, replace
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from .aiming import TargetPixel
+from .official_board import (
+    BOARD_HEIGHT_CM,
+    BOARD_WIDTH_CM,
+    hole_id_for_cell,
+    hole_position,
+    hole_position_for_cell,
+)
 
 # Expected ratio between the large and small hole diameters (40 cm / 20 cm).
 _EXPECTED_SIZE_RATIO = 2.0
@@ -42,6 +49,9 @@ class BoardTarget:
     width_px: float
     height_px: float
     confidence: float = 1.0
+    # Equivalent circular diameter from the segmentation mask.  Older
+    # callers may omit it and continue using the box dimensions.
+    diameter_px: Optional[float] = None
     diameter_m: Optional[float] = None
     distance_m: Optional[float] = None
     column: Optional[int] = None
@@ -54,7 +64,9 @@ class BoardTarget:
 
     @property
     def size_px(self) -> float:
-        """Apparent diameter.  A circle, so average the two box sides."""
+        """Apparent hole diameter, preferring the segmentation mask."""
+        if self.diameter_px is not None and self.diameter_px > 0:
+            return self.diameter_px
         return (self.width_px + self.height_px) / 2.0
 
     def to_pixel(self) -> TargetPixel:
@@ -70,6 +82,67 @@ def distance_from_size(size_px: float, diameter_m: float, focal_px: float) -> fl
     if focal_px <= 0:
         raise ValueError("focal_px must be positive")
     return focal_px * diameter_m / size_px
+
+
+def _fit_board_homography(
+    expected_points: Sequence[Tuple[float, float]],
+    observed_points: Sequence[Tuple[float, float]],
+    tolerance_cm: Optional[float],
+) -> Optional[np.ndarray]:
+    """Fit a board-to-image homography and reject bad correspondences.
+
+    The homography is fitted in normalized board coordinates.  The residual is
+    then measured back in centimetres, so the tolerance is independent of
+    camera resolution and viewing distance.
+    """
+
+    if len(expected_points) < 4 or len(observed_points) != len(expected_points):
+        return None
+    if tolerance_cm is not None and tolerance_cm <= 0:
+        raise ValueError("tolerance_cm must be positive")
+
+    expected = np.asarray(expected_points, dtype=np.float32)
+    observed = np.asarray(observed_points, dtype=np.float32)
+    matrix, inlier_mask = cv2.findHomography(
+        expected,
+        observed,
+        cv2.RANSAC,
+        30.0,
+    )
+    if matrix is None or inlier_mask is None:
+        return None
+    if int(np.count_nonzero(inlier_mask)) < 4:
+        return None
+
+    if tolerance_cm is None:
+        return matrix
+
+    inverse = np.linalg.inv(matrix)
+    projected_back = cv2.perspectiveTransform(
+        observed.reshape(-1, 1, 2), inverse
+    ).reshape(-1, 2)
+    delta = projected_back - expected
+    error_cm = np.hypot(
+        delta[:, 0] * BOARD_WIDTH_CM,
+        delta[:, 1] * BOARD_HEIGHT_CM,
+    )
+    if float(np.max(error_cm)) > tolerance_cm:
+        return None
+    return matrix
+
+
+def board_geometry_is_valid(
+    targets: Sequence[BoardTarget], tolerance_cm: float = 2.0
+) -> bool:
+    """Check whether 12 detections agree with the official board geometry."""
+
+    identified = assign_hole_ids(targets)
+    if len(identified) != 12 or any(target.hole_id is None for target in identified):
+        return False
+
+    expected = [hole_position(target.hole_id) for target in identified]
+    observed = [(target.u_px, target.v_px) for target in identified]
+    return _fit_board_homography(expected, observed, tolerance_cm) is not None
 
 
 def classify_by_size(
@@ -170,6 +243,7 @@ def build_virtual_plan(
     large_first: bool = True,
     left_to_right: bool = True,
     bottom_to_top: bool = True,
+    position_tolerance_cm: Optional[float] = None,
 ) -> "EngagementPlan":
     """Build a plan for a screen/virtual board with non-real hole scale.
 
@@ -180,6 +254,8 @@ def build_virtual_plan(
     selected = select_board_targets(targets, require_size_ratio=False)
     identified = assign_hole_ids(selected)
     if len(identified) != 12 or any(target.hole_id is None for target in identified):
+        return EngagementPlan([])
+    if not board_geometry_is_valid(identified, position_tolerance_cm):
         return EngagementPlan([])
     classified = [
         replace(
@@ -192,6 +268,125 @@ def build_virtual_plan(
     return EngagementPlan(
         order_targets(
             classified,
+            large_first=large_first,
+            left_to_right=left_to_right,
+            bottom_to_top=bottom_to_top,
+        )
+    )
+
+
+def estimate_board_distance_from_targets(
+    targets: Sequence[BoardTarget],
+    board_quad: np.ndarray,
+    focal_px: float,
+    small_diameter_m: float,
+    large_diameter_m: float,
+    position_tolerance_cm: float = 2.0,
+) -> Optional[float]:
+    """Estimate board range from visible holes and a board quadrilateral."""
+
+    if not targets or focal_px <= 0:
+        return None
+    quad = np.asarray(board_quad, dtype=np.float32).reshape(4, 2)
+    source = np.asarray(
+        [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)],
+        dtype=np.float32,
+    )
+    matrix = cv2.getPerspectiveTransform(source, quad)
+    inverse = np.linalg.inv(matrix)
+    points = np.asarray(
+        [(target.u_px, target.v_px) for target in targets], dtype=np.float32
+    ).reshape(-1, 1, 2)
+    board_points = cv2.perspectiveTransform(points, inverse).reshape(-1, 2)
+
+    cells = [
+        (
+            column,
+            row,
+            np.asarray(hole_position_for_cell(column, row), dtype=np.float32),
+        )
+        for row in range(4)
+        for column in range(3)
+    ]
+    ranges = []
+    for target, point in zip(targets, board_points):
+        _, row, expected = min(
+            cells,
+            key=lambda item: np.linalg.norm(point - item[2]),
+        )
+        error_cm = np.linalg.norm(
+            (point - expected) * np.asarray((BOARD_WIDTH_CM, BOARD_HEIGHT_CM))
+        )
+        if error_cm > position_tolerance_cm or target.size_px <= 0:
+            continue
+        diameter_m = small_diameter_m if row == 0 else large_diameter_m
+        ranges.append(distance_from_size(target.size_px, diameter_m, focal_px))
+    return float(np.median(ranges)) if ranges else None
+
+
+def build_plan_from_board_quad(
+    board_quad: np.ndarray,
+    small_diameter_m: float,
+    large_diameter_m: float,
+    board_distance_m: Optional[float] = None,
+    large_first: bool = True,
+    left_to_right: bool = True,
+    bottom_to_top: bool = True,
+) -> "EngagementPlan":
+    """Project all fixed hole positions from a visible board quadrilateral."""
+
+    quad = np.asarray(board_quad, dtype=np.float32).reshape(4, 2)
+    source = np.asarray(
+        [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)],
+        dtype=np.float32,
+    )
+    if abs(cv2.contourArea(quad.reshape(-1, 1, 2))) < 1.0:
+        return EngagementPlan([])
+    matrix = cv2.getPerspectiveTransform(source, quad)
+
+    def project(point: Tuple[float, float]) -> np.ndarray:
+        value = np.asarray(point, dtype=np.float32).reshape(1, 1, 2)
+        return cv2.perspectiveTransform(value, matrix).reshape(2)
+
+    targets = []
+    for row in range(4):
+        for column in range(3):
+            normalized = hole_position_for_cell(column, row)
+            center = project(normalized)
+            diameter_cm = 20.0 if row == 0 else 40.0
+            diameter_m = small_diameter_m if row == 0 else large_diameter_m
+            dx = diameter_cm / BOARD_WIDTH_CM
+            dy = diameter_cm / BOARD_HEIGHT_CM
+            width_px = float(
+                np.linalg.norm(
+                    project((normalized[0] + dx / 2.0, normalized[1]))
+                    - project((normalized[0] - dx / 2.0, normalized[1]))
+                )
+            )
+            height_px = float(
+                np.linalg.norm(
+                    project((normalized[0], normalized[1] + dy / 2.0))
+                    - project((normalized[0], normalized[1] - dy / 2.0))
+                )
+            )
+            targets.append(
+                BoardTarget(
+                    u_px=float(center[0]),
+                    v_px=float(center[1]),
+                    width_px=width_px,
+                    height_px=height_px,
+                    confidence=1.0,
+                    diameter_px=(width_px + height_px) / 2.0,
+                    diameter_m=diameter_m,
+                    distance_m=board_distance_m,
+                    column=column,
+                    row=3 - row,
+                    hole_id=hole_id_for_cell(column, row),
+                )
+            )
+    return EngagementPlan(
+        order_targets(
+            targets,
             large_first=large_first,
             left_to_right=left_to_right,
             bottom_to_top=bottom_to_top,
@@ -222,15 +417,18 @@ def build_virtual_plan_from_partial(
     large_first: bool = True,
     left_to_right: bool = True,
     bottom_to_top: bool = True,
+    focal_px: Optional[float] = None,
+    position_tolerance_cm: Optional[float] = None,
 ) -> "EngagementPlan":
     """Infer missing virtual-board holes from a partial 3x4 grid.
 
-    At least six candidates are required.  Candidate points are assigned to
+    At least four non-collinear candidates are required.  Candidate points are assigned to
     three x-columns and four y-rows, then a homography maps the official 12
-    normalized positions into the camera image.  This is for screen testing:
-    it intentionally does not use apparent hole size or range.
+    normalized positions into the camera image.  When ``focal_px`` is given,
+    the known hole diameters and the visible holes also provide a robust
+    board-range estimate for the inferred targets.
     """
-    if len(targets) < 6:
+    if len(targets) < 4:
         return EngagementPlan([])
     candidates = sorted(targets, key=lambda target: target.confidence, reverse=True)[:20]
     x_centers = _cluster_1d([target.u_px for target in candidates], 3)
@@ -243,33 +441,62 @@ def build_virtual_plan_from_partial(
         old = cells.get(cell)
         if old is None or target.confidence > old.confidence:
             cells[cell] = target
-    if len(cells) < 6:
+    if len(cells) < 4:
         return EngagementPlan([])
 
     canonical = []
     observed = []
     for (column, row), target in cells.items():
-        canonical.append((0.20 + 0.30 * column, 0.125 + 0.25 * row))
+        canonical.append(hole_position_for_cell(column, row))
         observed.append((target.u_px, target.v_px))
     if len(canonical) < 4:
         return EngagementPlan([])
-    matrix, _ = cv2.findHomography(
-        np.asarray(canonical, dtype=np.float32),
-        np.asarray(observed, dtype=np.float32),
-        cv2.RANSAC,
-        30.0,
+
+    # Estimate one range for the planar board from the holes that are visible.
+    # Missing holes have no valid depth sample of their own, so the board
+    # range must come from the visible holes rather than their backgrounds.
+    board_distance_m = None
+    row_sizes: Dict[int, List[float]] = {}
+    if focal_px is not None and focal_px > 0:
+        visible_ranges = []
+        for (_, row), target in cells.items():
+            apparent_size = target.size_px
+            if apparent_size <= 0:
+                continue
+            physical_size = small_diameter_m if row == 0 else large_diameter_m
+            visible_ranges.append(
+                distance_from_size(apparent_size, physical_size, focal_px)
+            )
+            row_sizes.setdefault(row, []).append(apparent_size)
+        if visible_ranges:
+            board_distance_m = float(np.median(visible_ranges))
+
+    # Give inferred targets a useful apparent size too.  This is mainly for
+    # diagnostics and future refinement; their firing range uses the robust
+    # board range above.  If an entire size class is missing, infer its pixel
+    # size from the known 20/40 cm ratio.
+    class_sizes: Dict[int, float] = {}
+    for row, values in row_sizes.items():
+        if values:
+            class_sizes[0 if row == 0 else 1] = float(np.median(values))
+    if 0 not in class_sizes and 1 in class_sizes:
+        class_sizes[0] = class_sizes[1] * small_diameter_m / large_diameter_m
+    if 1 not in class_sizes and 0 in class_sizes:
+        class_sizes[1] = class_sizes[0] * large_diameter_m / small_diameter_m
+    matrix = _fit_board_homography(
+        canonical,
+        observed,
+        position_tolerance_cm,
     )
     if matrix is None:
         return EngagementPlan([])
 
-    official_ids = {
-        (0, 0): "H10", (1, 0): "H11", (2, 0): "H12",
-        (0, 1): "H03", (1, 1): "H06", (2, 1): "H09",
-        (0, 2): "H02", (1, 2): "H05", (2, 2): "H08",
-        (0, 3): "H01", (1, 3): "H04", (2, 3): "H07",
-    }
     points = np.asarray(
-        [[0.20 + 0.30 * column, 0.125 + 0.25 * row] for row in range(4) for column in range(3)],
+        [
+            hole_position_for_cell(column, row)
+            for row in range(4)
+            for column in range(3)
+        ],
         dtype=np.float32,
     ).reshape(-1, 1, 2)
     projected = cv2.perspectiveTransform(points, matrix).reshape(-1, 2)
@@ -277,18 +504,21 @@ def build_virtual_plan_from_partial(
     index = 0
     for row in range(4):
         for column in range(3):
+            size_class = 0 if row == 0 else 1
+            apparent_size = class_sizes.get(size_class, 1.0)
             inferred.append(
                 BoardTarget(
                     u_px=float(projected[index, 0]),
                     v_px=float(projected[index, 1]),
-                    width_px=1.0,
-                    height_px=1.0,
+                    width_px=apparent_size,
+                    height_px=apparent_size,
                     confidence=1.0,
+                    diameter_px=apparent_size if apparent_size > 1.0 else None,
                     diameter_m=small_diameter_m if row == 0 else large_diameter_m,
-                    distance_m=None,
+                    distance_m=board_distance_m,
                     column=column,
                     row=3 - row,
-                    hole_id=official_ids[(column, row)],
+                    hole_id=hole_id_for_cell(column, row),
                 )
             )
             index += 1
@@ -451,6 +681,7 @@ def build_plan(
     large_first: bool = True,
     left_to_right: bool = True,
     bottom_to_top: bool = True,
+    position_tolerance_cm: Optional[float] = None,
 ) -> "EngagementPlan":
     """Classify, range and order one detection of the board."""
     selected = select_board_targets(targets, require_size_ratio=True)
@@ -460,6 +691,8 @@ def build_plan(
     ranged = apply_ranging(classified, focal_px)
     identified = assign_hole_ids(ranged)
     if len(identified) != 12 or any(target.hole_id is None for target in identified):
+        return EngagementPlan([])
+    if not board_geometry_is_valid(identified, position_tolerance_cm):
         return EngagementPlan([])
     if not _matches_board_size_layout(
         identified, small_diameter_m, large_diameter_m

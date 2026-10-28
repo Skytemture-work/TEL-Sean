@@ -20,6 +20,7 @@ import cv2
 
 from .backends import MockMotorBackend
 from .board import EngagementPlan, build_plan
+from .board_surface import detect_dark_board_surface, filter_targets_to_surface
 from .config import TurretConfig
 from .controller import TurretController
 from .detection import boxes_to_board_targets, select_best_box
@@ -119,7 +120,14 @@ def run_board_preview(
                 device=device,
                 verbose=False,
             )[0]
-            detected = boxes_to_board_targets(result, conf)
+            raw_detected = boxes_to_board_targets(result, conf)
+            board_surface = detect_dark_board_surface(
+                inference_frame,
+                value_threshold=config.board_dark_value_threshold,
+                min_area_fraction=config.board_min_area_fraction,
+                targets=raw_detected,
+            )
+            detected = filter_targets_to_surface(raw_detected, board_surface)
             plan = build_plan(
                 detected,
                 config.focal_length_x_px,
@@ -128,6 +136,7 @@ def run_board_preview(
                 config.engage_large_first,
                 config.engage_left_to_right,
                 config.engage_bottom_to_top,
+                config.board_position_tolerance_cm,
             )
 
             known_count = sum(target.diameter_m is not None for target in plan.targets)
@@ -138,15 +147,23 @@ def run_board_preview(
                 last_state = state
 
             display = result.plot()
+            if board_surface is not None:
+                cv2.drawContours(
+                    display,
+                    [board_surface.contour],
+                    -1,
+                    (0, 255, 255),
+                    2,
+                )
             _draw_board_plan(display, plan)
             if ready:
-                status = "BOARD READY: 12 holes classified and ordered"
+                status = f"BOARD READY: {len(detected)}/{len(raw_detected)} in board"
                 status_color = (0, 220, 0)
             elif known_count != len(detected):
                 status = f"WAIT: size classification {known_count}/{len(detected)}"
                 status_color = (0, 0, 255)
             else:
-                status = f"WAIT: detected {len(detected)}/12 holes"
+                status = f"WAIT: detected {len(detected)}/{len(raw_detected)} in board"
                 status_color = (0, 220, 255)
 
             cv2.putText(

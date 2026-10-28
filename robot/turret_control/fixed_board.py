@@ -24,6 +24,7 @@ def calibrate_layout(
         config.engage_large_first,
         config.engage_left_to_right,
         config.engage_bottom_to_top,
+        config.board_position_tolerance_cm,
     )
     if len(plan.targets) != 12 or any(t.hole_id is None for t in plan.targets):
         raise ValueError("need exactly 12 detected holes with valid board geometry")
@@ -38,6 +39,7 @@ def calibrate_layout(
                 "v_px": t.v_px,
                 "width_px": t.width_px,
                 "height_px": t.height_px,
+                "diameter_px": t.diameter_px,
                 "confidence": 1.0,
                 "diameter_m": t.diameter_m,
                 "distance_m": t.distance_m,
@@ -61,6 +63,11 @@ def load_layout(path: Path) -> EngagementPlan:
             width_px=float(item.get("width_px", 1.0)),
             height_px=float(item.get("height_px", 1.0)),
             confidence=float(item.get("confidence", 1.0)),
+            diameter_px=(
+                None
+                if item.get("diameter_px") is None
+                else float(item["diameter_px"])
+            ),
             diameter_m=item.get("diameter_m"),
             distance_m=item.get("distance_m"),
             column=item.get("column"),

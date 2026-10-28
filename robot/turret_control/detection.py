@@ -3,6 +3,22 @@
 from typing import Any, Optional
 
 from .aiming import TargetPixel
+from .vision_geometry import MaskGeometry, polygon_geometry
+
+
+def _geometry_for_mask(result: Any, index: int) -> Optional[MaskGeometry]:
+    """Read one Ultralytics polygon, if this is a segmentation result."""
+
+    masks = getattr(result, "masks", None)
+    if masks is None:
+        return None
+    try:
+        polygons = masks.xy
+        if index >= len(polygons):
+            return None
+        return polygon_geometry(polygons[index])
+    except (AttributeError, IndexError, TypeError, ValueError):
+        return None
 
 
 def select_best_box(result: Any, minimum_confidence: float = 0.40) -> Optional[TargetPixel]:
@@ -19,15 +35,16 @@ def select_best_box(result: Any, minimum_confidence: float = 0.40) -> Optional[T
 
     best = None
     best_confidence = minimum_confidence
-    for box in boxes:
+    for index, box in enumerate(boxes):
         confidence = float(box.conf[0].item())
         if confidence < best_confidence:
             continue
 
         x1, y1, x2, y2 = (float(value) for value in box.xyxy[0].tolist())
+        geometry = _geometry_for_mask(result, index)
         best = TargetPixel(
-            u_px=(x1 + x2) / 2.0,
-            v_px=(y1 + y2) / 2.0,
+            u_px=geometry.center_u if geometry else (x1 + x2) / 2.0,
+            v_px=geometry.center_v if geometry else (y1 + y2) / 2.0,
             confidence=confidence,
         )
         best_confidence = confidence
@@ -36,11 +53,10 @@ def select_best_box(result: Any, minimum_confidence: float = 0.40) -> Optional[T
 
 
 def boxes_to_board_targets(result, minimum_confidence: float = 0.40):
-    """Every box in one Ultralytics result, as board targets.
+    """Convert every detection into a board target.
 
-    Unlike :func:`select_best_box` this keeps *all* of them: the board is
-    static and fully in frame, so the plan is built from one good detection
-    rather than re-picking a winner every frame.
+    Segmentation masks provide the centre and apparent diameter.  Bounding
+    boxes remain a compatibility fallback for detection-only models.
     """
     from .board import BoardTarget
 
@@ -49,18 +65,32 @@ def boxes_to_board_targets(result, minimum_confidence: float = 0.40):
         return []
 
     targets = []
-    for box in boxes:
+    for index, box in enumerate(boxes):
         confidence = float(box.conf[0].item())
         if confidence < minimum_confidence:
             continue
         x1, y1, x2, y2 = (float(value) for value in box.xyxy[0].tolist())
+        geometry = _geometry_for_mask(result, index)
+        if geometry is not None:
+            u_px = geometry.center_u
+            v_px = geometry.center_v
+            width_px = geometry.width_px
+            height_px = geometry.height_px
+            diameter_px = geometry.equivalent_diameter_px
+        else:
+            u_px = (x1 + x2) / 2.0
+            v_px = (y1 + y2) / 2.0
+            width_px = abs(x2 - x1)
+            height_px = abs(y2 - y1)
+            diameter_px = None
         targets.append(
             BoardTarget(
-                u_px=(x1 + x2) / 2.0,
-                v_px=(y1 + y2) / 2.0,
-                width_px=abs(x2 - x1),
-                height_px=abs(y2 - y1),
+                u_px=u_px,
+                v_px=v_px,
+                width_px=width_px,
+                height_px=height_px,
                 confidence=confidence,
+                diameter_px=diameter_px,
             )
         )
     return targets

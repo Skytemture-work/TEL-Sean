@@ -7,18 +7,23 @@ import time
 import pyzed.sl as sl
 from ultralytics import YOLO
 import config
+from turret_control.vision_geometry import (
+    binary_mask_geometry,
+    polygon_geometry,
+    sample_board_depth,
+)
 
 class VisionTracker(threading.Thread):
     def __init__(self):
         super().__init__(daemon=True)
         self.lock = threading.Lock()
-        
+
         # 系統控制指令與狀態 (與 main.py 相容)
         self.chassis_cmd = (0, 0, 0)   # 底盤建議速度 (vx, vy, wz)
         self.turret_cmd = (50, 50)     # 砲台絕對角度 (yaw, pitch) -> 範圍 0~100
         self.target_detected = False
         self.is_active = True          # 支援模式切換待命
-        
+
         # 提供給主執行緒渲染畫面的共享圖像
         self.current_frame = None
 
@@ -40,18 +45,12 @@ class VisionTracker(threading.Thread):
             self.model = YOLO(model_path)
 
         # ---------------------------------------------------------
-        # 2. 標靶 3D 物理空間座標設定 (單位: cm)
+        # 2. 相機內參：先用 HD720 的保守預設值，開啟 ZED 後換成 SDK 校正值
         # ---------------------------------------------------------
-        w, h = config.TARGET_WIDTH_CM, config.TARGET_HEIGHT_CM
-        self.object_points = np.array([
-            [-w/2,  h/2, 0],
-            [ w/2,  h/2, 0],
-            [ w/2, -h/2, 0],
-            [-w/2, -h/2, 0]
-        ], dtype=np.float32)
-
-        self.camera_matrix = np.array([[700, 0, 640], [0, 700, 360], [0, 0, 1]], dtype=np.float32)
-        self.dist_coeffs = np.zeros((4, 1))
+        self.camera_matrix = np.array(
+            [[700, 0, 640], [0, 700, 360], [0, 0, 1]], dtype=np.float32
+        )
+        self.dist_coeffs = np.zeros((5, 1), dtype=np.float32)
 
     def run(self):
         # ---------------------------------------------------------
@@ -69,9 +68,17 @@ class VisionTracker(threading.Thread):
             print(f"[Vision Error] 無法開啟 ZED 相機，狀態碼: {status}")
             return
 
+        self._load_zed_calibration(zed)
+
         image_zed = sl.Mat()
         depth_zed = sl.Mat()
         runtime_parameters = sl.RuntimeParameters()
+        # 過濾立體匹配在孔洞邊緣與低紋理背景產生的不可靠深度。
+        # 舊版 SDK 若沒有這些欄位則保留預設值。
+        if hasattr(runtime_parameters, "confidence_threshold"):
+            runtime_parameters.confidence_threshold = 50
+        if hasattr(runtime_parameters, "texture_confidence_threshold"):
+            runtime_parameters.texture_confidence_threshold = 50
 
         print("[Vision] ZED 2 多組標靶取多數決 & 1Hz 控制線程已順利啟動！")
 
@@ -115,34 +122,93 @@ class VisionTracker(threading.Thread):
 
                         for idx, box in enumerate(boxes):
                             x1, y1, x2, y2 = map(int, box.xyxy[0])
-                            mask = masks[idx].data[0].cpu().numpy() if masks is not None and len(masks) > idx else None
 
-                            # A. 計算單一個物體/孔洞遮罩內最濃密的點 (Distance Transform)
-                            conc_u, conc_v = self._get_most_concentrated_point(mask, (x1, y1, x2, y2), color_bgr.shape)
-                            
-                            # B. 採樣視窗中位數深度
-                            dz_m = self._get_median_depth(depth_np, conc_u, conc_v)
+                            # YOLO segmentation 的 polygon 是原始影像座標；
+                            # 優先使用它，不再把圓孔當成矩形來做 PnP。
+                            mask_polygon = None
+                            mask_array = None
+                            if masks is not None and len(masks) > idx:
+                                try:
+                                    mask_polygon = np.asarray(
+                                        masks.xy[idx], dtype=np.float32
+                                    )
+                                except (AttributeError, IndexError, TypeError, ValueError):
+                                    # 相容沒有 masks.xy 的舊版 Ultralytics。
+                                    try:
+                                        mask_array = masks[idx].data[0].cpu().numpy()
+                                    except (AttributeError, IndexError, TypeError):
+                                        mask_array = None
 
-                            # C. SolvePnP 解算該物體姿態
-                            image_points = np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.float32)
-                            success, rvec, tvec = cv2.solvePnP(
-                                self.object_points, image_points, self.camera_matrix, self.dist_coeffs
+                            geometry = (
+                                polygon_geometry(mask_polygon)
+                                if mask_polygon is not None
+                                else None
+                            )
+                            if geometry is None and mask_array is not None:
+                                geometry = binary_mask_geometry(
+                                    mask_array, color_bgr.shape[:2]
+                                )
+                            # 沒有 segmentation mask 時，不能安全地從孔洞中心取深度；
+                            # 直接捨棄這筆，避免又把背景距離送進控制器。
+                            if geometry is None:
+                                continue
+
+                            center_u = geometry.center_u
+                            center_v = geometry.center_v
+                            dz_m = sample_board_depth(
+                                depth_np,
+                                polygon=mask_polygon,
+                                mask=mask_array,
+                                ring_px=6,
+                            )
+                            if dz_m is None or dz_m <= 0:
+                                continue
+
+                            # 目標是圓孔，不使用 bbox 四角 solvePnP。
+                            # 以「孔中心視線 + 孔外靶板深度」求相對位置。
+                            fx = float(self.camera_matrix[0, 0])
+                            fy = float(self.camera_matrix[1, 1])
+                            cx = float(self.camera_matrix[0, 2])
+                            cy = float(self.camera_matrix[1, 2])
+                            dx = (center_u - cx) * dz_m / fx * 100.0
+                            # 轉成 +Y 向上，配合原本 pitch 控制的座標約定。
+                            dy = -(center_v - cy) * dz_m / fy * 100.0
+                            yaw = np.degrees(np.arctan2(dx, dz_m * 100.0))
+
+                            detected_depths_cm.append(dz_m * 100.0)
+                            detected_dx_cm.append(dx)
+                            detected_dy_cm.append(dy)
+                            detected_yaw_deg.append(yaw)
+                            valid_boxes.append(
+                                (x1, y1, x2, y2, center_u, center_v, dz_m)
                             )
 
-                            if success and dz_m is not None and dz_m > 0:
-                                dx = tvec[0][0]
-                                dy = tvec[1][0]
-                                R, _ = cv2.Rodrigues(rvec)
-                                yaw = np.degrees(np.arctan2(R[1, 0], R[0, 0]))
-
-                                detected_depths_cm.append(dz_m * 100.0)
-                                detected_dx_cm.append(dx)
-                                detected_dy_cm.append(dy)
-                                detected_yaw_deg.append(yaw)
-                                valid_boxes.append((x1, y1, x2, y2, conc_u, conc_v, dz_m))
-
-                                # 繪製綠色十字標記每個找到的密集採樣點
-                                cv2.drawMarker(annotated_frame, (conc_u, conc_v), (0, 255, 0), cv2.MARKER_CROSS, 10, 2)
+                            # 顯示 mask 重心；藍色輪廓方便確認深度取樣位置。
+                            cv2.drawContours(
+                                annotated_frame,
+                                [geometry.contour],
+                                -1,
+                                (255, 0, 0),
+                                2,
+                            )
+                            cv2.drawMarker(
+                                annotated_frame,
+                                (round(center_u), round(center_v)),
+                                (0, 255, 0),
+                                cv2.MARKER_CROSS,
+                                10,
+                                2,
+                            )
+                            cv2.putText(
+                                annotated_frame,
+                                f"board depth {dz_m:.2f}m",
+                                (round(center_u) + 8, round(center_v) - 8),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.45,
+                                (255, 255, 0),
+                                1,
+                                cv2.LINE_AA,
+                            )
 
                     # ---------------------------------------------------------
                     # 5. 多組數據共識決 (多數決 / 中位數評估) 與 1 Hz 控制更新
@@ -193,41 +259,29 @@ class VisionTracker(threading.Thread):
             zed.close()
             print("[Vision] ZED 2 相機已安全關閉。")
 
-    def _get_most_concentrated_point(self, mask, box, frame_shape):
-        """尋找遮罩內距離邊界最遠、面積最濃密厚實的點 (Pole of Inaccessibility)"""
-        x1, y1, x2, y2 = box
-        img_h, img_w = frame_shape[:2]
-
-        if mask is not None:
-            mask_resized = cv2.resize(mask, (img_w, img_h))
-            binary_mask = (mask_resized > 0.5).astype(np.uint8)
-
-            dist_transform = cv2.distanceTransform(binary_mask, cv2.DIST_L2, 5)
-            _, max_val, _, max_loc = cv2.minMaxLoc(dist_transform)
-
-            if max_val > 0:
-                return max_loc[0], max_loc[1]
-
-        center_u = int((x1 + x2) / 2)
-        center_v = int((y1 + y2) / 2)
-        return center_u, center_v
-
-    def _get_median_depth(self, depth_np, u, v, window_size=3):
-        """採樣 3x3 視窗中位數深度，排除無效區域"""
-        h, w = depth_np.shape[:2]
-        half_w = window_size // 2
-
-        u_min = max(0, u - half_w)
-        u_max = min(w, u + half_w + 1)
-        v_min = max(0, v - half_w)
-        v_max = min(h, v + half_w + 1)
-
-        patch = depth_np[v_min:v_max, u_min:u_max]
-        valid_depths = patch[~np.isnan(patch) & ~np.isinf(patch) & (patch > 0)]
-
-        if len(valid_depths) > 0:
-            return float(np.median(valid_depths))
-        return None
+    def _load_zed_calibration(self, zed):
+        """Use the calibrated intrinsics for the rectified left image."""
+        try:
+            camera_info = zed.get_camera_information()
+            left = (
+                camera_info.camera_configuration
+                .calibration_parameters.left_cam
+            )
+            self.camera_matrix = np.array(
+                [[left.fx, 0.0, left.cx],
+                 [0.0, left.fy, left.cy],
+                 [0.0, 0.0, 1.0]],
+                dtype=np.float32,
+            )
+            # VIEW.LEFT is rectified, so distortion is intentionally zero here.
+            self.dist_coeffs = np.zeros((5, 1), dtype=np.float32)
+            print(
+                "[Vision] 使用 ZED 左相機校正內參："
+                f"fx={left.fx:.1f}, fy={left.fy:.1f}, "
+                f"cx={left.cx:.1f}, cy={left.cy:.1f}"
+            )
+        except (AttributeError, TypeError, ValueError) as exc:
+            print(f"[Vision Warning] 無法讀取 ZED 校正內參，使用預設值：{exc}")
 
     def get_vision_data(self):
         """提供給 main.py 讀取控制量的接口"""

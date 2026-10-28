@@ -17,7 +17,14 @@ from pathlib import Path
 import cv2
 
 from .backends import DamiaoSerialBackend
-from .board import build_plan, build_virtual_plan, build_virtual_plan_from_partial
+from .board import (
+    build_plan,
+    build_plan_from_board_quad,
+    build_virtual_plan,
+    build_virtual_plan_from_partial,
+    estimate_board_distance_from_targets,
+)
+from .board_surface import detect_dark_board_surface, filter_targets_to_surface
 from .config import TurretConfig
 from .controller import TurretController
 from .detection import boxes_to_board_targets
@@ -182,53 +189,122 @@ def main() -> None:
                 device=args.device,
                 verbose=False,
             )[0]
-            detected = boxes_to_board_targets(result, args.conf)
-            now = time.monotonic()
-            if now - last_report >= 2.0:
-                print(f"YOLO 候選孔：{len(detected)}/12", flush=True)
-                last_report = now
-            candidate_plan = None
-            if plan is None and args.virtual_board and len(detected) >= 6:
-                candidate_plan = build_virtual_plan_from_partial(
+            raw_detected = boxes_to_board_targets(result, args.conf)
+            board_surface = detect_dark_board_surface(
+                frame,
+                value_threshold=config.board_dark_value_threshold,
+                min_area_fraction=config.board_min_area_fraction,
+                targets=raw_detected,
+            )
+            detected = filter_targets_to_surface(raw_detected, board_surface)
+            quad_plan = None
+            if board_surface is not None and board_surface.quad is not None:
+                quad_distance = estimate_board_distance_from_targets(
                     detected,
+                    board_surface.quad,
+                    config.focal_length_x_px,
                     config.small_hole_diameter_m,
                     config.large_hole_diameter_m,
-                    config.engage_large_first,
-                    config.engage_left_to_right,
-                    config.engage_bottom_to_top,
+                    config.board_position_tolerance_cm,
                 )
-            elif plan is None and len(detected) == 12:
-                if args.virtual_board:
-                    candidate_plan = build_virtual_plan(
-                        detected,
-                        config.small_hole_diameter_m,
-                        config.large_hole_diameter_m,
-                        config.engage_large_first,
-                        config.engage_left_to_right,
-                        config.engage_bottom_to_top,
-                    )
+                quad_plan = build_plan_from_board_quad(
+                    board_surface.quad,
+                    config.small_hole_diameter_m,
+                    config.large_hole_diameter_m,
+                    board_distance_m=quad_distance,
+                    large_first=config.engage_large_first,
+                    left_to_right=config.engage_left_to_right,
+                    bottom_to_top=config.engage_bottom_to_top,
+                )
+            now = time.monotonic()
+            if now - last_report >= 2.0:
+                print(
+                    f"YOLO 候選孔：靶面內 {len(detected)} / 原始 {len(raw_detected)}",
+                    flush=True,
+                )
+                last_report = now
+            candidate_plan = None
+            inferred_plan_used = False
+            if plan is None:
+                if quad_plan is not None and len(quad_plan) == 12:
+                    candidate_plan = quad_plan
+                    inferred_plan_used = True
+                elif args.virtual_board:
+                    if len(detected) == 12:
+                        candidate_plan = build_virtual_plan(
+                            detected,
+                            config.small_hole_diameter_m,
+                            config.large_hole_diameter_m,
+                            config.engage_large_first,
+                            config.engage_left_to_right,
+                            config.engage_bottom_to_top,
+                            config.board_position_tolerance_cm,
+                        )
+                    elif len(detected) >= 4:
+                        candidate_plan = build_virtual_plan_from_partial(
+                            detected,
+                            config.small_hole_diameter_m,
+                            config.large_hole_diameter_m,
+                            config.engage_large_first,
+                            config.engage_left_to_right,
+                            config.engage_bottom_to_top,
+                            focal_px=config.focal_length_x_px,
+                            position_tolerance_cm=config.board_position_tolerance_cm,
+                        )
+                        inferred_plan_used = True
                 else:
-                    candidate_plan = build_plan(
-                        detected,
-                        config.focal_length_x_px,
-                        config.small_hole_diameter_m,
-                        config.large_hole_diameter_m,
-                        config.engage_large_first,
-                        config.engage_left_to_right,
-                        config.engage_bottom_to_top,
-                    )
+                    if len(detected) == 12:
+                        candidate_plan = build_plan(
+                            detected,
+                            config.focal_length_x_px,
+                            config.small_hole_diameter_m,
+                            config.large_hole_diameter_m,
+                            config.engage_large_first,
+                            config.engage_left_to_right,
+                            config.engage_bottom_to_top,
+                            config.board_position_tolerance_cm,
+                        )
+                        if len(candidate_plan) != 12:
+                            candidate_plan = build_virtual_plan(
+                                detected,
+                                config.small_hole_diameter_m,
+                                config.large_hole_diameter_m,
+                                config.engage_large_first,
+                                config.engage_left_to_right,
+                                config.engage_bottom_to_top,
+                                config.board_position_tolerance_cm,
+                            )
+                    # Normal field mode also accepts a geometrically valid
+                    # partial board.  It is treated as a complete target plan
+                    # so lighting-related missed holes do not stop the match.
+                    if (
+                        (candidate_plan is None or len(candidate_plan) != 12)
+                        and len(detected) >= 4
+                    ):
+                        candidate_plan = build_virtual_plan_from_partial(
+                            detected,
+                            config.small_hole_diameter_m,
+                            config.large_hole_diameter_m,
+                            config.engage_large_first,
+                            config.engage_left_to_right,
+                            config.engage_bottom_to_top,
+                            focal_px=config.focal_length_x_px,
+                            position_tolerance_cm=config.board_position_tolerance_cm,
+                        )
+                        inferred_plan_used = True
                 
             if candidate_plan is not None and len(candidate_plan) == 12 and all(t.hole_id is not None for t in candidate_plan.targets):
                 plan = candidate_plan
                 if last_state != tuple(t.hole_id for t in plan.targets):
                     driver.set_plan(plan)
                     last_state = tuple(t.hole_id for t in plan.targets)
+                    plan_source = "推算" if inferred_plan_used else "實測"
                     print(
-                        "靶板計畫建立："
+                        f"{plan_source}靶板計畫建立："
                         + " ".join(t.hole_id or "??" for t in plan.targets),
                         flush=True,
                     )
-                    if args.calibrate_layout:
+                    if args.calibrate_layout and not inferred_plan_used:
                         calibrate_layout(detected, config, args.calibrate_layout)
                         print(f"已保存固定靶板版面：{args.calibrate_layout}", flush=True)
 
@@ -252,6 +328,14 @@ def main() -> None:
                     )
                 last_target_id = target_id
             display = result.plot()
+            if board_surface is not None:
+                cv2.drawContours(
+                    display,
+                    [board_surface.contour],
+                    -1,
+                    (0, 255, 255),
+                    2,
+                )
             if plan is not None:
                 _draw_board_plan(display, plan)
             text = f"12-hole {'READY' if plan else 'WAIT'} | remaining={status.remaining}"

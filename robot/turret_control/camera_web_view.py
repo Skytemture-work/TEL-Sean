@@ -16,6 +16,7 @@ import cv2
 from ultralytics import YOLO
 
 from .board import build_plan
+from .board_surface import detect_dark_board_surface, filter_targets_to_surface
 from .config import TurretConfig
 from .detection import boxes_to_board_targets
 from .run_yolo_demo import _draw_board_plan
@@ -43,7 +44,14 @@ class CameraState:
             result = self.model.predict(
                 frame, imgsz=640, conf=self.conf, device=self.device, verbose=False
             )[0]
-            detected = boxes_to_board_targets(result, self.conf)
+            raw_detected = boxes_to_board_targets(result, self.conf)
+            board_surface = detect_dark_board_surface(
+                frame,
+                value_threshold=self.config.board_dark_value_threshold,
+                min_area_fraction=self.config.board_min_area_fraction,
+                targets=raw_detected,
+            )
+            detected = filter_targets_to_surface(raw_detected, board_surface)
             plan = build_plan(
                 detected,
                 self.config.focal_length_x_px,
@@ -52,11 +60,23 @@ class CameraState:
                 self.config.engage_large_first,
                 self.config.engage_left_to_right,
                 self.config.engage_bottom_to_top,
+                self.config.board_position_tolerance_cm,
             )
             display = result.plot()
+            if board_surface is not None:
+                cv2.drawContours(
+                    display,
+                    [board_surface.contour],
+                    -1,
+                    (0, 255, 255),
+                    2,
+                )
             _draw_board_plan(display, plan)
             known = sum(t.diameter_m is not None for t in detected)
-            status = f"Detected {len(detected)}/12 | Classified {known}/{len(detected)}"
+            status = (
+                f"Board {len(detected)}/{len(raw_detected)} raw | "
+                f"Classified {known}/{len(detected)}"
+            )
             color = (0, 220, 0) if len(detected) == 12 and known == 12 else (0, 0, 255)
             cv2.putText(display, status, (12, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
             ok, encoded = cv2.imencode('.jpg', display, [cv2.IMWRITE_JPEG_QUALITY, 80])

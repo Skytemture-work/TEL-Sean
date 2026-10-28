@@ -49,6 +49,14 @@ class BoardGeometryTests(unittest.TestCase):
             {f"H{i:02d}" for i in range(1, 13)},
         )
 
+    def test_partial_board_can_estimate_range_for_inferred_targets(self):
+        partial = make_board()[:-1]
+        plan = build_virtual_plan_from_partial(partial, 0.20, 0.40, focal_px=700.0)
+
+        self.assertEqual(len(plan.targets), 12)
+        self.assertTrue(all(target.distance_m is not None for target in plan.targets))
+        self.assertAlmostEqual(plan.targets[0].distance_m, 7.0, places=6)
+
 
 if __name__ == "__main__":
     unittest.main()

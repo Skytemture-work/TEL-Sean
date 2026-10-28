@@ -14,23 +14,21 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from .board import build_plan, build_virtual_plan_from_partial
+from .board import (
+    build_plan,
+    build_plan_from_board_quad,
+    build_virtual_plan,
+    build_virtual_plan_from_partial,
+    estimate_board_distance_from_targets,
+)
 from .config import TurretConfig
 from .detection import boxes_to_board_targets
 from .run_yolo_demo import _draw_board_plan
+from .board_surface import detect_dark_board_surface, filter_targets_to_surface
+from .vision_geometry import polygon_geometry, sample_board_depth
 
 
 DEFAULT_ENGINE = Path.home() / "Desktop" / "best.engine"
-
-
-def _median_depth(depth: np.ndarray, u: int, v: int, radius: int = 2) -> float:
-    """Return median valid depth in metres around one image pixel."""
-    height, width = depth.shape[:2]
-    x0, x1 = max(0, u - radius), min(width, u + radius + 1)
-    y0, y1 = max(0, v - radius), min(height, v + radius + 1)
-    values = depth[y0:y1, x0:x1]
-    values = values[np.isfinite(values) & (values > 0)]
-    return float(np.median(values)) if values.size else math.nan
 
 
 def _draw_inferred_board(display: np.ndarray, plan) -> None:
@@ -155,7 +153,33 @@ def main() -> None:
                 device=0,
                 verbose=False,
             )[0]
-            detected = boxes_to_board_targets(result, args.conf)
+            raw_detected = boxes_to_board_targets(result, args.conf)
+            board_surface = detect_dark_board_surface(
+                frame,
+                value_threshold=config.board_dark_value_threshold,
+                min_area_fraction=config.board_min_area_fraction,
+                targets=raw_detected,
+            )
+            detected = filter_targets_to_surface(raw_detected, board_surface)
+            quad_plan = None
+            if board_surface is not None and board_surface.quad is not None:
+                quad_distance = estimate_board_distance_from_targets(
+                    detected,
+                    board_surface.quad,
+                    config.focal_length_x_px,
+                    config.small_hole_diameter_m,
+                    config.large_hole_diameter_m,
+                    config.board_position_tolerance_cm,
+                )
+                quad_plan = build_plan_from_board_quad(
+                    board_surface.quad,
+                    config.small_hole_diameter_m,
+                    config.large_hole_diameter_m,
+                    board_distance_m=quad_distance,
+                    large_first=config.engage_large_first,
+                    left_to_right=config.engage_left_to_right,
+                    bottom_to_top=config.engage_bottom_to_top,
+                )
             plan = build_plan(
                 detected,
                 config.focal_length_x_px,
@@ -164,13 +188,32 @@ def main() -> None:
                 config.engage_large_first,
                 config.engage_left_to_right,
                 config.engage_bottom_to_top,
+                config.board_position_tolerance_cm,
             )
             board_ready = len(plan.targets) == 12 and all(
                 target.hole_id is not None and target.diameter_m is not None
                 for target in plan.targets
             )
             inferred_plan = None
-            if not board_ready and len(detected) >= 6:
+            observed_fallback_plan = None
+            if not board_ready and len(detected) == 12:
+                # Twelve candidates should use their actual positions.  A
+                # partial homography here could move a valid point elsewhere
+                # when size classification alone was the failed check.
+                candidate = build_virtual_plan(
+                    detected,
+                    config.small_hole_diameter_m,
+                    config.large_hole_diameter_m,
+                    config.engage_large_first,
+                    config.engage_left_to_right,
+                    config.engage_bottom_to_top,
+                    config.board_position_tolerance_cm,
+                )
+                if len(candidate.targets) != 12:
+                    candidate = None
+                else:
+                    observed_fallback_plan = candidate
+            elif not board_ready and len(detected) >= 4:
                 candidate = build_virtual_plan_from_partial(
                     detected,
                     config.small_hole_diameter_m,
@@ -178,6 +221,8 @@ def main() -> None:
                     config.engage_large_first,
                     config.engage_left_to_right,
                     config.engage_bottom_to_top,
+                    focal_px=config.focal_length_x_px,
+                    position_tolerance_cm=config.board_position_tolerance_cm,
                 )
                 if len(candidate.targets) == 12:
                     inferred_plan = candidate
@@ -185,9 +230,19 @@ def main() -> None:
             # target. Keep thin boxes and masks, then add only compact depth
             # text below.
             display = result.plot(labels=False, line_width=1)
-            _draw_board_plan(display, plan)
-            if inferred_plan is not None:
-                _draw_inferred_board(display, inferred_plan)
+            if board_surface is not None:
+                cv2.drawContours(
+                    display,
+                    [board_surface.contour],
+                    -1,
+                    (0, 255, 255),
+                    2,
+                )
+            display_plan = quad_plan or observed_fallback_plan or inferred_plan or plan
+            _draw_board_plan(display, display_plan)
+            overlay_plan = quad_plan or inferred_plan
+            if overlay_plan is not None:
+                _draw_inferred_board(display, overlay_plan)
                 if args.save_frame and not saved_frame:
                     args.save_frame.parent.mkdir(parents=True, exist_ok=True)
                     if cv2.imwrite(str(args.save_frame), display):
@@ -196,14 +251,33 @@ def main() -> None:
             frame_count += 1
             elapsed = time.perf_counter() - started
             fps = frame_count / elapsed if elapsed else 0.0
-            count = 0 if result.boxes is None else len(result.boxes)
+            count = len(detected)
             detection_text = []
 
             if result.boxes is not None:
+                masks = result.masks
                 for index, box in enumerate(result.boxes):
                     x1, y1, x2, y2 = (float(value) for value in box.xyxy[0])
-                    u, v = round((x1 + x2) / 2), round((y1 + y2) / 2)
-                    distance = _median_depth(depth_data, u, v)
+                    polygon = None
+                    geometry = None
+                    if masks is not None and index < len(masks):
+                        try:
+                            polygon = masks.xy[index]
+                            geometry = polygon_geometry(polygon)
+                        except (AttributeError, IndexError, TypeError, ValueError):
+                            geometry = None
+                    if geometry is None:
+                        u, v = round((x1 + x2) / 2), round((y1 + y2) / 2)
+                        distance = math.nan
+                    else:
+                        u, v = round(geometry.center_u), round(geometry.center_v)
+                        distance = sample_board_depth(
+                            depth_data,
+                            polygon=polygon,
+                            ring_px=6,
+                        )
+                        if distance is None:
+                            distance = math.nan
                     label = "depth unavailable" if math.isnan(distance) else f"{distance:.2f} m"
                     detection_text.append(
                         f"#{index + 1} conf={float(box.conf[0]):.2f} "
@@ -229,7 +303,8 @@ def main() -> None:
             else:
                 board_text = "BOARD WAIT"
             status_text = (
-                f"{board_text}  holes={count}/12  plan={len(plan.targets)}/12  "
+                f"{board_text}  holes={count}/{len(raw_detected)} raw  "
+                f"plan={len(plan.targets)}/12  "
                 f"infer={inference_ms:.1f} ms  avg={fps:.1f} FPS"
             )
             cv2.putText(
