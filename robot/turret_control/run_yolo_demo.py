@@ -28,11 +28,19 @@ from .scoring_light import detect_score_light_scores
 
 
 REPO_MODEL = Path(__file__).resolve().parent.parent / "best_v2.pt"
+REPO_FALLBACK_MODEL = Path(__file__).resolve().parent.parent / "best.pt"
 LOCAL_MODEL = (
     Path(__file__).resolve().parent.parent
     / "jfwiskamckzxc.v2i.yolo26/runs/segment/runs/segment/hole_seg/weights/best.pt"
 )
-DEFAULT_MODEL = REPO_MODEL if REPO_MODEL.is_file() else LOCAL_MODEL
+DEFAULT_MODEL = next(
+    (
+        path
+        for path in (REPO_MODEL, REPO_FALLBACK_MODEL, LOCAL_MODEL)
+        if path.is_file()
+    ),
+    REPO_MODEL,
+)
 
 
 def _inference_frame(frame, zed_uvc: bool):

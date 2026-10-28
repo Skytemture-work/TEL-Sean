@@ -62,7 +62,11 @@ class BoardEngagement:
         self.shot_cooldown_s = shot_cooldown_s
         self.target_timeout_s = target_timeout_s
         self._clock = clock
-        self._last_shot_at: Optional[float] = None
+        # Throttle every launcher callback attempt, not only successful shots.
+        # A real launcher commonly returns False while it is spinning up or
+        # reloading; without this timestamp the 200 Hz control loop would call
+        # the hardware transport again on every tick.
+        self._last_fire_attempt_at: Optional[float] = None
         self._target_started_at: Optional[float] = None
         self._firing_enabled = True
         self._firing_blocked_reason: Optional[str] = None
@@ -136,11 +140,11 @@ class BoardEngagement:
         )
 
         if command.fire_allowed and self._cooldown_expired(now):
+            self._last_fire_attempt_at = now
             fired = True if self.fire is None else bool(self.fire(target))
             if fired:
                 plan_index = self.plan.index
                 self.shots += 1
-                self._last_shot_at = now
                 self.plan.mark_engaged()
                 self._target_started_at = now
                 self._record_event(
@@ -170,9 +174,9 @@ class BoardEngagement:
         return status
 
     def _cooldown_expired(self, now: float) -> bool:
-        if self._last_shot_at is None:
+        if self._last_fire_attempt_at is None:
             return True
-        return now - self._last_shot_at >= self.shot_cooldown_s
+        return now - self._last_fire_attempt_at >= self.shot_cooldown_s
 
     def _timed_out(self, now: float) -> bool:
         if self.target_timeout_s is None or self._target_started_at is None:

@@ -1,9 +1,9 @@
 """Real-camera, real-motor target-board aiming run.
 
 This controls the two DAMIAO motors and can build the upper/lower-half
-maximum-score plans from the 2026-09-03 rules.
-Firing is deliberately operator-confirmed with the ``f`` key; the launcher
-callback is the integration point for the real firing actuator.
+maximum-score plans from the 2026-09-03 rules.  The CLI defaults to an
+operator-confirmed ``f`` key.  An integrating process can instead pass a real
+``fire_callback`` and receive structured state through ``telemetry_callback``.
 """
 
 from __future__ import annotations
@@ -12,11 +12,13 @@ import argparse
 import time
 from dataclasses import replace
 from pathlib import Path
+from typing import Any, Callable, Dict, Optional, Sequence
 
 import cv2
 
 from .backends import DamiaoSerialBackend
 from .board import (
+    BoardTarget,
     build_plan,
     build_plan_from_board_quad,
     build_virtual_plan,
@@ -48,7 +50,27 @@ from .scoring_strategy import (
     build_max_score_strategy,
 )
 
-def main() -> None:
+FireCallback = Callable[[BoardTarget], bool]
+TelemetryCallback = Callable[[Dict[str, Any]], None]
+
+
+def main(
+    argv: Optional[Sequence[str]] = None,
+    *,
+    fire_callback: Optional[FireCallback] = None,
+    telemetry_callback: Optional[TelemetryCallback] = None,
+) -> None:
+    """Run the real board pipeline.
+
+    ``fire_callback`` is an opt-in automatic launcher hook.  It is called only
+    after the vision, pose, reachability and motor-settling gates all pass.  It
+    must return True only after the requested ball was actually sent; False
+    keeps the same target active.
+
+    ``telemetry_callback`` receives the same dictionary exposed by
+    ``GET /api/status`` once per processed camera frame.  Both callbacks run on
+    this control thread and therefore must return quickly.
+    """
     parser = argparse.ArgumentParser(description="Real camera + real motors, 12-hole board aiming")
     parser.add_argument("--camera", type=int, default=0)
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
@@ -58,6 +80,12 @@ def main() -> None:
     parser.add_argument("--port", default="/dev/ttyACM0")
     parser.add_argument("--zed-uvc", action="store_true")
     parser.add_argument("--cooldown", type=float, default=1.0)
+    parser.add_argument(
+        "--target-timeout",
+        type=float,
+        default=6.0,
+        help="等待目前孔位成功發射的秒數；0 表示不自動略過",
+    )
     parser.add_argument("--headless", action="store_true", help="不開 OpenCV 視窗")
     parser.add_argument(
         "--web-port",
@@ -91,7 +119,11 @@ def main() -> None:
         default="upper",
         help="比賽半場；決定 27/18 球上限與最大得分射擊順序",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    if args.cooldown < 0:
+        parser.error("--cooldown 不可小於 0")
+    if args.target_timeout < 0:
+        parser.error("--target-timeout 不可小於 0")
 
     try:
         from ultralytics import YOLO
@@ -152,7 +184,14 @@ def main() -> None:
         position_limits=config.motor_limits,
     )
     turret = TurretController(config, motors)
-    driver = BoardEngagement(config, turret, shot_cooldown_s=args.cooldown)
+    driver = BoardEngagement(
+        config,
+        turret,
+        shot_cooldown_s=args.cooldown,
+        target_timeout_s=(
+            None if args.target_timeout == 0 else args.target_timeout
+        ),
+    )
     pose_tracker = BoardPoseTracker(config)
     plan = None
     board_plan = None
@@ -183,8 +222,10 @@ def main() -> None:
         print("F：確認此孔，請在這裡接入實際發射器命令。")
         return True
 
-    driver.fire = operator_fire
-    window = "REAL BOARD AIM - F confirm / S skip / G score start / Q quit"
+    external_fire = fire_callback is not None
+    driver.fire = fire_callback if external_fire else operator_fire
+    fire_label = "external fire callback" if external_fire else "F confirm"
+    window = f"REAL BOARD AIM - {fire_label} / S skip / G score start / Q quit"
     if not args.headless:
         cv2.namedWindow(window, cv2.WINDOW_NORMAL)
     dashboard = DashboardState() if args.web_port else None
@@ -348,13 +389,13 @@ def main() -> None:
 
             pose = None
             pose_ready = args.virtual_board and frame_size_ok
+            pose_blocked_reason = None
             if not frame_size_ok:
-                driver.set_firing_enabled(
-                    False,
-                    "camera frame size does not match calibrated intrinsics",
+                pose_blocked_reason = (
+                    "camera frame size does not match calibrated intrinsics"
                 )
             elif args.virtual_board:
-                driver.set_firing_enabled(True)
+                pass
             else:
                 pose_reference = board_plan or plan
                 pose = pose_tracker.update(
@@ -377,16 +418,26 @@ def main() -> None:
                     and pose.stable
                     and pose_tracker.is_fresh(now)
                 )
-                driver.set_firing_enabled(
-                    pose_ready,
-                    None if pose_ready else "board pose moving, stale or unstable",
-                )
+                if not pose_ready:
+                    pose_blocked_reason = "board pose moving, stale or unstable"
 
             # An operator confirmation belongs to the exact stable pose in
             # which it was given.  Never keep it latched across robot motion or
             # a lost visual pose and fire later without a fresh confirmation.
             if not pose_ready:
                 fire_requested = False
+
+            if not pose_ready:
+                driver.set_firing_enabled(False, pose_blocked_reason)
+            elif external_fire or fire_requested:
+                driver.set_firing_enabled(True)
+            else:
+                # In CLI/manual mode, waiting for F is not a failed launcher
+                # attempt and must not consume the target timeout window.
+                driver.set_firing_enabled(
+                    False,
+                    "waiting for operator F confirmation",
+                )
 
             if now - last_report >= 2.0:
                 pose_report = "virtual"
@@ -608,37 +659,40 @@ def main() -> None:
                 2,
                 cv2.LINE_AA,
             )
-            if dashboard is not None:
-                dashboard.update_telemetry(
-                    build_dashboard_snapshot(
-                        plan=plan,
-                        board_plan=board_plan,
-                        engagement_status=status,
-                        config=config,
-                        pose=pose,
-                        pose_ready=pose_ready,
-                        virtual_board=args.virtual_board,
-                        frame_size_ok=frame_size_ok,
-                        raw_detection_count=len(raw_detected),
-                        board_detection_count=len(detected),
-                        board_surface_found=board_surface is not None,
-                        score_mode=args.score_mode,
-                        match_phase=args.match_phase,
-                        score_state=score_state,
-                        bonus_hole_id=last_bonus_hole_id,
-                        operator_fire_pending=fire_requested,
-                        current_yaw_motor_rad=(
-                            yaw_motor_state.position_rad
-                            if yaw_motor_state is not None
-                            else None
-                        ),
-                        current_pitch_motor_rad=(
-                            pitch_motor_state.position_rad
-                            if pitch_motor_state is not None
-                            else None
-                        ),
-                    )
+            if dashboard is not None or telemetry_callback is not None:
+                telemetry = build_dashboard_snapshot(
+                    plan=plan,
+                    board_plan=board_plan,
+                    engagement_status=status,
+                    config=config,
+                    pose=pose,
+                    pose_ready=pose_ready,
+                    virtual_board=args.virtual_board,
+                    frame_size_ok=frame_size_ok,
+                    raw_detection_count=len(raw_detected),
+                    board_detection_count=len(detected),
+                    board_surface_found=board_surface is not None,
+                    score_mode=args.score_mode,
+                    match_phase=args.match_phase,
+                    score_state=score_state,
+                    bonus_hole_id=last_bonus_hole_id,
+                    operator_fire_pending=fire_requested,
+                    current_yaw_motor_rad=(
+                        yaw_motor_state.position_rad
+                        if yaw_motor_state is not None
+                        else None
+                    ),
+                    current_pitch_motor_rad=(
+                        pitch_motor_state.position_rad
+                        if pitch_motor_state is not None
+                        else None
+                    ),
                 )
+                if telemetry_callback is not None:
+                    telemetry_callback(telemetry)
+                if dashboard is not None:
+                    dashboard.update_telemetry(telemetry)
+            if dashboard is not None:
                 ok_jpg, encoded = cv2.imencode(".jpg", display, [cv2.IMWRITE_JPEG_QUALITY, 80])
                 if ok_jpg:
                     dashboard.update_frame(encoded.tobytes())
@@ -647,7 +701,12 @@ def main() -> None:
                 cv2.imshow(window, display)
                 key = cv2.waitKey(1) & 0xFF
             if key == ord("f"):
-                if pose_ready:
+                if external_fire:
+                    print(
+                        "目前由外部 fire_callback 控制發射，F 不會另送一次命令。",
+                        flush=True,
+                    )
+                elif pose_ready:
                     fire_requested = True
                 else:
                     fire_requested = False

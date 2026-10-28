@@ -64,6 +64,41 @@ class EngagementSafetyGateTests(unittest.TestCase):
         self.assertEqual(fired, ["H05"])
         self.assertTrue(plan.finished)
 
+    def test_failed_launcher_attempt_is_retried_only_after_cooldown(self):
+        clock = _Clock()
+        attempts = []
+        target = BoardTarget(
+            640.0,
+            360.0,
+            40.0,
+            40.0,
+            hole_id="H05",
+            distance_m=5.0,
+        )
+        plan = EngagementPlan([target])
+        engagement = BoardEngagement(
+            TurretConfig(),
+            _AlwaysReadyTurret(),
+            plan=plan,
+            fire=lambda item: attempts.append(item.hole_id) or False,
+            shot_cooldown_s=1.0,
+            target_timeout_s=None,
+            clock=clock,
+        )
+
+        engagement.update()
+        clock.now = 0.2
+        engagement.update()
+        clock.now = 0.99
+        engagement.update()
+        self.assertEqual(attempts, ["H05"])
+        self.assertEqual(plan.index, 0)
+
+        clock.now = 1.0
+        engagement.update()
+        self.assertEqual(attempts, ["H05", "H05"])
+        self.assertEqual(plan.index, 0)
+
 
 if __name__ == "__main__":
     unittest.main()
