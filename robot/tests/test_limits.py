@@ -7,13 +7,15 @@ import tempfile
 import unittest
 from contextlib import redirect_stdout
 
-from turret_control.backends import DamiaoSerialBackend, PositionCommand
+from turret_control.backends import DamiaoSerialBackend, MotorState, PositionCommand
 from turret_control.config import TurretConfig
 from turret_control.limits import (
     HomeCorridor,
     WorkspaceLimit,
     clamp_workspace_target,
     clamp_motor_position,
+    constrain_yaw_design_limit,
+    constrain_pitch_activity_limit,
     load_axis_limits,
     load_motor_limits,
     load_workspace_limit,
@@ -22,9 +24,86 @@ from turret_control.limits import (
     workspace_contains,
 )
 from turret_control.run_limit_calibration import _save_recovery_trace
+from turret_control.pitch import PitchCalibration, load_pitch_calibration
+from turret_control.run_vertical_panel import DEFAULT_STARTUP_POSE
 
 
 class MotorLimitTests(unittest.TestCase):
+    def test_yaw_design_limit_uses_calibration_and_preserves_stricter_limits(self):
+        for sign in (-1, 1):
+            calibration = PitchCalibration(0.5, 2.0, sign)
+            lower, upper = constrain_yaw_design_limit((-10.0, 10.0), calibration)
+            physical = sorted(math.degrees(calibration.muzzle_from_motor(v)) for v in (lower, upper))
+            self.assertAlmostEqual(physical[0], -34.5)
+            self.assertAlmostEqual(physical[1], 34.5)
+            self.assertEqual(constrain_yaw_design_limit((0.4, 0.6), calibration), (0.4, 0.6))
+
+    def test_enable_rejects_yaw_outside_fixed_limit(self):
+        backend = DamiaoSerialBackend.__new__(DamiaoSerialBackend)
+        backend._motors = {0x03: object()}
+        backend._position_limits = {0x03: (-0.6, 0.6)}
+        backend.refresh = lambda: None
+        backend.get_state = lambda motor_id: MotorState(motor_id, 0.61, 0.0, 0.0, 0)
+        with self.assertRaisesRegex(RuntimeError, "outside.*safety limit"):
+            backend.enable()
+
+    def test_pitch_activity_limit_and_enable_reject_outside_position(self):
+        for sign in (-1, 1):
+            calibration = PitchCalibration(0.5, 2.0, sign)
+            lower, upper = constrain_pitch_activity_limit((-10.0, 10.0), calibration)
+            physical = sorted(math.degrees(calibration.muzzle_from_motor(v)) for v in (lower, upper))
+            self.assertAlmostEqual(physical[0], 0.0)
+            self.assertAlmostEqual(physical[1], 30.0)
+        backend = DamiaoSerialBackend.__new__(DamiaoSerialBackend)
+        backend._motors = {0x01: object()}
+        backend._position_limits = {0x01: (0.0, 0.6)}
+        backend.refresh = lambda: None
+        backend.get_state = lambda motor_id: MotorState(motor_id, 0.61, 0.0, 0.0, 0)
+        with self.assertRaisesRegex(RuntimeError, "pitch.*0–45° travel limit"):
+            backend.enable()
+
+    def test_home_hold_exit_and_activity_pitch_cap_use_feedback(self):
+        from turret_control.pitch import load_yaw_calibration
+
+        pitch = load_pitch_calibration(DEFAULT_STARTUP_POSE)
+        yaw = load_yaw_calibration(DEFAULT_STARTUP_POSE)
+        center = yaw.motor_from_muzzle(0.0)
+        home = pitch.motor_from_muzzle(math.radians(45.0))
+        feedback = {0x03: center, 0x01: home}
+        backend = DamiaoSerialBackend.__new__(DamiaoSerialBackend)
+        backend._motors = {0x03: object(), 0x01: object()}
+        backend._position_limits = load_motor_limits()
+        backend._pitch_calibration = pitch
+        backend._workspace = load_workspace_limit()
+        backend._last_workspace_notice = None
+        backend._last = {}
+        backend._enabled = True
+        backend.get_state = lambda motor_id: MotorState(motor_id, feedback[motor_id], 0.0, 0.0, 1)
+        sent = {}
+        backend._send_target = lambda motor_id, position, speed, velocity, torque: sent.update({motor_id: position})
+        backend.send_targets({0x03: (center, 0.2, 0.0, 0.0), 0x01: (home, 0.2, 0.0, 0.0)})
+        self.assertAlmostEqual(sent[0x01], home)
+        feedback[0x03] = yaw.motor_from_muzzle(math.radians(9))
+        backend.send_targets({0x03: (feedback[0x03], 0.2, 0.0, 0.0), 0x01: (home, 0.2, 0.0, 0.0)})
+        self.assertAlmostEqual(sent[0x03], feedback[0x03])
+        self.assertAlmostEqual(sent[0x01], home)
+        backend.send_targets({0x03: (yaw.motor_from_muzzle(math.radians(10)), 0.2, 0.0, 0.0),
+                              0x01: (pitch.motor_from_muzzle(math.radians(25)), 0.2, 0.0, 0.0)})
+        self.assertAlmostEqual(sent[0x03], center)
+        self.assertAlmostEqual(sent[0x01], pitch.motor_from_muzzle(math.radians(25)))
+        feedback[0x01] = pitch.motor_from_muzzle(math.radians(20))
+        feedback[0x03] = center
+        backend.send_targets({0x03: (center, 0.2, 0.0, 0.0), 0x01: (home, 0.2, 0.0, 0.0)})
+        self.assertAlmostEqual(sent[0x01], pitch.motor_from_muzzle(math.radians(30)))
+        feedback[0x03] = yaw.motor_from_muzzle(math.radians(9))
+        backend.set_home_return(True)
+        backend.send_targets({0x03: (center, 0.2, 0.0, 0.0), 0x01: (home, 0.2, 0.0, 0.0)})
+        self.assertAlmostEqual(sent[0x03], center)
+        self.assertAlmostEqual(sent[0x01], feedback[0x01])
+        feedback[0x03] = center
+        backend.send_targets({0x03: (center, 0.2, 0.0, 0.0), 0x01: (home, 0.2, 0.0, 0.0)})
+        self.assertAlmostEqual(sent[0x01], home)
+
     def test_recovery_trace_serializes_numpy_float32(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "mechanism_limits_trace_latest.json"
@@ -51,10 +130,9 @@ class MotorLimitTests(unittest.TestCase):
         limits = load_motor_limits()
         config = TurretConfig()
         self.assertEqual(limits[config.yaw_motor_id], (config.yaw_min_rad, config.yaw_max_rad))
-        self.assertEqual(
-            limits[config.pitch_motor_id],
-            (config.pitch_min_rad, config.pitch_max_rad),
-        )
+        pitch = load_pitch_calibration(DEFAULT_STARTUP_POSE)
+        self.assertEqual(constrain_pitch_activity_limit(limits[config.pitch_motor_id], pitch),
+                         (config.pitch_min_rad, config.pitch_max_rad))
 
     def test_clamp_reports_out_of_range_target(self):
         self.assertEqual(clamp_motor_position(0.5, (0.0, 1.0)), (0.5, False))

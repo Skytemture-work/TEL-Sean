@@ -1,15 +1,22 @@
 import math
 import io
+import json
 from pathlib import Path
 import shutil
 import tempfile
 import unittest
 from contextlib import redirect_stdout
 from unittest.mock import patch
+from types import SimpleNamespace
 
 from turret_control.pitch import PitchCalibration, save_manual_origin_calibration
 from turret_control.config import TurretConfig
-from turret_control.limits import load_axis_limits
+from turret_control.limits import (
+    constrain_pitch_activity_limit,
+    load_axis_limits,
+    load_workspace_limit,
+    workspace_contains,
+)
 from turret_control.run_vertical_panel import (
     DEFAULT_STARTUP_POSE,
     MAX_MUZZLE_ELEVATION_DEG,
@@ -58,15 +65,25 @@ class PitchCalibrationTests(unittest.TestCase):
 
     def test_project_calibration_maps_requested_muzzle_angle(self):
         calibration = load_pitch_calibration(DEFAULT_STARTUP_POSE)
+        stored = json.loads(DEFAULT_STARTUP_POSE.read_text())["vertical"]
         motor_at_zero = calibration.motor_from_muzzle(0.0)
         motor_at_fifteen = calibration.motor_from_muzzle(math.radians(15.0))
-        self.assertAlmostEqual(motor_at_zero, calibration.motor_zero_rad)
-        self.assertAlmostEqual(
-            motor_at_fifteen,
-            calibration.motor_zero_rad - math.radians(15.0),
-        )
+        motor_at_45 = float(stored["angle_rad"])
+        level_reference = float(stored["level_reference_angle_rad"])
+        self.assertAlmostEqual(motor_at_zero, level_reference)
+        self.assertAlmostEqual(calibration.motor_from_muzzle(math.radians(45.0)), motor_at_45)
+        self.assertAlmostEqual(motor_at_fifteen, level_reference + (motor_at_45 - level_reference) / 3)
         self.assertGreater(motor_at_zero, motor_at_fifteen)
-        self.assertAlmostEqual(motor_at_zero - motor_at_fifteen, math.radians(15.0))
+
+    def test_centered_activity_range_is_in_workspace(self):
+        yaw = load_yaw_calibration(DEFAULT_STARTUP_POSE)
+        pitch = load_pitch_calibration(DEFAULT_STARTUP_POSE)
+        workspace = load_workspace_limit()
+        center = yaw.motor_from_muzzle(0.0)
+        for elevation in (0.0, 15.0, 30.0):
+            self.assertTrue(workspace_contains(
+                workspace, center, pitch.motor_from_muzzle(math.radians(elevation))
+            ), msg=f"centered elevation {elevation}° is outside workspace")
 
     def test_captured_initial_motor_pose_is_forty_five_degrees_up(self):
         calibration = load_pitch_calibration(DEFAULT_STARTUP_POSE)
@@ -79,14 +96,46 @@ class PitchCalibrationTests(unittest.TestCase):
         calibration = load_pitch_calibration(DEFAULT_STARTUP_POSE)
         limits = load_axis_limits()["pitch"]
         self.assertEqual(config.pitch_sign, -1)
-        self.assertAlmostEqual(config.pitch_min_rad, limits.min_rad)
-        self.assertAlmostEqual(config.pitch_max_rad, limits.max_rad)
+        activity = constrain_pitch_activity_limit((limits.min_rad, limits.max_rad), calibration)
+        self.assertAlmostEqual(config.pitch_min_rad, activity[0])
+        self.assertAlmostEqual(config.pitch_max_rad, activity[1])
         physical_limits = sorted(
             math.degrees(calibration.muzzle_from_motor(value))
             for value in (config.pitch_min_rad, config.pitch_max_rad)
         )
         self.assertGreaterEqual(physical_limits[0], 0.0)
-        self.assertLessEqual(physical_limits[1], 45.0)
+        self.assertAlmostEqual(physical_limits[1], 30.0)
+        self.assertAlmostEqual(max(math.degrees(calibration.muzzle_from_motor(v)) for v in activity), 30.0)
+
+    def test_home_exit_corridor_allows_ten_degrees_yaw_above_activity_range(self):
+        yaw = load_yaw_calibration(DEFAULT_STARTUP_POSE)
+        pitch = load_pitch_calibration(DEFAULT_STARTUP_POSE)
+        workspace = load_workspace_limit()
+        for elevation in (30.1, 35.0, 45.0):
+            pitch_pos = pitch.motor_from_muzzle(math.radians(elevation))
+            for angle in (-10.0, 0.0, 10.0):
+                self.assertTrue(workspace_contains(workspace, yaw.motor_from_muzzle(math.radians(angle)), pitch_pos))
+            for angle in (-10.1, 10.1):
+                self.assertFalse(workspace_contains(workspace, yaw.motor_from_muzzle(math.radians(angle)), pitch_pos))
+
+    def test_explicit_home_centers_before_rising_above_activity_range(self):
+        pitch = PitchCalibration(motor_zero_rad=0.2, motor_sign=-1)
+        yaw = PitchCalibration(motor_zero_rad=0.5, motor_sign=-1)
+        worker = self.make_worker(pitch, yaw)
+        worker.max_muzzle_rad = math.radians(30)
+        worker.max_pitch_for_yaw_rad = math.radians(30)
+        worker.yaw_release_pitch_rad = math.radians(30)
+        worker.yaw_clearance_pitch_rad = math.radians(29.5)
+        worker._feedback_position_rad = pitch.motor_from_muzzle(math.radians(20))
+        worker._yaw_feedback_position_rad = yaw.motor_from_muzzle(math.radians(10))
+        worker._enabled = True
+        requested = []
+        worker._motors = SimpleNamespace(set_home_return=requested.append)
+        worker._set_aim_targets(0.0, 45.0, home_return=True)
+        self.assertEqual(requested, [True])
+        self.assertEqual(worker.snapshot().yaw_sequence_phase, "clearance")
+        self.assertAlmostEqual(worker.snapshot().target_muzzle_rad, math.radians(29.5))
+        self.assertAlmostEqual(worker.snapshot().yaw_restore_muzzle_rad, math.radians(45))
 
     def test_horizontal_reference_and_limits_match_measured_workspace(self):
         calibration = load_yaw_calibration(DEFAULT_STARTUP_POSE)

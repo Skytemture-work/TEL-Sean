@@ -14,10 +14,11 @@
         "observed_min_rad": -0.0722896158695221,
         "observed_max_rad": 1.101892113685608
       },
-      "min_rad": -0.039911459132484506,
-      "max_rad": 1.0931654674256364,
-      "min_motor_deg": -2.2867581625002282,
-      "max_motor_deg": 62.63376759293484
+      "min_rad": -0.08504850976946454,
+      "max_rad": 1.1192286741066226,
+      "min_motor_deg": -4.872920663667468,
+      "max_motor_deg": 64.12707933633251,
+      "limit_source": "calibrated yaw zero with physical software limits -34.5 to +34.5 degrees"
     },
     "pitch": {
       "axis": "pitch",
@@ -26,10 +27,11 @@
         "observed_min_rad": -0.3549630045890808,
         "observed_max_rad": 0.24280919134616852
       },
-      "min_rad": -0.5323491096496582,
-      "max_rad": 0.23408254508619686,
-      "min_motor_deg": -30.501357210472502,
-      "max_motor_deg": 13.411941891119888
+      "min_rad": -0.5579079985618591,
+      "max_rad": 0.22106507420539856,
+      "min_motor_deg": -31.965773674185332,
+      "max_motor_deg": 12.666095749715698,
+      "limit_source": "0–30 degree activity range; 30–45 degree centered home transit only"
     }
   },
   "workspace": {
@@ -40,22 +42,23 @@
     "simplify_motor_deg": 0.25,
     "closure_gap_motor_deg": 1.001539183305738,
     "closure_seam_trimmed_samples": 222,
-    "symmetry_yaw_center_rad": 0.5266270041465759,
+    "symmetry_yaw_center_rad": 0.5170900821685791,
     "home_corridor": {
-      "yaw_center_rad": 0.5266270041465759,
-      "yaw_tolerance_motor_deg": 0.25,
-      "home_pitch_rad": -0.5323491096496582,
-      "transition_pitch_rad": -0.32449225608944576
+      "yaw_center_rad": 0.5170900821685791,
+      "yaw_tolerance_motor_deg": 10.0,
+      "home_pitch_rad": -0.5579079985618591,
+      "transition_pitch_rad": -0.2982502076394398,
+      "reference_source": "45-degree home with centered transit to 30-degree activity range; physical yaw tolerance ±10 degrees, target yaw 0"
     },
     "hard_limit_violation_count": 51,
     "previous_hard_limits_rad": {
       "0x03": {
-        "min_rad": -0.07164955426094255,
-        "max_rad": 1.1374922423445912
+        "min_rad": -0.0937751560294362,
+        "max_rad": 1.1279553203665944
       },
       "0x01": {
-        "min_rad": -0.5323491096496582,
-        "max_rad": 0.2499972363306453
+        "min_rad": -0.5579079985618591,
+        "max_rad": 0.22106507420539856
       }
     },
     "anchor_rad": {
@@ -64,19 +67,19 @@
     },
     "vertices_rad": [
       {
-        "yaw_rad": -0.06466010212898254,
-        "pitch_rad": -0.33321890234947205
+        "yaw_rad": -0.0937751560294362,
+        "pitch_rad": -0.3069769538994115
       },
       {
-        "yaw_rad": 1.101892113685608,
-        "pitch_rad": -0.33321890234947205
+        "yaw_rad": 1.1279553203665944,
+        "pitch_rad": -0.3069769538994115
       },
       {
-        "yaw_rad": 1.101892113685608,
+        "yaw_rad": 1.1279553203665944,
         "pitch_rad": 0.24280919134616852
       },
       {
-        "yaw_rad": -0.06466010212898254,
+        "yaw_rad": -0.0937751560294362,
         "pitch_rad": 0.24280919134616852
       }
     ],
@@ -3239,6 +3242,20 @@
         "pitch_rad": -0.3389410376548767,
         "elapsed_s": 30.000119587999507
       }
-    ]
+    ],
+    "yaw_hard_limit_source": "calibrated yaw zero with mechanical design limits -35 to +35 degrees",
+    "horizontal_boundary_source": "mechanical design ±35 degrees from calibrated yaw zero; user confirmed full ±34.5 degree travel across existing base pitch range; existing margin retained",
+    "previous_horizontal_vertices_rad": [
+      -0.06466010212898254,
+      1.101892113685608
+    ],
+    "pitch_activity_limit_source": "operator specified physical elevation 0 to 30 degrees; 45-degree home with centered vertical-only transit",
+    "inactive_calibration_home_corridor": {
+      "yaw_center_rad": 0.5170900821685791,
+      "yaw_tolerance_motor_deg": 0.25,
+      "home_pitch_rad": -0.5579079985618591,
+      "transition_pitch_rad": -0.2982502076394398,
+      "reference_source": "45-degree home; centered transit to 30-degree activity range"
+    }
   }
 }

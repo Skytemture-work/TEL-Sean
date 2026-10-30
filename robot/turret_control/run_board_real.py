@@ -42,6 +42,7 @@ from .dashboard import (
 from .detection import boxes_to_board_targets
 from .engagement import BoardEngagement
 from .fixed_board import calibrate_layout, load_layout
+from .limits import load_motor_limits
 from .run_yolo_demo import DEFAULT_MODEL, _draw_board_plan, _inference_frame
 from .scoring_light import ScoreRoundController
 from .scoring_strategy import (
@@ -181,7 +182,7 @@ def main(
         kp=5.0,
         kd=1.0,
         enable_on_start=False,
-        position_limits=config.motor_limits,
+        position_limits=load_motor_limits(),
     )
     turret = TurretController(config, motors)
     driver = BoardEngagement(

@@ -1,0 +1,12 @@
+{
+  "captured_at": "2026-10-30T23:42:06+08:00",
+  "description": "User confirmed level muzzle reference; no controller parameters changed",
+  "physical_pitch_deg": 0.0,
+  "pitch_motor_rad": 0.22106507420539856,
+  "yaw_motor_rad": 0.49114975333213806,
+  "previous_home_pitch_deg": 45.0,
+  "previous_home_pitch_motor_rad": -0.5579079985618591,
+  "measured_pitch_motor_rad_per_muzzle_rad": 0.991819320531134,
+  "sample_count": 12,
+  "both_motor_err": 0
+}

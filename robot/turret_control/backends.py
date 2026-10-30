@@ -21,12 +21,15 @@ from .limits import (
     WorkspaceLimit,
     clamp_motor_position,
     clamp_workspace_target,
+    constrain_pitch_travel_limit,
+    constrain_yaw_design_limit,
     load_motor_limits,
     load_workspace_limit,
     workspace_base_contains,
     workspace_contains,
     workspace_in_home_corridor,
 )
+from .pitch import load_pitch_calibration, load_yaw_calibration
 
 DEFAULT_BAUD = 921600
 
@@ -172,6 +175,8 @@ class DamiaoSerialBackend:
         startup_hold_s: float = 0.5,
         position_limits: Optional[Mapping[int, Tuple[float, float]]] = None,
         workspace: Optional[WorkspaceLimit] = None,
+        yaw_calibration=None,
+        pitch_calibration=None,
     ):
         import serial
 
@@ -218,6 +223,15 @@ class DamiaoSerialBackend:
             int(motor_id): (float(bounds[0]), float(bounds[1]))
             for motor_id, bounds in position_limits.items()
         }
+        self._recorded_position_limits = dict(self._position_limits)
+        if 0x03 in self._position_limits:
+            if yaw_calibration is None:
+                yaw_calibration = load_yaw_calibration(Path(__file__).with_name("startup_pose.json"))
+            self.set_yaw_calibration(yaw_calibration)
+        if 0x01 in self._position_limits:
+            if pitch_calibration is None:
+                pitch_calibration = load_pitch_calibration(Path(__file__).with_name("startup_pose.json"))
+            self.set_pitch_calibration(pitch_calibration)
         for motor_id, bounds in self._position_limits.items():
             if bounds[0] >= bounds[1] or not all(math.isfinite(value) for value in bounds):
                 raise ValueError(f"invalid motor position limits for 0x{motor_id:02X}")
@@ -347,6 +361,30 @@ class DamiaoSerialBackend:
 
     # ------------------------------------------------------------ lifecycle
 
+    def set_yaw_calibration(self, calibration) -> None:
+        """Update the design boundary without loosening recorded limits."""
+        if getattr(self, "_enabled", False):
+            raise RuntimeError("yaw calibration cannot change while motors are enabled")
+        self._position_limits[0x03] = constrain_yaw_design_limit(
+            self._recorded_position_limits[0x03], calibration
+        )
+        self._yaw_calibration = calibration
+
+    def set_pitch_calibration(self, calibration) -> None:
+        """Update the calibrated pitch travel range while disabled."""
+        if getattr(self, "_enabled", False):
+            raise RuntimeError("pitch calibration cannot change while motors are enabled")
+        self._position_limits[0x01] = constrain_pitch_travel_limit(
+            self._recorded_position_limits[0x01], calibration
+        )
+        self._pitch_calibration = calibration
+
+    def set_home_return(self, enabled: bool) -> None:
+        """Allow explicit return through the centered home corridor."""
+        if enabled and (self._workspace is None or self._workspace.home_corridor is None):
+            raise RuntimeError("home return requires a calibrated workspace corridor")
+        self._home_return_requested = bool(enabled)
+
     def enable(self) -> None:
         # Capture the actual pose before enabling.  Sending the first control
         # frame only after enable can otherwise create a sudden torque/position
@@ -359,6 +397,22 @@ class DamiaoSerialBackend:
             if state is None or state.err is None:
                 raise RuntimeError(f"no feedback from motor 0x{motor_id:02X} before enable")
             startup_positions[motor_id] = state.position_rad
+
+        if 0x03 in startup_positions and 0x03 in self._position_limits:
+            lower, upper = self._position_limits[0x03]
+            if not lower <= startup_positions[0x03] <= upper:
+                raise RuntimeError(
+                    "current yaw is outside the recorded or ±34.5° safety limit; "
+                    "move it by hand into the allowed range before enabling"
+                )
+
+        if 0x01 in startup_positions and 0x01 in self._position_limits:
+            lower, upper = self._position_limits[0x01]
+            if not lower <= startup_positions[0x01] <= upper:
+                raise RuntimeError(
+                    "current pitch is outside the recorded or 0–45° travel limit; "
+                    "move it by hand into the allowed range before enabling"
+                )
 
         workspace = getattr(self, "_workspace", None)
         if workspace is not None and not workspace_contains(
@@ -390,6 +444,7 @@ class DamiaoSerialBackend:
         for motor in self._motors.values():
             self._mc.disable(motor)
         self._enabled = False
+        self._home_return_requested = False
 
     def set_zero_here(self) -> None:
         """Define the current pose as zero.  Only valid while disabled."""
@@ -486,6 +541,22 @@ class DamiaoSerialBackend:
             limits = self._position_limits.get(motor_id)
             if limits is not None:
                 position, _ = clamp_motor_position(float(position), limits)
+            if motor_id == 0x01 and hasattr(self, "_pitch_calibration"):
+                calibration = self._pitch_calibration
+                desired_elevation = calibration.muzzle_from_motor(position)
+                if desired_elevation > math.radians(30.0) and not getattr(self, "_home_return_requested", False):
+                    state = self.get_state(motor_id)
+                    measured = (
+                        calibration.muzzle_from_motor(state.position_rad)
+                        if state is not None and state.err is not None
+                        and state.err < 0x8 and math.isfinite(state.position_rad)
+                        else math.radians(30.0)
+                    )
+                    # Home and the vertical-only exit corridor may be held or
+                    # exited. Ordinary commands cannot raise beyond the larger
+                    # of 30° and the actual feedback position.
+                    allowed_elevation = min(desired_elevation, max(math.radians(30.0), measured))
+                    position = calibration.motor_from_muzzle(allowed_elevation)
             prepared[motor_id] = (position, speed, velocity, torque)
 
         workspace = getattr(self, "_workspace", None)
@@ -553,7 +624,13 @@ class DamiaoSerialBackend:
                 )
                 yaw_is_centered = (
                     abs(previous_yaw - corridor.yaw_center_rad)
-                    <= corridor.yaw_tolerance_rad
+                    <= min(
+                        corridor.yaw_tolerance_rad,
+                        math.radians(0.25) * getattr(
+                            getattr(self, "_yaw_calibration", None),
+                            "motor_rad_per_muzzle_rad", 1.0,
+                        ),
+                    )
                 )
                 if previous_in_corridor and not previous_in_base and not requested_in_corridor:
                     # Leaving 45-degree home: lower vertically into the traced

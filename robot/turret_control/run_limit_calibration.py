@@ -552,6 +552,7 @@ def main() -> None:
             "closure_motor_deg": args.closure_motor_deg,
             "hard_motor_limits": hard_motor_limits,
             "yaw_symmetry_center_rad": yaw_calibration.motor_zero_rad,
+            "home_corridor_yaw_deg": 10.0 * yaw_calibration.motor_rad_per_muzzle_rad,
             "home_position": {
                 "yaw_rad": yaw_calibration.motor_from_muzzle(0.0),
                 "pitch_rad": pitch_calibration.motor_from_muzzle(

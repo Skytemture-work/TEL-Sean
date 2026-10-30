@@ -25,7 +25,7 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 
 from .backends import DamiaoSerialBackend
-from .limits import load_motor_limits
+from .limits import PITCH_MAX_DEG, load_motor_limits
 from .pitch import (
     PitchCalibration,
     load_pitch_calibration,
@@ -42,8 +42,8 @@ YAW_MOTOR_ID = 0x03
 CONTROL_PERIOD_S = 0.005
 MIN_MUZZLE_ELEVATION_DEG = 0.0
 MAX_MUZZLE_ELEVATION_DEG = 45.0
-MIN_TURRET_YAW_DEG = -35.0
-MAX_TURRET_YAW_DEG = 35.0
+MIN_TURRET_YAW_DEG = -34.5
+MAX_TURRET_YAW_DEG = 34.5
 MAX_PITCH_FOR_YAW_DEG = 35.0
 YAW_RELEASE_MARGIN_DEG = 0.5
 YAW_CLEARANCE_PITCH_DEG = MAX_PITCH_FOR_YAW_DEG - YAW_RELEASE_MARGIN_DEG
@@ -152,7 +152,7 @@ class MotorWorker:
             or max_yaw_deg > MAX_TURRET_YAW_DEG
             or min_yaw_deg >= max_yaw_deg
         ):
-            raise ValueError("水平角度控制範圍必須位於 -35.0° 到 +35.0° 內")
+            raise ValueError("水平角度控制範圍必須位於 -34.5° 到 +34.5° 內")
         if (
             not math.isfinite(max_pitch_for_yaw_deg)
             or max_pitch_for_yaw_deg < MIN_MUZZLE_ELEVATION_DEG
@@ -237,6 +237,9 @@ class MotorWorker:
     def request_aim(self, yaw_deg: float, muzzle_deg: float) -> None:
         self._commands.put(("aim", (float(yaw_deg), float(muzzle_deg))))
 
+    def request_home(self) -> None:
+        self._commands.put(("home", None))
+
     def request_calibration_reload(
         self,
         pitch_calibration: PitchCalibration,
@@ -291,6 +294,9 @@ class MotorWorker:
                 f"{math.degrees(self.max_muzzle_rad):+.1f}°"
             )
 
+        if self._motors is not None:
+            self._motors.set_home_return(False)
+
         if self._yaw_sequence_phase in ("clearance", "rotating"):
             self._yaw_restore_muzzle_rad = muzzle_rad
             active_pitch_rad = (
@@ -341,7 +347,7 @@ class MotorWorker:
         )
         self._apply_pitch_target(
             active_pitch_rad,
-            "水平自動避讓：垂直先降到 35° 以下，確認安全後雙軸同時移動",
+            f"水平自動避讓：垂直先降到 {math.degrees(self.max_pitch_for_yaw_rad):.1f}° 以下，確認安全後雙軸同時移動",
         )
         self._publish(
             yaw_sequence_phase="clearance",
@@ -381,9 +387,15 @@ class MotorWorker:
             raise ValueError("水平角度必須是有限數字")
         yaw_rad = math.radians(yaw_deg)
         if not self.min_yaw_rad <= yaw_rad <= self.max_yaw_rad:
-            raise ValueError("水平角度超出安全限制：-35.0° 到 +35.0°")
+            raise ValueError(
+                f"水平角度超出安全限制：{math.degrees(self.min_yaw_rad):+.1f}° 到 "
+                f"{math.degrees(self.max_yaw_rad):+.1f}°"
+            )
         if self._feedback_position_rad is None:
             raise ValueError("尚未取得垂直馬達回饋，禁止水平移動")
+
+        if self._motors is not None:
+            self._motors.set_home_return(False)
 
         target = self.yaw_calibration.motor_from_muzzle(yaw_rad)
         move_required = self._yaw_motion_required(target)
@@ -439,7 +451,7 @@ class MotorWorker:
             error=None,
         )
 
-    def _set_aim_targets(self, yaw_deg: float, muzzle_deg: float) -> None:
+    def _set_aim_targets(self, yaw_deg: float, muzzle_deg: float, *, home_return: bool = False) -> None:
         """Set a final two-axis pose, staging through clearance when needed."""
         if self.yaw_calibration is None:
             raise ValueError("水平馬達控制未啟用")
@@ -448,13 +460,24 @@ class MotorWorker:
         yaw_rad = math.radians(yaw_deg)
         muzzle_rad = math.radians(muzzle_deg)
         if not self.min_yaw_rad <= yaw_rad <= self.max_yaw_rad:
-            raise ValueError("水平角度超出安全限制：-35.0° 到 +35.0°")
-        if not self.min_muzzle_rad <= muzzle_rad <= self.max_muzzle_rad:
-            raise ValueError("砲口仰角超出安全限制：0.0° 到 45.0°")
+            raise ValueError(
+                f"水平角度超出安全限制：{math.degrees(self.min_yaw_rad):+.1f}° 到 "
+                f"{math.degrees(self.max_yaw_rad):+.1f}°"
+            )
+        pitch_upper = math.radians(MAX_MUZZLE_ELEVATION_DEG) if home_return else self.max_muzzle_rad
+        if not self.min_muzzle_rad <= muzzle_rad <= pitch_upper:
+            raise ValueError(
+                f"砲口仰角超出安全限制：{math.degrees(self.min_muzzle_rad):.1f}° 到 "
+                f"{math.degrees(self.max_muzzle_rad):.1f}°"
+            )
         if self._feedback_position_rad is None:
             raise ValueError("尚未取得垂直馬達回饋，禁止雙軸移動")
         if self._yaw_feedback_position_rad is None:
             raise ValueError("尚未取得水平馬達回饋，禁止雙軸移動")
+        if home_return and (not self._enabled or self._motors is None):
+            raise ValueError("回 home 前必須先使能馬達")
+        if self._motors is not None:
+            self._motors.set_home_return(home_return)
         feedback_pitch = self.pitch_calibration.muzzle_from_motor(
             self._feedback_position_rad
         )
@@ -503,7 +526,7 @@ class MotorWorker:
                 self._yaw_sequence_phase = "rotating"
                 self._publish(
                     yaw_sequence_phase="rotating",
-                    status="垂直已確認低於 35°；開始水平、垂直同時移動",
+                    status=f"垂直已進入 {math.degrees(self.max_pitch_for_yaw_rad):.1f}° 活動範圍；開始水平、垂直同時移動",
                     error=None,
                 )
             return
@@ -584,6 +607,9 @@ class MotorWorker:
         if self._yaw_feedback_position_rad is None:
             raise ValueError("尚未取得水平馬達回饋")
 
+        if self._motors is not None:
+            self._motors.set_yaw_calibration(yaw_calibration)
+            self._motors.set_pitch_calibration(pitch_calibration)
         self.pitch_calibration = pitch_calibration
         self.yaw_calibration = yaw_calibration
         self.startup_pitch_rad = pitch_calibration.motor_zero_rad
@@ -774,6 +800,11 @@ class MotorWorker:
                 self._set_aim_targets(float(yaw_deg), float(muzzle_deg))
             except (TypeError, ValueError) as exc:
                 self._publish(status="雙軸目標未套用", error=str(exc))
+        elif action == "home":
+            try:
+                self._set_aim_targets(0.0, MAX_MUZZLE_ELEVATION_DEG, home_return=True)
+            except (ValueError, RuntimeError) as exc:
+                self._publish(status="home 目標未套用", error=str(exc))
         elif action == "calibration":
             try:
                 pitch_calibration, yaw_calibration = value
@@ -801,6 +832,8 @@ class MotorWorker:
                 enable_on_start=False,
                 startup_hold_s=0.5,
                 position_limits=self.position_limits,
+                yaw_calibration=self.yaw_calibration,
+                pitch_calibration=self.pitch_calibration,
             )
             # The USB-CAN read is non-blocking by design.  Give the adapter a
             # few cycles to return the first feedback frame before showing it.
@@ -1430,7 +1463,7 @@ def _prompt_and_request_pose(
 
     while True:
         horizontal_text = input(
-            "水平目標角度（-35～+35°，正向右、負向左，直接 Enter 取消）："
+            "水平目標角度（-34.5～+34.5°，正向右、負向左，直接 Enter 取消）："
         ).strip()
         if not horizontal_text:
             print("取消角度設定。")
@@ -1443,7 +1476,7 @@ def _prompt_and_request_pose(
         if not math.isfinite(horizontal_deg) or not (
             MIN_TURRET_YAW_DEG <= horizontal_deg <= MAX_TURRET_YAW_DEG
         ):
-            print("水平角度必須在 -35.0° 到 +35.0° 之間。")
+            print("水平角度必須在 -34.5° 到 +34.5° 之間。")
             continue
         break
 
@@ -1470,10 +1503,10 @@ def _run_terminal_panel(
     )
     print(f"set 的角度是砲口仰角，軟限制 {min_angle:+.1f}° 到 {max_angle:+.1f}°。")
     if worker.yaw_calibration is not None:
-        print("yaw 是水平絕對角度：正向右、負向左，安全範圍 -35.0° 到 +35.0°。")
+        print("yaw 是水平絕對角度：正向右、負向左，上限 -34.5° 到 +34.5°；實際範圍也受記錄的工作區限制。")
         print(
-            "若垂直高於 35°，yaw/aim 會先降低垂直；實際回饋低於 35° 後，"
-            "水平與垂直會同時移動。"
+            f"若垂直高於 {math.degrees(worker.max_pitch_for_yaw_rad):.1f}°，"
+            "yaw/aim 會先降低垂直；確認進入活動範圍後再水平移動。"
         )
     worker.start()
     target_angle: Optional[float] = None
@@ -1571,7 +1604,7 @@ def _run_terminal_panel(
                 if not math.isfinite(requested_yaw):
                     print("水平角度必須是有限數字。")
                 elif not MIN_TURRET_YAW_DEG <= requested_yaw <= MAX_TURRET_YAW_DEG:
-                    print("超出水平安全限制：-35.0° 到 +35.0°")
+                    print("超出水平安全限制：-34.5° 到 +34.5°")
                 else:
                     worker.request_yaw_angle(requested_yaw)
                     if worker.yaw_calibration is not None:
@@ -1599,7 +1632,7 @@ def _run_terminal_panel(
                 ):
                     print("aim 的水平與垂直角度都必須是有限數字。")
                 elif not MIN_TURRET_YAW_DEG <= requested_yaw <= MAX_TURRET_YAW_DEG:
-                    print("超出水平安全限制：-35.0° 到 +35.0°")
+                    print("超出水平安全限制：-34.5° 到 +34.5°")
                 elif not min_angle <= requested_pitch <= max_angle:
                     print(
                         f"垂直角度必須在 {min_angle:.1f}° 到 {max_angle:.1f}° 之間"
@@ -1612,17 +1645,12 @@ def _run_terminal_panel(
                     )
                 continue
             if command in ("home", "initial", "i"):
-                if not min_angle <= MAX_MUZZLE_ELEVATION_DEG <= max_angle:
-                    print(
-                        "目前垂直軟限制不包含原點 45.0°，無法執行 home。"
-                    )
+                if not worker.snapshot().enabled:
+                    print("馬達尚未使能；請先輸入 enable。")
                 else:
-                    worker.request_aim(0.0, MAX_MUZZLE_ELEVATION_DEG)
+                    worker.request_home()
                     target_angle = MAX_MUZZLE_ELEVATION_DEG
-                    print(
-                        "回原點：水平與垂直先前往水平 0°／垂直 34.5°，"
-                        "兩軸到位後垂直再回到 45°。"
-                    )
+                    print("回 home：先在活動區水平置中，再經置中通道回到垂直 45°。")
                 continue
             if target_angle is None:
                 latest = worker.snapshot()
@@ -1712,8 +1740,8 @@ def main() -> None:
         type=float,
         help="覆寫校正檔：砲口轉 1 rad 所需的馬達角度；直驅為 1",
     )
-    parser.add_argument("--speed", type=float, default=0.06, help="平滑移動速度上限 rad/s")
-    parser.add_argument("--acceleration", type=float, default=0.05, help="平滑加速度上限 rad/s^2")
+    parser.add_argument("--speed", type=float, default=0.10, help="平滑移動速度上限 rad/s")
+    parser.add_argument("--acceleration", type=float, default=0.09, help="平滑加速度上限 rad/s^2")
     parser.add_argument(
         "--torque-ff",
         type=float,
@@ -1826,8 +1854,11 @@ def main() -> None:
         pitch_calibration,
         PITCH_MOTOR_ID,
         MIN_MUZZLE_ELEVATION_DEG,
-        MAX_MUZZLE_ELEVATION_DEG,
+        PITCH_MAX_DEG,
     )
+    # Avoid rejecting a displayed 30.0° endpoint due to floating point
+    # conversion (e.g. 29.999999999999996°); the backend still clamps motors.
+    pitch_safe_min, pitch_safe_max = round(pitch_safe_min, 10), round(pitch_safe_max, 10)
     yaw_safe_min, yaw_safe_max = physical_bounds(
         yaw_calibration,
         YAW_MOTOR_ID,

@@ -10,7 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, Optional, Tuple
 
-from .limits import DEFAULT_LIMITS_PATH, load_axis_limits
+from .limits import DEFAULT_LIMITS_PATH, constrain_pitch_activity_limit, load_axis_limits
 from .pitch import load_pitch_calibration, load_yaw_calibration
 
 
@@ -51,9 +51,9 @@ _DEFAULT_YAW_LIMITS = (
     _DEFAULT_AXIS_LIMITS["yaw"].min_rad,
     _DEFAULT_AXIS_LIMITS["yaw"].max_rad,
 )
-_DEFAULT_PITCH_LIMITS = (
-    _DEFAULT_AXIS_LIMITS["pitch"].min_rad,
-    _DEFAULT_AXIS_LIMITS["pitch"].max_rad,
+_DEFAULT_PITCH_LIMITS = constrain_pitch_activity_limit(
+    (_DEFAULT_AXIS_LIMITS["pitch"].min_rad, _DEFAULT_AXIS_LIMITS["pitch"].max_rad),
+    _DEFAULT_PITCH_CALIBRATION,
 )
 
 

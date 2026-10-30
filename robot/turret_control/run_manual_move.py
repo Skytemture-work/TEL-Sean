@@ -1,7 +1,7 @@
 """Interactive manual move for the two DAMIAO turret motors.
 
 Yaw is relative to the current feedback position.  Pitch is the absolute
-physical muzzle elevation and is limited to 0..45 degrees.
+physical muzzle elevation and is limited to 0..30 degrees.
 
 Examples::
 
@@ -20,13 +20,13 @@ from typing import Optional
 
 from .backends import DamiaoSerialBackend
 from .limits import load_motor_limits
-from .pitch import load_pitch_calibration
+from .pitch import load_pitch_calibration, load_yaw_calibration
 from .trajectory import smoothstep_sample
 
 
 DEFAULT_STARTUP_POSE = Path(__file__).with_name("startup_pose.json")
 MIN_MUZZLE_ELEVATION_DEG = 0.0
-MAX_MUZZLE_ELEVATION_DEG = 45.0
+MAX_MUZZLE_ELEVATION_DEG = 30.0
 
 
 def angle_or_prompt(value: Optional[float], label: str) -> float:
@@ -43,7 +43,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="輸入水平／垂直角度，讓兩顆馬達同步轉動")
     parser.add_argument("--port", default="/dev/ttyACM0")
     parser.add_argument("--yaw", type=float, help="水平相對角度，單位度")
-    parser.add_argument("--pitch", type=float, help="物理砲口絕對仰角，0 到 45 度")
+    parser.add_argument("--pitch", type=float, help="物理砲口絕對仰角，0 到 30 度")
     parser.add_argument("--startup-pose", type=Path, default=DEFAULT_STARTUP_POSE)
     parser.add_argument("--speed", type=float, default=0.30, help="最大速度 rad/s")
     parser.add_argument("--kp", type=float, default=30.0, help="MIT 位置增益")
@@ -63,7 +63,7 @@ def main() -> None:
         <= pitch_deg
         <= MAX_MUZZLE_ELEVATION_DEG
     ):
-        raise SystemExit("垂直砲口仰角必須在 0° 到 45° 之間")
+        raise SystemExit("垂直砲口仰角必須在 0° 到 30° 之間")
 
     yaw_delta = math.radians(yaw_deg)
     pitch_calibration = load_pitch_calibration(args.startup_pose)
@@ -76,6 +76,8 @@ def main() -> None:
         kd=args.kd,
         enable_on_start=False,
         position_limits=load_motor_limits(),
+        yaw_calibration=load_yaw_calibration(args.startup_pose),
+        pitch_calibration=pitch_calibration,
     )
     try:
         motors.refresh()

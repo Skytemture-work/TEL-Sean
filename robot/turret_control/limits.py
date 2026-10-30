@@ -19,6 +19,42 @@ from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 
 DEFAULT_LIMITS_PATH = Path(__file__).with_name("mechanism_limits.json")
+YAW_DESIGN_LIMIT_DEG = 34.5
+PITCH_MIN_DEG = 0.0
+PITCH_MAX_DEG = 30.0
+
+
+def constrain_pitch_activity_limit(bounds, calibration):
+    """Intersect recorded limits with the calibrated 0–30° activity range."""
+    design = sorted(
+        calibration.motor_from_muzzle(math.radians(angle))
+        for angle in (PITCH_MIN_DEG, PITCH_MAX_DEG)
+    )
+    lower, upper = max(bounds[0], design[0]), min(bounds[1], design[1])
+    if lower >= upper:
+        raise ValueError("recorded pitch limits do not overlap the 0–30° activity range")
+    return lower, upper
+
+
+def constrain_pitch_travel_limit(bounds, calibration):
+    """Allow the calibrated 0–45° range, subject to the workspace corridor."""
+    design = sorted(calibration.motor_from_muzzle(math.radians(angle)) for angle in (0.0, 45.0))
+    lower, upper = max(bounds[0], design[0]), min(bounds[1], design[1])
+    if lower >= upper:
+        raise ValueError("recorded pitch limits do not overlap the 0–45° travel range")
+    return lower, upper
+
+
+def constrain_yaw_design_limit(bounds, calibration):
+    """Intersect encoder limits with the calibrated physical yaw boundary."""
+    design = sorted(
+        calibration.motor_from_muzzle(math.radians(angle))
+        for angle in (-YAW_DESIGN_LIMIT_DEG, YAW_DESIGN_LIMIT_DEG)
+    )
+    lower, upper = max(bounds[0], design[0]), min(bounds[1], design[1])
+    if lower >= upper:
+        raise ValueError("recorded yaw limits do not overlap the ±34.5° design limit")
+    return lower, upper
 
 
 @dataclass(frozen=True)
@@ -211,7 +247,7 @@ def workspace_in_home_corridor(
     )
     return (
         abs(float(yaw_rad) - corridor.yaw_center_rad)
-        <= corridor.yaw_tolerance_rad
+        <= corridor.yaw_tolerance_rad + 1e-12
         and pitch_min <= float(pitch_rad) <= pitch_max
     )
 

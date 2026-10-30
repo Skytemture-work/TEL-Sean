@@ -251,10 +251,14 @@ def main() -> None:
         raise SystemExit("--boundary-backoff-motor-deg 必須至少 0.1 度")
 
     workspace = load_workspace_limit(args.limits)
-    if workspace is None or workspace.home_corridor is None:
-        raise SystemExit("找不到多邊形工作區或 home 通道")
+    if workspace is None:
+        raise SystemExit("找不到多邊形工作區")
+    if workspace.home_corridor is None:
+        raise SystemExit("45° home 巡邊不適用目前 0°～30° 的垂直活動範圍")
     yaw_calibration = load_yaw_calibration(args.startup_pose)
     pitch_calibration = load_pitch_calibration(args.startup_pose)
+    if math.degrees(pitch_calibration.muzzle_from_motor(workspace.home_corridor.home_pitch_rad)) > 30.0:
+        raise SystemExit("45° home 巡邊不適用目前 0°～30° 的垂直活動範圍")
     boundary = _build_boundary_path(workspace, args.boundary_backoff_motor_deg)
     home = (
         workspace.home_corridor.yaw_center_rad,
@@ -280,6 +284,8 @@ def main() -> None:
         enable_on_start=False,
         position_limits=load_motor_limits(args.limits),
         workspace=workspace,
+        yaw_calibration=yaw_calibration,
+        pitch_calibration=pitch_calibration,
     )
     try:
         current = _feedback_pair(motors)
