@@ -3,7 +3,7 @@
 from typing import Any, Optional
 
 from .aiming import TargetPixel
-from .vision_geometry import MaskGeometry, polygon_geometry
+from .vision_geometry import MaskGeometry, polygon_geometry, sample_board_depth
 
 
 def _geometry_for_mask(result: Any, index: int) -> Optional[MaskGeometry]:
@@ -52,7 +52,7 @@ def select_best_box(result: Any, minimum_confidence: float = 0.40) -> Optional[T
     return best
 
 
-def boxes_to_board_targets(result, minimum_confidence: float = 0.40):
+def boxes_to_board_targets(result, minimum_confidence: float = 0.40, depth_data=None):
     """Convert every detection into a board target.
 
     Segmentation masks provide the centre and apparent diameter.  Bounding
@@ -77,12 +77,15 @@ def boxes_to_board_targets(result, minimum_confidence: float = 0.40):
             width_px = geometry.width_px
             height_px = geometry.height_px
             diameter_px = geometry.equivalent_diameter_px
+            depth_m = (sample_board_depth(depth_data, polygon=geometry.contour)
+                       if depth_data is not None else None)
         else:
             u_px = (x1 + x2) / 2.0
             v_px = (y1 + y2) / 2.0
             width_px = abs(x2 - x1)
             height_px = abs(y2 - y1)
             diameter_px = None
+            depth_m = None
         targets.append(
             BoardTarget(
                 u_px=u_px,
@@ -91,6 +94,8 @@ def boxes_to_board_targets(result, minimum_confidence: float = 0.40):
                 height_px=height_px,
                 confidence=confidence,
                 diameter_px=diameter_px,
+                distance_m=depth_m,
+                distance_source="zed_depth" if depth_m is not None else None,
             )
         )
     return targets

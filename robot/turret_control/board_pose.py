@@ -27,6 +27,7 @@ class BoardPose:
     translation_speed_m_s: float
     rotation_speed_rad_s: float
     stable: bool
+    source: str = "pnp"
 
 
 def camera_matrix(config: TurretConfig) -> np.ndarray:
@@ -156,6 +157,7 @@ class BoardPoseTracker:
         self.config = config
         self._pose: Optional[BoardPose] = None
         self._stable_frames = 0
+        self._last_stable_pnp_at: Optional[float] = None
 
     @property
     def last_pose(self) -> Optional[BoardPose]:
@@ -316,6 +318,92 @@ class BoardPoseTracker:
             stable=stable,
         )
         self._pose = pose
+        if stable:
+            self._last_stable_pnp_at = timestamp
+        else:
+            # A newly observed moving pose must not fall back to an old one.
+            self._last_stable_pnp_at = None
+        return pose
+
+    def update_partial(
+        self,
+        observed_targets: Sequence[BoardTarget],
+        reference_plan: Optional[EngagementPlan],
+        now: Optional[float] = None,
+    ) -> Optional[BoardPose]:
+        """Track a recent stable pose using visible, matched hole centres.
+
+        Sparse observations can only update image-plane translation; depth and
+        rotation remain assumptions and the independent PnP age is never reset.
+        """
+        timestamp = time.monotonic() if now is None else now
+        previous = self._pose
+        reference_at = self._last_stable_pnp_at
+        if (previous is None or reference_plan is None or reference_at is None
+                or timestamp < previous.timestamp
+                or timestamp - previous.timestamp > self.config.board_pose_stale_timeout_s
+                or timestamp - reference_at > self.config.board_pose_partial_max_age_s):
+            return None
+        projected = list(project_targets_from_pose(reference_plan, previous, self.config).values())
+        if len(projected) < 2:
+            return None
+        positions = np.asarray([(t.u_px, t.v_px) for t in projected])
+        distances = np.linalg.norm(positions[:, None] - positions[None, :], axis=2)
+        distances += np.eye(len(projected)) * 1e9
+        spacing = float(np.min(distances))
+        gate = min(20.0, spacing * 0.2)
+        pairs = []
+        for observed in observed_targets:
+            if (not all(math.isfinite(v) for v in
+                        (observed.u_px, observed.v_px, observed.size_px, observed.confidence))
+                    or observed.confidence < self.config.board_pose_partial_min_confidence):
+                continue
+            delta = positions - (observed.u_px, observed.v_px)
+            distance = np.linalg.norm(delta, axis=1)
+            index = int(np.argmin(distance))
+            expected = projected[index]
+            if (distance[index] <= gate and expected.size_px > 0
+                    and 0.75 * expected.size_px <= observed.size_px <= 1.3 * expected.size_px):
+                pairs.append((float(distance[index]), index, observed, expected))
+        matches = []
+        used = set()
+        for _, index, observed, expected in sorted(pairs, key=lambda item: item[0]):
+            if index not in used:
+                matches.append((observed, expected))
+                used.add(index)
+        if not matches:
+            return None
+        shifts = np.asarray([(o.u_px - e.u_px, o.v_px - e.v_px) for o, e in matches])
+        shift = np.median(shifts, axis=0)
+        if np.max(np.linalg.norm(shifts - shift, axis=1)) > max(2.0, spacing * 0.04):
+            return None
+        # Undistort the paired image points before estimating lateral motion.
+        points = np.asarray([(e.u_px, e.v_px) for _, e in matches]
+                            + [(o.u_px, o.v_px) for o, _ in matches], dtype=np.float64)
+        normalized = cv2.undistortPoints(points.reshape(-1, 1, 2), camera_matrix(self.config),
+                                         distortion_coefficients(self.config)).reshape(-1, 2)
+        rotation, _ = cv2.Rodrigues(previous.rvec)
+        translations = []
+        for index, (_, expected) in enumerate(matches):
+            depth = float((rotation @ _board_point(expected.hole_id).reshape(3, 1) + previous.tvec)[2, 0])
+            translations.append((normalized[index + len(matches)] - normalized[index]) * depth)
+        displacement = np.median(np.asarray(translations), axis=0)
+        dt = timestamp - previous.timestamp
+        if dt <= 1e-4:
+            return None
+        speed = float(np.linalg.norm(displacement) / dt)
+        if speed > self.config.board_pose_fire_translation_m_s:
+            self._last_stable_pnp_at = None
+            return None
+        tvec = previous.tvec.copy()
+        tvec[:2, 0] += displacement
+        pose = BoardPose(
+            rvec=previous.rvec.copy(), tvec=tvec, timestamp=timestamp,
+            reprojection_error_px=float(np.max(np.linalg.norm(shifts - shift, axis=1))),
+            correspondence_count=len(matches), translation_speed_m_s=speed,
+            rotation_speed_rad_s=0.0, stable=True, source="partial",
+        )
+        self._pose = pose
         return pose
 
 
@@ -367,8 +455,40 @@ def project_targets_from_pose(
             diameter_px=(width_px + height_px) / 2.0,
             diameter_m=diameter_m,
             distance_m=depth_m,
+            distance_source="board_pose",
         )
     return projected
+
+
+def prefer_observed_depth(
+    projected: Dict[str, BoardTarget], observed: Sequence[BoardTarget]
+) -> Dict[str, BoardTarget]:
+    """Use same-frame stereo depth for uniquely matched visible hole masks."""
+    references = list(projected.items())
+    if not references:
+        return projected
+    pairs = []
+    for observation_index, target in enumerate(observed):
+        if (target.distance_source != "zed_depth" or target.distance_m is None
+                or not math.isfinite(target.distance_m) or target.distance_m <= 0):
+            continue
+        for hole_id, reference in references:
+            distance = math.hypot(target.u_px - reference.u_px, target.v_px - reference.v_px)
+            gate = min(40.0, max(8.0, reference.size_px * .6))
+            if (distance <= gate and reference.size_px > 0
+                    and .5 * reference.size_px <= target.size_px <= 1.5 * reference.size_px):
+                pairs.append((distance, observation_index, hole_id))
+    result = dict(projected)
+    used_observations, used_holes = set(), set()
+    for _, observation_index, hole_id in sorted(pairs):
+        if observation_index in used_observations or hole_id in used_holes:
+            continue
+        used_observations.add(observation_index)
+        used_holes.add(hole_id)
+        result[hole_id] = replace(result[hole_id],
+                                  distance_m=observed[observation_index].distance_m,
+                                  distance_source="zed_depth")
+    return result
 
 
 def update_plan_geometry(
@@ -394,6 +514,7 @@ def update_plan_geometry(
                 height_px=live.height_px,
                 diameter_px=live.diameter_px,
                 distance_m=live.distance_m,
+                distance_source=live.distance_source,
             )
         )
     plan.targets[:] = updated

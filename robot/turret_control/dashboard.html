@@ -463,8 +463,8 @@
         <div class="vision-strip">
           <div class="vision-stat"><span class="eyebrow">原始候選</span><b id="rawDetections">—</b></div>
           <div class="vision-stat"><span class="eyebrow">靶面內孔位</span><b id="boardDetections">—</b></div>
-          <div class="vision-stat"><span class="eyebrow">PnP 對應點</span><b id="posePoints">—</b></div>
-          <div class="vision-stat"><span class="eyebrow">重投影誤差</span><b id="poseError">—</b></div>
+          <div class="vision-stat"><span class="eyebrow">姿態對應點</span><b id="posePoints">—</b></div>
+          <div class="vision-stat"><span class="eyebrow">位置殘差</span><b id="poseError">—</b></div>
         </div>
       </article>
 
@@ -670,23 +670,25 @@
       text("sumFiredHoles", `${(plan.fired_holes || []).length} 個孔位`);
       text("sumRemaining", integer(plan.remaining_shots || 0));
       text("sumTotal", `共 ${plan.total_shots || 0} 球`);
-      text("sumPose", ({ ready: "穩定", settling: "收斂中", invalid: "無效", virtual: "虛擬" })[pose.state] || "—");
-      text("sumPoseMeta", pose.reprojection_error_px === null || pose.reprojection_error_px === undefined ? "等待 PnP" : `誤差 ${pose.reprojection_error_px.toFixed(2)} px`);
+      text("sumPose", pose.source === "partial" && pose.state === "ready" ? "單孔／少孔追蹤" : (({ ready: "穩定", settling: "收斂中", invalid: "無效", virtual: "虛擬" })[pose.state] || "—"));
+      text("sumPoseMeta", pose.reprojection_error_px === null || pose.reprojection_error_px === undefined ? "等待 PnP" : `${pose.source === "partial" ? "平移殘差" : "重投影誤差"} ${pose.reprojection_error_px.toFixed(2)} px`);
       text("sumGate", firing.allowed ? "就緒" : "鎖定");
       text("sumGateMeta", firing.allowed ? "可接受操作確認" : "安全條件未成立");
       $("sumGate").style.color = firing.allowed ? "var(--green)" : "var(--amber)";
 
-      text("visionMeta", `YOLO ${vision.raw_detections ?? "—"} / 靶面 ${vision.board_detections ?? "—"}`);
+      const planeMeta = vision.depth_plane_inliers == null ? "平面未採用" : `平面 ${vision.depth_plane_inliers}/${vision.depth_plane_samples} 點 / 誤差 ${fmt(vision.depth_plane_median_error_m, 3, " m")}`;
+      text("visionMeta", `YOLO ${vision.raw_detections ?? "—"} / 靶面 ${vision.board_detections ?? "—"} / ${planeMeta}`);
       text("rawDetections", integer(vision.raw_detections));
       text("boardDetections", integer(vision.board_detections));
       text("posePoints", integer(pose.correspondences));
       text("poseError", fmt(pose.reprojection_error_px, 2, " px"));
       text("videoTarget", `TARGET ${target.hole_id || "—"}`);
-      text("videoPose", `POSE ${(pose.state || "—").toUpperCase()}`);
+      text("videoPose", `POSE ${(pose.source || "—").toUpperCase()} ${(pose.state || "—").toUpperCase()}`);
 
       text("targetId", target.hole_id || "—");
       text("targetDistance", fmt(target.distance_m, 2));
-      text("targetDetail", `像素 ${fmt(target.pixel_u, 1)}, ${fmt(target.pixel_v, 1)} / 信心度 ${fmt(target.confidence, 2)} / 孔徑 ${fmt(target.diameter_cm, 0, " cm")}`);
+      const depthSource = ({ zed_plane: "ZED 靶面平面", zed_depth: "ZED 單孔深度", board_pose: "靶板姿態估算" })[target.distance_source] || "未標示";
+      text("targetDetail", `距離來源 ${depthSource} / 像素 ${fmt(target.pixel_u, 1)}, ${fmt(target.pixel_v, 1)} / 信心度 ${fmt(target.confidence, 2)} / 孔徑 ${fmt(target.diameter_cm, 0, " cm")}`);
       text("modeMeta", `${score.enabled ? "SCORE" : "NORMAL"} / ${phaseName(system.match_phase)}`);
 
       const safety = $("safetyMessage");

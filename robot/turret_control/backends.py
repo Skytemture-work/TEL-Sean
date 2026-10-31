@@ -57,6 +57,7 @@ class MotorState:
     torque_nm: float
     # DAMIAO feedback ERR nibble: 0=disabled, 1=enabled, 8..E=fault.
     err: Optional[int] = None
+    feedback_at: Optional[float] = None
 
 
 class MotorBackend(Protocol):
@@ -225,6 +226,9 @@ class DamiaoSerialBackend:
             for motor_id, bounds in position_limits.items()
         }
         self._recorded_position_limits = dict(self._position_limits)
+        if workspace is None:
+            workspace = load_workspace_limit()
+        self._workspace = workspace
         if 0x03 in self._position_limits:
             if yaw_calibration is None:
                 yaw_calibration = load_yaw_calibration(Path(__file__).with_name("startup_pose.json"))
@@ -237,9 +241,6 @@ class DamiaoSerialBackend:
             if bounds[0] >= bounds[1] or not all(math.isfinite(value) for value in bounds):
                 raise ValueError(f"invalid motor position limits for 0x{motor_id:02X}")
         self._last_limit_notice: Dict[int, Tuple[float, float]] = {}
-        if workspace is None:
-            workspace = load_workspace_limit()
-        self._workspace = workspace
         if self._workspace is not None:
             required_ids = {
                 self._workspace.yaw_motor_id,
@@ -375,8 +376,11 @@ class DamiaoSerialBackend:
         """Update the calibrated pitch travel range while disabled."""
         if getattr(self, "_enabled", False):
             raise RuntimeError("pitch calibration cannot change while motors are enabled")
+        workspace = getattr(self, "_workspace", None)
+        corridor = workspace.home_corridor if workspace is not None else None
         self._position_limits[0x01] = constrain_pitch_travel_limit(
-            self._recorded_position_limits[0x01], calibration
+            self._recorded_position_limits[0x01], calibration,
+            home_motor_rad=corridor.home_pitch_rad if corridor is not None else None,
         )
         self._pitch_calibration = calibration
 
@@ -411,7 +415,7 @@ class DamiaoSerialBackend:
             lower, upper = self._position_limits[0x01]
             if not lower <= startup_positions[0x01] <= upper:
                 raise RuntimeError(
-                    "current pitch is outside the recorded or 0–45° travel limit; "
+                    "current pitch is outside the recorded level-to-home travel limit; "
                     "move it by hand into the allowed range before enabling"
                 )
 
@@ -746,6 +750,7 @@ class DamiaoSerialBackend:
             velocity_rad_s=motor.getVelocity(),
             torque_nm=motor.getTorque(),
             err=motor.getError(),
+            feedback_at=getattr(motor, "last_feedback_at", None),
         )
 
     # ---------------------------------------------------------------- close

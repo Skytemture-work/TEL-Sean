@@ -1,4 +1,5 @@
 import unittest
+from dataclasses import replace
 
 import cv2
 import numpy as np
@@ -154,6 +155,47 @@ class BoardPoseTests(unittest.TestCase):
         result = tracker.update([], self.template, quad, now=0.0)
 
         self.assertIsNone(result)
+
+    def test_single_visible_hole_bridges_occlusion_then_expires(self):
+        plan = self._observed_plan()
+        tracker = BoardPoseTracker(self.config)
+        for index in range(5):
+            stable = tracker.update(plan.targets, plan, now=index * .05)
+        self.assertTrue(stable.stable)
+        one = [replace(plan.targets[0], u_px=plan.targets[0].u_px + 0.2)]
+        self.assertIsNone(tracker.update(one, plan, now=.25))
+        partial = tracker.update_partial(one, plan, now=.25)
+        self.assertIsNotNone(partial)
+        self.assertEqual(partial.source, "partial")
+        self.assertEqual(partial.correspondence_count, 1)
+        live = project_targets_from_pose(plan, partial, self.config)
+        self.assertAlmostEqual(live[one[0].hole_id].u_px, one[0].u_px, places=2)
+        # Frequent partial frames must never extend the original PnP deadline.
+        for timestamp in (.4, .55, .7, .85, 1.0, 1.15):
+            self.assertIsNotNone(tracker.update_partial(one, plan, now=timestamp))
+        self.assertIsNone(tracker.update_partial(one, plan, now=1.21))
+
+    def test_partial_requires_stable_recent_reference_and_matching_observation(self):
+        plan = self._observed_plan()
+        tracker = BoardPoseTracker(self.config)
+        self.assertIsNone(tracker.update_partial(plan.targets[:1], plan, now=0.0))
+        for index in range(5):
+            tracker.update(plan.targets, plan, now=index * .05)
+        self.assertIsNone(tracker.update_partial([], plan, now=.25))
+        wrong_size = replace(plan.targets[0], width_px=1, height_px=1, diameter_px=1)
+        self.assertIsNone(tracker.update_partial([wrong_size], plan, now=.25))
+        wrong_position = replace(plan.targets[0], u_px=plan.targets[0].u_px + 1000)
+        self.assertIsNone(tracker.update_partial([wrong_position], plan, now=.25))
+        self.assertIsNone(tracker.update_partial(plan.targets[:1], plan, now=.5))
+
+    def test_fast_partial_motion_invalidates_reference(self):
+        plan = self._observed_plan()
+        tracker = BoardPoseTracker(self.config)
+        for index in range(5):
+            tracker.update(plan.targets, plan, now=index * .05)
+        moved = replace(plan.targets[0], u_px=plan.targets[0].u_px + 10)
+        self.assertIsNone(tracker.update_partial([moved], plan, now=.25))
+        self.assertIsNone(tracker.update_partial(plan.targets[:1], plan, now=.3))
 
     def test_geometry_update_preserves_shot_index_and_duplicate_targets(self):
         original = self._observed_plan()

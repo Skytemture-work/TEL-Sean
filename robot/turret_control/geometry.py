@@ -199,9 +199,20 @@ def target_to_axis_aim(
     if pitch_axis_distance <= 0:
         raise ValueError("target coincides with the vertical axis")
 
-    pitch_rad = math.atan2(
-        target_from_pitch.y,
-        math.hypot(target_from_pitch.x, target_from_pitch.z),
+    # At zero elevation the launch ray begins at (exit_y, exit_z) in
+    # the pitch frame and points along +z. Rotating that ray around the
+    # pitch axis means its perpendicular distance to the axis is exit_y.
+    # Solve for the forward ray, not merely the axis-to-target bearing.
+    target_radius = math.hypot(target_from_pitch.y, target_from_pitch.z)
+    exit_y = config.pitch_exit_offset_y_m
+    exit_z = config.pitch_exit_offset_z_m
+    if target_radius <= abs(exit_y):
+        raise ValueError("target cannot be reached by the rotating exit ray")
+    along_ray = math.sqrt(max(0.0, target_radius * target_radius - exit_y * exit_y))
+    if along_ray < exit_z:
+        raise ValueError("target is behind the launch exit")
+    pitch_rad = math.atan2(target_from_pitch.y, target_from_pitch.z) - math.asin(
+        exit_y / target_radius
     )
     return AxisAim(
         yaw_rad=yaw_rad,

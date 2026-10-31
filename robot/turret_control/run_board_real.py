@@ -16,7 +16,6 @@ from typing import Any, Callable, Dict, Optional, Sequence
 
 import cv2
 
-from .backends import DamiaoSerialBackend
 from .board import (
     BoardTarget,
     build_plan,
@@ -27,12 +26,15 @@ from .board import (
     EngagementPlan,
 )
 from .board_surface import detect_dark_board_surface, filter_targets_to_surface
+from .board_depth_plane import apply_board_depth_plane, fit_board_depth_plane
 from .board_pose import (
     BoardPoseTracker,
+    prefer_observed_depth,
     project_targets_from_pose,
     update_plan_geometry,
 )
 from .config import TurretConfig
+from .competition_geometry import with_competition_geometry
 from .controller import TurretController
 from .dashboard import (
     DashboardState,
@@ -40,9 +42,9 @@ from .dashboard import (
     start_dashboard_server,
 )
 from .detection import boxes_to_board_targets
-from .engagement import BoardEngagement
+from .engagement import BoardEngagement, PartialPoseShotGate
 from .fixed_board import calibrate_layout, load_layout
-from .limits import load_motor_limits
+from .shared_motor_backend import SharedMotorBackend
 from .run_yolo_demo import DEFAULT_MODEL, _draw_board_plan, _inference_frame
 from .scoring_light import ScoreRoundController
 from .scoring_strategy import (
@@ -50,6 +52,8 @@ from .scoring_strategy import (
     append_reallocated_grid_shots,
     build_max_score_strategy,
 )
+from .zed_calibration import load_zed2_uvc_calibration
+from .zed_camera import ZedDepthCamera
 
 FireCallback = Callable[[BoardTarget], bool]
 TelemetryCallback = Callable[[Dict[str, Any]], None]
@@ -73,13 +77,19 @@ def main(
     this control thread and therefore must return quickly.
     """
     parser = argparse.ArgumentParser(description="Real camera + real motors, 12-hole board aiming")
-    parser.add_argument("--camera", type=int, default=0)
+    parser.add_argument("--camera", type=int, default=0, help="OpenCV / UVC 相機編號")
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
     parser.add_argument("--device", default="0")
     parser.add_argument("--conf", type=float, default=0.40)
     parser.add_argument("--imgsz", type=int, default=640)
     parser.add_argument("--port", default="/dev/ttyACM0")
-    parser.add_argument("--zed-uvc", action="store_true")
+    camera_mode = parser.add_mutually_exclusive_group()
+    camera_mode.add_argument("--zed-uvc", action="store_true", help="使用 ZED UVC 原始影像，不提供立體深度")
+    camera_mode.add_argument("--opencv-camera", action="store_true", help="使用一般 OpenCV 相機，不提供立體深度")
+    parser.add_argument(
+        "--zed-calibration", type=Path,
+        help="ZED 2 原廠 SN*.conf 標定檔（配合 --zed-uvc 的 HD720 未校正左眼影像）",
+    )
     parser.add_argument("--cooldown", type=float, default=1.0)
     parser.add_argument(
         "--target-timeout",
@@ -111,8 +121,9 @@ def main(
     )
     parser.add_argument(
         "--score-mode",
-        action="store_true",
-        help="2026 計分策略：按 G 開始，鎖定亮燈孔並建立最高分射擊計畫",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="競賽計分模式（預設啟用）：按 G 鎖定亮燈孔並建立射擊計畫；--no-score-mode 切換一般模式",
     )
     parser.add_argument(
         "--match-phase",
@@ -125,13 +136,29 @@ def main(
         parser.error("--cooldown 不可小於 0")
     if args.target_timeout < 0:
         parser.error("--target-timeout 不可小於 0")
+    if args.zed_calibration is not None and not args.zed_uvc:
+        parser.error("--zed-calibration 必須配合 --zed-uvc 使用")
+
+    config = with_competition_geometry(TurretConfig()) if not args.virtual_board else TurretConfig()
+    if args.zed_calibration is not None:
+        try:
+            config = load_zed2_uvc_calibration(config, args.zed_calibration)
+        except ValueError as exc:
+            parser.error(str(exc))
+    elif args.zed_uvc and not args.virtual_board:
+        print(
+            "警告：尚未載入此台 ZED 2 的原廠左眼標定，"
+            "目前焦距、主點與畸變是暫值；請指定 --zed-calibration SNxxxx.conf。",
+            flush=True,
+        )
 
     try:
         from ultralytics import YOLO
     except ImportError as exc:
         raise SystemExit("請先安裝 ultralytics：python3 -m pip install ultralytics") from exc
 
-    config = TurretConfig()
+    if args.zed_calibration is not None:
+        print(f"已載入 ZED 2 HD720 左眼原廠標定：{args.zed_calibration}", flush=True)
     if args.virtual_board:
         config = replace(
             config,
@@ -147,15 +174,6 @@ def main(
             "程式會鎖定紅燈孔 60 秒。",
             flush=True,
         )
-    if not args.virtual_board and (
-        config.camera_principal_x_px is None
-        or config.camera_principal_y_px is None
-    ):
-        print(
-            "提醒：相機主點仍使用畫面中心暫值；正式自動瞄準前請填入相機標定的 "
-            "fx/fy/cx/cy 與畸變參數。",
-            flush=True,
-        )
     if not args.virtual_board and config.use_axis_geometry:
         if config.yaw_axis_offset == (0.0, 0.0, 0.0) and (
             config.pitch_axis_offset_x_m,
@@ -168,22 +186,29 @@ def main(
                 flush=True,
             )
     model = YOLO(str(args.model))
-    camera = cv2.VideoCapture(args.camera)
-    if not camera.isOpened():
-        raise SystemExit(f"無法開啟 /dev/video{args.camera}")
-    requested_width = config.image_width_px * (2 if args.zed_uvc else 1)
-    camera.set(cv2.CAP_PROP_FRAME_WIDTH, requested_width)
-    camera.set(cv2.CAP_PROP_FRAME_HEIGHT, config.image_height_px)
+    use_zed_sdk = not (args.zed_uvc or args.opencv_camera)
+    if use_zed_sdk:
+        try:
+            camera = ZedDepthCamera(config)
+        except (RuntimeError, ValueError) as exc:
+            raise SystemExit(str(exc)) from exc
+        config = camera.config
+        print("ZED SDK 深度模式：使用校正後左眼影像及同步雙眼深度。", flush=True)
+    else:
+        camera = cv2.VideoCapture(args.camera)
+        if not camera.isOpened():
+            raise SystemExit(f"無法開啟 /dev/video{args.camera}")
+        requested_width = config.image_width_px * (2 if args.zed_uvc else 1)
+        camera.set(cv2.CAP_PROP_FRAME_WIDTH, requested_width)
+        camera.set(cv2.CAP_PROP_FRAME_HEIGHT, config.image_height_px)
+        if not args.virtual_board and config.camera_principal_x_px is None:
+            print("提醒：相機內參仍為暫值，正式瞄準前請完成標定。", flush=True)
 
-    motors = DamiaoSerialBackend(
-        motor_ids=[config.yaw_motor_id, config.pitch_motor_id],
-        port=args.port,
-        mode="mit",
-        kp=5.0,
-        kd=1.0,
-        enable_on_start=False,
-        position_limits=load_motor_limits(),
-    )
+    try:
+        motors = SharedMotorBackend(args.port)
+    except Exception:
+        camera.release()
+        raise
     turret = TurretController(config, motors)
     driver = BoardEngagement(
         config,
@@ -239,6 +264,7 @@ def main(
         )
     last_report = 0.0
     last_target_id = None
+    partial_shot_gate = PartialPoseShotGate()
     if args.layout:
         board_plan = load_layout(args.layout)
         if not args.score_mode:
@@ -254,7 +280,11 @@ def main(
     try:
         motors.enable()
         while True:
-            ok, frame = camera.read()
+            if use_zed_sdk:
+                ok, frame, depth_data = camera.read()
+            else:
+                ok, frame = camera.read()
+                depth_data = None
             if not ok:
                 break
             vision_frame = _inference_frame(frame, args.zed_uvc)
@@ -269,7 +299,7 @@ def main(
                 device=args.device,
                 verbose=False,
             )[0]
-            raw_detected = boxes_to_board_targets(result, args.conf)
+            raw_detected = boxes_to_board_targets(result, args.conf, depth_data)
             board_surface = detect_dark_board_surface(
                 vision_frame,
                 value_threshold=config.board_dark_value_threshold,
@@ -389,6 +419,7 @@ def main(
                         print(f"已保存固定靶板版面：{args.calibrate_layout}", flush=True)
 
             pose = None
+            depth_plane = None
             pose_ready = args.virtual_board and frame_size_ok
             pose_blocked_reason = None
             if not frame_size_ok:
@@ -405,12 +436,29 @@ def main(
                     board_surface.quad if board_surface is not None else None,
                     now=now,
                 )
+                if pose is None and args.score_mode:
+                    # Bridge a short occlusion using matched visible holes.
+                    pose = pose_tracker.update_partial(
+                        detected if board_surface is not None else raw_detected,
+                        pose_reference,
+                        now=now,
+                    )
                 if pose is not None and pose_reference is not None:
                     live_targets = project_targets_from_pose(
                         pose_reference,
                         pose,
                         config,
                     )
+                    if depth_data is not None:
+                        if board_surface is not None:
+                            depth_plane = fit_board_depth_plane(
+                                depth_data, board_surface.mask, pose, live_targets,
+                                detected, config,
+                            )
+                            if depth_plane is not None:
+                                live_targets = apply_board_depth_plane(live_targets, depth_plane, config)
+                        if depth_plane is None:
+                            live_targets = prefer_observed_depth(live_targets, detected)
                     update_plan_geometry(board_plan, live_targets)
                     if plan is not board_plan:
                         update_plan_geometry(plan, live_targets)
@@ -421,6 +469,9 @@ def main(
                 )
                 if not pose_ready:
                     pose_blocked_reason = "board pose moving, stale or unstable"
+                elif not partial_shot_gate.allows(pose):
+                    pose_ready = False
+                    pose_blocked_reason = "partial pose shot used; waiting for stable PnP"
 
             # An operator confirmation belongs to the exact stable pose in
             # which it was given.  Never keep it latched across robot motion or
@@ -533,6 +584,7 @@ def main(
                     expiry_processed_round_id = score_round.round_id
 
             status = driver.update()
+            partial_shot_gate.record(pose, status.fired)
             yaw_motor_state = motors.get_state(config.yaw_motor_id)
             pitch_motor_state = motors.get_state(config.pitch_motor_id)
             if (
@@ -643,7 +695,7 @@ def main(
                 pose_color = (0, 165, 255)
             else:
                 pose_text = (
-                    f"POSE {'READY' if pose_ready else 'SETTLING'} "
+                    f"POSE {pose.source.upper()} {'READY' if pose_ready else 'SETTLING'} "
                     f"n={pose.correspondence_count} "
                     f"err={pose.reprojection_error_px:.1f}px "
                     f"v={pose.translation_speed_m_s:.2f}m/s "
@@ -668,6 +720,7 @@ def main(
                     config=config,
                     pose=pose,
                     pose_ready=pose_ready,
+                    depth_plane=depth_plane,
                     virtual_board=args.virtual_board,
                     frame_size_ok=frame_size_ok,
                     raw_detection_count=len(raw_detected),

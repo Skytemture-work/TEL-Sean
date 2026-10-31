@@ -243,6 +243,7 @@ def build_dashboard_snapshot(
     operator_fire_pending: bool,
     current_yaw_motor_rad: Optional[float] = None,
     current_pitch_motor_rad: Optional[float] = None,
+    depth_plane: Any = None,
 ) -> Dict[str, Any]:
     """Convert live controller objects into browser-safe telemetry."""
 
@@ -307,9 +308,15 @@ def build_dashboard_snapshot(
             "raw_detections": int(raw_detection_count),
             "board_detections": int(board_detection_count),
             "board_surface_found": bool(board_surface_found),
+            "depth_plane_inliers": getattr(depth_plane, "inlier_count", None),
+            "depth_plane_samples": getattr(depth_plane, "sample_count", None),
+            "depth_plane_median_error_m": _json_number(
+                getattr(depth_plane, "median_error_m", None), 4
+            ),
         },
         "pose": {
             "state": pose_state,
+            "source": getattr(pose, "source", None),
             "ready": bool(pose_ready),
             "correspondences": (
                 int(getattr(pose, "correspondence_count", 0))
@@ -342,6 +349,7 @@ def build_dashboard_snapshot(
         "target": {
             "hole_id": getattr(target, "hole_id", None),
             "distance_m": _json_number(getattr(target, "distance_m", None), 3),
+            "distance_source": getattr(target, "distance_source", None),
             "yaw_axis_distance_m": _json_number(
                 getattr(command, "yaw_axis_distance_m", None), 3
             ),

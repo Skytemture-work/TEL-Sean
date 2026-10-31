@@ -1,6 +1,9 @@
 import math
 import unittest
+from dataclasses import replace
 
+from turret_control.aiming import AimingController, TargetPixel
+from turret_control.competition_geometry import with_competition_geometry
 from turret_control.config import TurretConfig
 from turret_control.geometry import (
     aim_angles_from_target,
@@ -10,6 +13,44 @@ from turret_control.geometry import (
 
 
 class TurretGeometryTests(unittest.TestCase):
+    def test_competition_geometry_recovers_known_forward_projected_rays(self):
+        config = with_competition_geometry(TurretConfig(
+            yaw_zero_rad=0.0, yaw_sign=1, pitch_zero_rad=0.0, pitch_sign=1,
+            yaw_min_rad=-1.0, yaw_max_rad=1.0, pitch_min_rad=-1.0, pitch_max_rad=1.0,
+        ))
+        controller = AimingController(config)
+        self.assertFalse(config.compensate_gravity)
+        # Independent forward model: CAD home dimensions first rotate to the
+        # desired pitch; the whole assembly then rotates about the yaw axis.
+        for yaw_deg, pitch_deg, distance in ((0, 0, 2), (15, 20, 5), (-22, 30, 8)):
+            with self.subTest(yaw=yaw_deg, pitch=pitch_deg, distance=distance):
+                yaw, pitch = math.radians(yaw_deg), math.radians(pitch_deg)
+                offset_y = (0.0965 - 0.150) / math.sqrt(2.0)
+                offset_z = (0.0965 + 0.150) / math.sqrt(2.0)
+                level_y = 0.0721 + math.cos(pitch) * offset_y + math.sin(pitch) * (offset_z + distance)
+                level_z = -math.sin(pitch) * offset_y + math.cos(pitch) * (offset_z + distance)
+                x = 0.060 + math.sin(yaw) * level_z
+                y = -0.001998 + level_y
+                z = -0.101662 + math.cos(yaw) * level_z
+                c, s = math.cos(math.radians(20)), math.sin(math.radians(20))
+                camera_y, camera_z = c * y - s * z, s * y + c * z
+                u = config.camera_center_x_px + config.focal_length_x_px * x / camera_z
+                v = config.camera_center_y_px - config.focal_length_y_px * camera_y / camera_z
+                command = controller.update(TargetPixel(u, v, distance_m=camera_z))
+                self.assertTrue(command.target_reachable, command.blocked_reason)
+                self.assertAlmostEqual(command.target_yaw_rad, yaw, places=7)
+                self.assertAlmostEqual(command.target_pitch_rad, pitch, places=7)
+
+    def test_rotating_exit_rejects_a_target_behind_the_exit(self):
+        config = replace(TurretConfig(), pitch_exit_offset_z_m=1.0, compensate_gravity=False)
+        with self.assertRaisesRegex(ValueError, "behind the launch exit"):
+            target_to_axis_aim(config.camera_center_x_px, config.camera_center_y_px, 0.5, config)
+
+    def test_gravity_and_rotating_exit_cannot_be_combined_silently(self):
+        config = replace(with_competition_geometry(TurretConfig()), compensate_gravity=True)
+        with self.assertRaisesRegex(ValueError, "gravity with a rotating exit offset"):
+            config.validate()
+
     def test_center_target_has_zero_angles_when_axes_are_coincident(self):
         config = TurretConfig(
             image_width_px=1280,

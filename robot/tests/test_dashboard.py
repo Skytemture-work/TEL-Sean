@@ -107,9 +107,13 @@ class DashboardTelemetryTests(unittest.TestCase):
             ),
             bonus_hole_id="H11",
             operator_fire_pending=False,
+            depth_plane=SimpleNamespace(inlier_count=200, sample_count=250, median_error_m=.013),
         )
 
         self.assertEqual(snapshot["target"]["hole_id"], "H05")
+        self.assertEqual(snapshot["vision"]["depth_plane_inliers"], 200)
+        self.assertEqual(snapshot["vision"]["depth_plane_samples"], 250)
+        self.assertEqual(snapshot["vision"]["depth_plane_median_error_m"], .013)
         self.assertEqual(snapshot["plan"]["fired_shots"], 1)
         self.assertEqual(snapshot["plan"]["skipped_shots"], 1)
         self.assertEqual(snapshot["plan"]["pending_shots"], 2)

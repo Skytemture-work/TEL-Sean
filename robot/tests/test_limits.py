@@ -16,19 +16,41 @@ from turret_control.limits import (
     clamp_motor_position,
     constrain_yaw_design_limit,
     constrain_pitch_activity_limit,
+    constrain_pitch_travel_limit,
     load_axis_limits,
     load_motor_limits,
     load_workspace_limit,
     save_manual_limits,
     save_workspace_limits,
     workspace_contains,
+    workspace_segment_is_safe,
 )
-from turret_control.run_limit_calibration import _save_recovery_trace
+from turret_control.run_limit_calibration import _hard_limits_for_capture, _save_recovery_trace
 from turret_control.pitch import PitchCalibration, load_pitch_calibration
 from turret_control.run_vertical_panel import DEFAULT_STARTUP_POSE
 
 
 class MotorLimitTests(unittest.TestCase):
+    def test_travel_uses_recorded_home_even_if_inferred_angle_is_not_45(self):
+        calibration = PitchCalibration(.2, 1., -1)
+        home = calibration.motor_from_muzzle(math.radians(46.))
+        lower, upper = constrain_pitch_travel_limit((-1., .2), calibration, home)
+        self.assertAlmostEqual(lower, home)
+        self.assertAlmostEqual(upper, .2)
+        with self.assertRaisesRegex(ValueError, "outside the retained"):
+            constrain_pitch_travel_limit((-.5, .2), calibration, home)
+
+    def test_recalibrating_home_does_not_move_measured_level(self):
+        workspace = load_workspace_limit()
+        calibration = load_pitch_calibration(DEFAULT_STARTUP_POSE)
+        hard, proposed, _ = _hard_limits_for_capture(
+            Path(__file__).resolve().parents[1] / "turret_control" / "mechanism_limits.json",
+            DEFAULT_STARTUP_POSE, workspace.home_corridor.yaw_center_rad,
+            workspace.home_corridor.home_pitch_rad, 45.,
+        )
+        self.assertAlmostEqual(proposed.motor_zero_rad, calibration.motor_zero_rad)
+        self.assertAlmostEqual(hard[1][0], workspace.home_corridor.home_pitch_rad)
+
     def test_yaw_design_limit_uses_calibration_and_preserves_stricter_limits(self):
         for sign in (-1, 1):
             calibration = PitchCalibration(0.5, 2.0, sign)
@@ -59,7 +81,7 @@ class MotorLimitTests(unittest.TestCase):
         backend._position_limits = {0x01: (0.0, 0.6)}
         backend.refresh = lambda: None
         backend.get_state = lambda motor_id: MotorState(motor_id, 0.61, 0.0, 0.0, 0)
-        with self.assertRaisesRegex(RuntimeError, "pitch.*0–45° travel limit"):
+        with self.assertRaisesRegex(RuntimeError, "pitch.*level-to-home travel limit"):
             backend.enable()
 
     def test_home_hold_exit_and_activity_pitch_cap_use_feedback(self):
@@ -68,7 +90,7 @@ class MotorLimitTests(unittest.TestCase):
         pitch = load_pitch_calibration(DEFAULT_STARTUP_POSE)
         yaw = load_yaw_calibration(DEFAULT_STARTUP_POSE)
         center = yaw.motor_from_muzzle(0.0)
-        home = pitch.motor_from_muzzle(math.radians(45.0))
+        home = load_workspace_limit().home_corridor.home_pitch_rad
         feedback = {0x03: center, 0x01: home}
         backend = DamiaoSerialBackend.__new__(DamiaoSerialBackend)
         backend._motors = {0x03: object(), 0x01: object()}
@@ -209,6 +231,20 @@ class MotorLimitTests(unittest.TestCase):
         self.assertTrue(workspace_contains(workspace, yaw, pitch))
         self.assertLessEqual(yaw, 1.0)
         self.assertLessEqual(pitch, 1.0)
+
+    def test_vectorized_segment_check_matches_scalar_workspace_rules(self):
+        workspace = load_workspace_limit()
+        rng = np.random.default_rng(17)
+        for _ in range(200):
+            start = tuple(rng.uniform((-.1, -.56), (1.12, .23)))
+            end = tuple(rng.uniform((-.1, -.56), (1.12, .23)))
+            step = .015
+            count = max(1, math.ceil(max(abs(end[0] - start[0]), abs(end[1] - start[1])) / step))
+            scalar = all(workspace_contains(
+                workspace, start[0] + (end[0] - start[0]) * index / count,
+                start[1] + (end[1] - start[1]) * index / count,
+            ) for index in range(count + 1))
+            self.assertEqual(workspace_segment_is_safe(workspace, start, end, step), scalar)
 
     def test_symmetric_workspace_uses_conservative_mirrored_intersection(self):
         workspace = WorkspaceLimit(

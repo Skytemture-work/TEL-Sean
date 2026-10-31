@@ -22,6 +22,25 @@ DEFAULT_SHOT_COOLDOWN_S = 1.0
 DEFAULT_TARGET_TIMEOUT_S = 6.0
 
 
+class PartialPoseShotGate:
+    """Allow one shot per partial-observation episode until stable PnP returns."""
+
+    def __init__(self):
+        self._used = False
+
+    def allows(self, pose) -> bool:
+        if pose is None or not pose.stable:
+            return False
+        if pose.source == "pnp":
+            self._used = False
+            return True
+        return pose.source == "partial" and not self._used
+
+    def record(self, pose, fired: bool) -> None:
+        if fired and pose is not None and pose.source == "partial":
+            self._used = True
+
+
 @dataclass
 class EngagementStatus:
     command: AimCommand

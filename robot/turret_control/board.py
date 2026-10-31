@@ -61,6 +61,7 @@ class BoardTarget:
     hole_id: Optional[str] = None
     # Row index from bottom to top within a column: 0..3.
     row: Optional[int] = None
+    distance_source: Optional[str] = None
 
     @property
     def size_px(self) -> float:

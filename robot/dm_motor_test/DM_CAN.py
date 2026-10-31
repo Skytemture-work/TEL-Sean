@@ -1,4 +1,4 @@
-from time import sleep
+from time import monotonic, sleep
 import numpy as np
 from enum import IntEnum
 from struct import unpack
@@ -21,6 +21,7 @@ class Motor:
         # Feedback D[1] is ID | (ERR << 4).  Keep ERR instead of dropping it
         # so callers can distinguish the commanded state from the real state.
         self.state_err = None
+        self.last_feedback_at = None
         self.SlaveID = SlaveID
         self.MasterID = MasterID
         self.MotorType = MotorType
@@ -32,6 +33,7 @@ class Motor:
         self.state_q = q
         self.state_dq = dq
         self.state_tau = tau
+        self.last_feedback_at = monotonic()
         if err is not None:
             self.state_err = int(err)
 

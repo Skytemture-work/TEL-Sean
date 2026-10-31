@@ -10,7 +10,7 @@
 #   VESC_LEFT_PORT / VESC_RIGHT_PORT：射擊雙馬達轉速控制（UART）
 #
 # 注意：
-# 1. ESP32 的 yaw/pitch (0~100) 由 Xavier 轉成 DM 目標角：Yaw -34.5~+34.5°、Pitch 0~45°。
+# 1. ESP32 的 yaw/pitch (0~100) 對應水平 -34.5~+34.5°、垂直 0° 至已記錄 home 的估算仰角。
 # 2. FIRE 每次由 0 變 1，觸發一個射擊循環。
 # 3. 每個射擊循環包含 1700 -> 3000 pulses -> 反向回零 -> 正向回零。
 # 4. 每格累積 3 次循環後，才允許彈藥倉轉動一格。
@@ -18,6 +18,7 @@
 # 6. 請先確認 DM 與兩個 VESC 使用不同的序列埠，並卸除彈藥進行低速測試。
 
 import time
+import math
 import struct
 import threading
 from pathlib import Path
@@ -27,6 +28,7 @@ import serial
 # 使用專案已驗證的 DM 雙軸控制器（包含加減速、回授及水平安全聯鎖）。
 from turret_control.run_vertical_panel import MotorWorker
 from turret_control.pitch import load_pitch_calibration, load_yaw_calibration
+from turret_control.limits import load_workspace_limit
 
 import can
 from mks_servo_can import MksServo
@@ -457,6 +459,13 @@ class ManualController:
         print("[Manual] 初始化 DM 水平/垂直砲台，USB-CAN：{}".format(DM_PORT))
         pitch_calibration = load_pitch_calibration(DM_STARTUP_POSE)
         yaw_calibration = load_yaw_calibration(DM_STARTUP_POSE)
+        workspace = load_workspace_limit()
+        if workspace is None or workspace.home_corridor is None:
+            raise RuntimeError("尚未記錄垂直 home 馬達位置")
+        self._dm_home_pitch_deg = min(
+            DM_MAX_PITCH_DEG,
+            math.degrees(pitch_calibration.muzzle_from_motor(workspace.home_corridor.home_pitch_rad)),
+        )
         self.turret_worker = MotorWorker(
             port=DM_PORT,
             pitch_calibration=pitch_calibration,
@@ -479,12 +488,12 @@ class ManualController:
         self.turret_worker.start()
 
     @staticmethod
-    def _packet_axis_to_degrees(yaw_value, pitch_value):
-        """ESP32 yaw/pitch 0..100 -> 水平角 -34.5..+34.5°、砲口仰角 0..45°。"""
+    def _packet_axis_to_degrees(yaw_value, pitch_value, max_pitch_deg=DM_MAX_PITCH_DEG):
+        """ESP32 0..100 -> 水平角 -34.5..+34.5°、仰角 0..記錄的 home。"""
         yaw_value = max(0, min(100, int(yaw_value)))
         pitch_value = max(0, min(100, int(pitch_value)))
         yaw_deg = DM_MIN_YAW_DEG + (DM_MAX_YAW_DEG - DM_MIN_YAW_DEG) * yaw_value / 100.0
-        pitch_deg = DM_MIN_PITCH_DEG + (DM_MAX_PITCH_DEG - DM_MIN_PITCH_DEG) * pitch_value / 100.0
+        pitch_deg = DM_MIN_PITCH_DEG + (max_pitch_deg - DM_MIN_PITCH_DEG) * pitch_value / 100.0
         return yaw_deg, pitch_deg
 
     def _update_dm_turret(self, yaw_value, pitch_value):
@@ -499,7 +508,7 @@ class ManualController:
             self.turret_worker.request_enable()
             self._turret_enable_requested = True
 
-        yaw_deg, pitch_deg = self._packet_axis_to_degrees(yaw_value, pitch_value)
+        yaw_deg, pitch_deg = self._packet_axis_to_degrees(yaw_value, pitch_value, self._dm_home_pitch_deg)
         target = (round(yaw_deg, 2), round(pitch_deg, 2))
         if target != self._last_turret_command:
             self.turret_worker.request_aim(yaw_deg, pitch_deg)

@@ -64,10 +64,15 @@ def load_pitch_calibration(path: Path) -> PitchCalibration:
     motor_rad_per_muzzle_rad = float(vertical.get("motor_rad_per_muzzle_rad", 1.0))
     motor_sign = int(vertical.get("motor_sign", 1))
     motor_angle_at_reference = float(vertical["angle_rad"])
-    motor_zero_rad = (
-        motor_angle_at_reference
-        - motor_sign * motor_rad_per_muzzle_rad * math.radians(zero_elevation_deg)
-    )
+    if "level_reference_angle_rad" in vertical:
+        # An inclinometer-measured level point is the authoritative zero;
+        # the separate home position must never redefine that reference.
+        motor_zero_rad = float(vertical["level_reference_angle_rad"])
+    else:
+        motor_zero_rad = (
+            motor_angle_at_reference
+            - motor_sign * motor_rad_per_muzzle_rad * math.radians(zero_elevation_deg)
+        )
     return PitchCalibration(
         motor_zero_rad=motor_zero_rad,
         motor_rad_per_muzzle_rad=motor_rad_per_muzzle_rad,
@@ -95,13 +100,54 @@ def load_yaw_calibration(path: Path) -> PitchCalibration:
     )
 
 
+def _save_calibration_data(path: Path, data: dict) -> Path:
+    backup_path = path.with_suffix(path.suffix + ".bak")
+    temporary_path = path.with_suffix(path.suffix + ".tmp")
+    shutil.copy2(str(path), str(backup_path))
+    try:
+        with temporary_path.open("w", encoding="utf-8") as handle:
+            json.dump(data, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+        os.replace(str(temporary_path), str(path))
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
+    return backup_path
+
+
+def save_level_reference_calibration(path: Path, pitch_motor_rad: float) -> Path:
+    """Record an inclinometer-confirmed level position without moving home."""
+    if not math.isfinite(pitch_motor_rad):
+        raise ValueError("水平 0° 馬達位置必須是有限數字")
+    path = Path(path)
+    with path.open("r", encoding="utf-8") as handle:
+        data = json.load(handle)
+    vertical = data["vertical"]
+    calibration = PitchCalibration(
+        float(pitch_motor_rad), float(vertical.get("motor_rad_per_muzzle_rad", 1.0)),
+        int(vertical.get("motor_sign", -1)),
+    )
+    home_elevation = calibration.muzzle_from_motor(float(vertical["angle_rad"]))
+    if home_elevation <= 0:
+        raise ValueError("記錄的 home 必須高於水平 0°")
+    timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+    vertical.update({
+        "level_reference_angle_rad": float(pitch_motor_rad),
+        "level_reference_captured_at": timestamp,
+        "muzzle_elevation_deg_at_angle": math.degrees(home_elevation),
+    })
+    data["captured_at"] = timestamp
+    data["note"] = "Inclinometer-confirmed level zero; home motor position and pitch ratio were preserved."
+    return _save_calibration_data(path, data)
+
+
 def save_manual_origin_calibration(
     path: Path,
     yaw_motor_rad: float,
     pitch_motor_rad: float,
     pitch_reference_deg: float = 45.0,
 ) -> Path:
-    """Persist a manually aligned yaw=0 / pitch=45 reference pose.
+    """Record yaw zero and home without changing an existing pitch level zero.
 
     The motor's internal encoder zero is deliberately left untouched.  The
     previous JSON file is copied to ``.bak`` and the replacement is written
@@ -127,6 +173,12 @@ def save_manual_origin_calibration(
         }
     )
     vertical = data["vertical"]
+    if "level_reference_angle_rad" in vertical:
+        level = float(vertical["level_reference_angle_rad"])
+        ratio = float(vertical.get("motor_rad_per_muzzle_rad", 1.0))
+        pitch_reference_deg = math.degrees(
+            PitchCalibration(level, ratio, -1).muzzle_from_motor(float(pitch_motor_rad))
+        )
     vertical.update(
         {
             "angle_rad": float(pitch_motor_rad),
@@ -138,19 +190,8 @@ def save_manual_origin_calibration(
     data["captured_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
     data["source"] = "manual mechanism origin alignment with DAMIAO feedback"
     data["note"] = (
-        "Manual origin: horizontal turret 0 deg and muzzle elevation "
-        f"{pitch_reference_deg:.1f} deg. Motor internal encoder zeros were not changed."
+        "Manual home: horizontal turret 0 deg and inferred muzzle elevation "
+        f"{pitch_reference_deg:.2f} deg. Measured level reference and encoder zeros are preserved."
     )
 
-    backup_path = path.with_suffix(path.suffix + ".bak")
-    temporary_path = path.with_suffix(path.suffix + ".tmp")
-    shutil.copy2(str(path), str(backup_path))
-    try:
-        with temporary_path.open("w", encoding="utf-8") as handle:
-            json.dump(data, handle, ensure_ascii=False, indent=2)
-            handle.write("\n")
-        os.replace(str(temporary_path), str(path))
-    finally:
-        if temporary_path.exists():
-            temporary_path.unlink()
-    return backup_path
+    return _save_calibration_data(path, data)

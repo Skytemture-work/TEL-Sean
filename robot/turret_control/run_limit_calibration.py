@@ -119,7 +119,9 @@ def _hard_limits_for_capture(
 
     hard_limits = load_hard_motor_limits(limits_path)
     stored = load_pitch_calibration(startup_pose_path)
-    if proposed_origin_pitch is None:
+    startup_data = json.loads(startup_pose_path.read_text(encoding="utf-8"))
+    has_level_reference = "level_reference_angle_rad" in startup_data["vertical"]
+    if proposed_origin_pitch is None or has_level_reference:
         calibration = stored
     else:
         # save_manual_origin_calibration stores motor_sign=-1 while retaining
@@ -137,10 +139,19 @@ def _hard_limits_for_capture(
             motor_sign=motor_sign,
         )
 
+    previous_workspace = load_workspace_limit(limits_path)
+    recorded_home = (previous_workspace.home_corridor.home_pitch_rad
+                     if previous_workspace is not None and previous_workspace.home_corridor is not None
+                     else None)
+    home_motor = proposed_origin_pitch if proposed_origin_pitch is not None else recorded_home
+    if home_motor is None:
+        home_motor = calibration.motor_from_muzzle(math.radians(MAX_MUZZLE_ELEVATION_DEG))
+    if calibration.muzzle_from_motor(float(home_motor)) <= 0:
+        raise ValueError("home 必須高於水平 0°")
     physical_pitch_bounds = sorted(
         (
             calibration.motor_from_muzzle(math.radians(MIN_MUZZLE_ELEVATION_DEG)),
-            calibration.motor_from_muzzle(math.radians(MAX_MUZZLE_ELEVATION_DEG)),
+            float(home_motor),
         )
     )
     if PITCH_MOTOR_ID in hard_limits:
@@ -150,7 +161,7 @@ def _hard_limits_for_capture(
             min(physical_pitch_bounds[1], previous[1]),
         ]
     if physical_pitch_bounds[0] >= physical_pitch_bounds[1]:
-        raise ValueError("previous pitch limits do not overlap physical elevation 0..45 degrees")
+        raise ValueError("previous pitch limits do not overlap level-to-home travel")
     hard_limits[PITCH_MOTOR_ID] = (
         physical_pitch_bounds[0],
         physical_pitch_bounds[1],
@@ -352,7 +363,7 @@ def main() -> None:
         "--home-pitch-deg",
         type=float,
         default=45.0,
-        help="手動 home 參考點的砲口仰角，預設 45 度",
+        help="僅供沒有水平基準的舊版校正檔使用；已有水平基準時由編碼器換算 home 仰角",
     )
     parser.add_argument(
         "--skip-origin",
@@ -454,7 +465,7 @@ def main() -> None:
             origin_pitch = _capture(
                 motors,
                 PITCH_MOTOR_ID,
-                f"請手動把垂直軸放到 home 仰角 {args.home_pitch_deg:.1f}°。",
+                "請手動把垂直軸放到機構 home 位置（不假設精確 45°）。",
             )
 
         hard_motor_limits, pitch_calibration, yaw_calibration = _hard_limits_for_capture(
@@ -464,6 +475,13 @@ def main() -> None:
             origin_pitch,
             args.home_pitch_deg,
         )
+        previous_workspace = load_workspace_limit(args.output)
+        home_motor_rad = (origin_pitch if origin_pitch is not None else
+                          previous_workspace.home_corridor.home_pitch_rad
+                          if previous_workspace is not None and previous_workspace.home_corridor is not None
+                          else None)
+        if home_motor_rad is None:
+            raise ValueError("未記錄 home 馬達位置；請先擷取 home")
         pitch_hard_min, pitch_hard_max = hard_motor_limits[PITCH_MOTOR_ID]
         physical_hard_bounds = sorted(
             math.degrees(pitch_calibration.muzzle_from_motor(value))
@@ -555,9 +573,7 @@ def main() -> None:
             "home_corridor_yaw_deg": 10.0 * yaw_calibration.motor_rad_per_muzzle_rad,
             "home_position": {
                 "yaw_rad": yaw_calibration.motor_from_muzzle(0.0),
-                "pitch_rad": pitch_calibration.motor_from_muzzle(
-                    math.radians(args.home_pitch_deg)
-                ),
+                "pitch_rad": home_motor_rad,
             },
         }
         while True:

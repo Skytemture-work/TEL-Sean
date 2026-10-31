@@ -21,8 +21,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple
 
-import tkinter as tk
-from tkinter import messagebox, ttk
+try:
+    import tkinter as tk
+    from tkinter import messagebox, ttk
+except ImportError:  # The motor worker also runs on headless robots.
+    tk = messagebox = ttk = None
 
 from .backends import DamiaoSerialBackend
 from .limits import (
@@ -30,13 +33,18 @@ from .limits import (
     PITCH_ACTIVITY_TRANSITION_DEG,
     PITCH_MAX_DEG,
     load_motor_limits,
+    load_workspace_limit,
+    constrain_pitch_travel_limit,
     max_activity_pitch_for_yaw_deg,
+    workspace_contains,
+    workspace_segment_is_safe,
 )
 from .pitch import (
     PitchCalibration,
     load_pitch_calibration,
     load_yaw_calibration,
     save_manual_origin_calibration,
+    save_level_reference_calibration,
 )
 from .trajectory import acceleration_limited_step
 
@@ -54,8 +62,20 @@ MAX_PITCH_FOR_YAW_DEG = 35.0
 YAW_RELEASE_MARGIN_DEG = 0.5
 YAW_CLEARANCE_PITCH_DEG = MAX_PITCH_FOR_YAW_DEG - YAW_RELEASE_MARGIN_DEG
 HOME_CORRIDOR_YAW_TOLERANCE_DEG = 10.0
-YAW_MOVE_EPSILON_DEG = 0.05
-SEQUENCE_ARRIVAL_TOLERANCE_DEG = 0.5
+YAW_MOVE_EPSILON_DEG = 0.000001
+SEQUENCE_ARRIVAL_TOLERANCE_DEG = 0.05
+# Leave room for the DAMIAO feedback velocity's finite encoder resolution.
+SEQUENCE_STOP_SPEED_RAD_S = math.radians(0.5)
+FEEDBACK_TIMEOUT_S = 0.25
+
+
+def _fresh_enabled_feedback(state, now: float) -> bool:
+    return (
+        state is not None and state.err == 1
+        and state.feedback_at is not None and math.isfinite(state.feedback_at)
+        and 0 <= now - state.feedback_at <= FEEDBACK_TIMEOUT_S
+        and math.isfinite(state.position_rad) and math.isfinite(state.velocity_rad_s)
+    )
 
 
 def load_startup_pitch(path: Path) -> float:
@@ -80,6 +100,7 @@ class WorkerSnapshot:
     tracking_error_rad: Optional[float] = None
     torque_ff_nm: Optional[float] = None
     motor_err: Optional[int] = None
+    feedback_at: Optional[float] = None
     yaw_position_rad: Optional[float] = None
     yaw_velocity_rad_s: Optional[float] = None
     yaw_feedback_torque_nm: Optional[float] = None
@@ -90,9 +111,11 @@ class WorkerSnapshot:
     yaw_command_velocity_rad_s: Optional[float] = None
     yaw_tracking_error_rad: Optional[float] = None
     yaw_motor_err: Optional[int] = None
+    yaw_feedback_at: Optional[float] = None
     yaw_interlock_ready: bool = False
     yaw_sequence_phase: Optional[str] = None
     yaw_restore_muzzle_rad: Optional[float] = None
+    aim_request_id: int = 0
     error: Optional[str] = None
 
 
@@ -200,6 +223,7 @@ class MotorWorker:
         self._last_command_rad = pitch_calibration.motor_zero_rad
         self._command_velocity_rad_s = 0.0
         self._feedback_position_rad: Optional[float] = None
+        self._feedback_velocity_rad_s = 0.0
         self._enabled_at = time.monotonic()
         self._last_tick_at = time.monotonic()
         self._stall_reference_rad: Optional[float] = None
@@ -212,9 +236,12 @@ class MotorWorker:
         self._yaw_last_command_rad = self._yaw_target_rad
         self._yaw_command_velocity_rad_s = 0.0
         self._yaw_feedback_position_rad: Optional[float] = None
+        self._yaw_feedback_velocity_rad_s = 0.0
         self._yaw_interlock_hold_rad: Optional[float] = None
         self._yaw_sequence_phase: Optional[str] = None
         self._yaw_restore_muzzle_rad: Optional[float] = None
+        self._deferred_aim: Optional[Tuple[float, float, bool]] = None
+        self._feedback_waiting = False
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._run, name="vertical-motor", daemon=True)
@@ -243,6 +270,9 @@ class MotorWorker:
 
     def request_aim(self, yaw_deg: float, muzzle_deg: float) -> None:
         self._commands.put(("aim", (float(yaw_deg), float(muzzle_deg))))
+
+    def request_tagged_aim(self, yaw_deg: float, muzzle_deg: float, request_id: int) -> None:
+        self._commands.put(("aim_tagged", (float(yaw_deg), float(muzzle_deg), int(request_id))))
 
     def request_home(self) -> None:
         self._commands.put(("home", None))
@@ -312,29 +342,12 @@ class MotorWorker:
                     self._pose_limit_error(math.degrees(current_yaw_rad), muzzle_deg)
                 )
 
-        if self._motors is not None:
-            self._motors.set_home_return(False)
-
-        if self._yaw_sequence_phase in ("clearance", "rotating"):
-            self._yaw_restore_muzzle_rad = muzzle_rad
-            active_pitch_rad = (
-                muzzle_rad
-                if muzzle_rad < self.max_pitch_for_yaw_rad
-                else self.yaw_clearance_pitch_rad
-            )
-            self._apply_pitch_target(
-                active_pitch_rad,
-                f"水平避讓進行中；最終砲口目標更新為 {muzzle_deg:+.2f}°",
-            )
-            self._publish(
-                yaw_restore_muzzle_rad=muzzle_rad,
-                error=None,
-            )
+        if self.yaw_calibration is not None and self._yaw_feedback_position_rad is not None:
+            self._set_aim_targets(math.degrees(self._yaw_target_angle_rad), muzzle_deg)
             return
 
-        if self._yaw_sequence_phase == "restoring":
-            self._yaw_restore_muzzle_rad = muzzle_rad
-            self._publish(yaw_restore_muzzle_rad=muzzle_rad)
+        if self._motors is not None:
+            self._motors.set_home_return(False)
 
         self._apply_pitch_target(
             muzzle_rad,
@@ -384,6 +397,15 @@ class MotorWorker:
             <= HOME_CORRIDOR_YAW_TOLERANCE_DEG + 1e-6
         )
 
+    def _recorded_home_muzzle_rad(self) -> float:
+        """Convert the recorded home encoder position using the level reference."""
+        workspace = getattr(self._motors, "_workspace", None)
+        if workspace is None:
+            workspace = load_workspace_limit()
+        if workspace is None or workspace.home_corridor is None:
+            raise ValueError("尚未記錄 home 馬達位置，不能回 home")
+        return self.pitch_calibration.muzzle_from_motor(workspace.home_corridor.home_pitch_rad)
+
     @staticmethod
     def _pose_limit_error(yaw_deg: float, muzzle_deg: float) -> str:
         return (
@@ -395,9 +417,10 @@ class MotorWorker:
         """Lower into the yaw-dependent activity region, then restore pitch."""
         self._yaw_sequence_phase = "clearance"
         self._yaw_restore_muzzle_rad = restore_muzzle_rad
-        self.yaw_clearance_pitch_rad = self._clearance_pitch_for_yaw(
-            self._yaw_target_angle_rad
-        )
+        current_yaw = self.yaw_calibration.muzzle_from_motor(self._yaw_feedback_position_rad)
+        commanded_yaw = self.yaw_calibration.muzzle_from_motor(self._yaw_last_command_rad)
+        widest_yaw = max((current_yaw, commanded_yaw, self._yaw_target_angle_rad), key=abs)
+        self.yaw_clearance_pitch_rad = self._clearance_pitch_for_yaw(widest_yaw)
         self.yaw_release_pitch_rad = self.yaw_clearance_pitch_rad
         active_pitch_rad = (
             restore_muzzle_rad
@@ -416,6 +439,7 @@ class MotorWorker:
     def _clear_yaw_sequence(self) -> None:
         self._yaw_sequence_phase = None
         self._yaw_restore_muzzle_rad = None
+        self._deferred_aim = None
         self._publish(
             yaw_sequence_phase=None,
             yaw_restore_muzzle_rad=None,
@@ -439,6 +463,18 @@ class MotorWorker:
             )
         return self._yaw_interlock_hold_rad
 
+    def _yaw_feedback_clear(self, feedback_pitch_rad: float) -> bool:
+        limit = self.max_pitch_for_yaw_rad
+        if self._yaw_sequence_phase == "rotating":
+            limit = min(limit, self.yaw_clearance_pitch_rad)
+        return feedback_pitch_rad <= limit + 1e-10
+
+    def _recorded_path_is_safe(self, start, end) -> bool:
+        workspace = getattr(self._motors, "_workspace", None)
+        if workspace is None:
+            return True
+        return workspace_segment_is_safe(workspace, start, end)
+
     def _set_yaw_target(self, yaw_deg: float) -> None:
         if self.yaw_calibration is None:
             raise ValueError("水平馬達控制未啟用")
@@ -453,65 +489,12 @@ class MotorWorker:
         if self._feedback_position_rad is None:
             raise ValueError("尚未取得垂直馬達回饋，禁止水平移動")
 
-        if self._motors is not None:
-            self._motors.set_home_return(False)
-
-        target = self.yaw_calibration.motor_from_muzzle(yaw_rad)
-        move_required = self._yaw_motion_required(target)
-        reversing = (
-            abs(self._yaw_command_velocity_rad_s) > 1e-9
-            and self._yaw_command_velocity_rad_s
-            * (target - self._yaw_last_command_rad)
-            < 0.0
-        )
-        self._apply_yaw_target(yaw_rad)
-
-        if not move_required:
-            if self._yaw_sequence_phase in ("clearance", "rotating"):
-                restore = self._yaw_restore_muzzle_rad
-                if restore is not None:
-                    self._yaw_sequence_phase = "restoring"
-                    self._apply_pitch_target(restore, "水平已到位；回復原垂直角度")
-                    self._publish(yaw_sequence_phase="restoring")
-            else:
-                self._publish(status=f"水平已在目標：{yaw_deg:+.2f}°", error=None)
-            return
-
-        if self._yaw_sequence_phase in ("clearance", "rotating"):
-            self._publish(
-                status=f"水平避讓目標已更新：{yaw_deg:+.2f}°",
-                error=None,
-            )
-            return
-
-        feedback_pitch = self.pitch_calibration.muzzle_from_motor(
-            self._feedback_position_rad
-        )
-        clearance_pitch = self._clearance_pitch_for_yaw(yaw_rad)
         restore_muzzle = (
             self._yaw_restore_muzzle_rad
-            if self._yaw_sequence_phase == "restoring"
-            and self._yaw_restore_muzzle_rad is not None
+            if self._yaw_restore_muzzle_rad is not None
             else self._target_muzzle_rad
         )
-        if not self._pose_allowed_by_activity(yaw_rad, restore_muzzle):
-            raise ValueError(self._pose_limit_error(yaw_deg, math.degrees(restore_muzzle)))
-        if (
-            feedback_pitch > clearance_pitch
-            or restore_muzzle >= clearance_pitch
-        ):
-            self._begin_yaw_clearance_sequence(restore_muzzle)
-            return
-
-        self._clear_yaw_sequence()
-        self._publish(
-            status=(
-                f"水平目標已設定：{yaw_deg:+.2f}°；正在煞車，隨後反轉"
-                if reversing
-                else f"水平目標已設定：{yaw_deg:+.2f}°"
-            ),
-            error=None,
-        )
+        self._set_aim_targets(yaw_deg, math.degrees(restore_muzzle))
 
     def _set_aim_targets(self, yaw_deg: float, muzzle_deg: float, *, home_return: bool = False) -> None:
         """Set a final two-axis pose, staging through clearance when needed."""
@@ -526,7 +509,10 @@ class MotorWorker:
                 f"水平角度超出安全限制：{math.degrees(self.min_yaw_rad):+.1f}° 到 "
                 f"{math.degrees(self.max_yaw_rad):+.1f}°"
             )
-        pitch_upper = math.radians(MAX_MUZZLE_ELEVATION_DEG) if home_return else self.max_muzzle_rad
+        pitch_upper = (
+            max(math.radians(MAX_MUZZLE_ELEVATION_DEG), self._recorded_home_muzzle_rad())
+            if home_return else self.max_muzzle_rad
+        )
         if not self.min_muzzle_rad <= muzzle_rad <= pitch_upper:
             raise ValueError(
                 f"砲口仰角超出安全限制：{math.degrees(self.min_muzzle_rad):.1f}° 到 "
@@ -540,20 +526,35 @@ class MotorWorker:
             raise ValueError("尚未取得水平馬達回饋，禁止雙軸移動")
         if home_return and (not self._enabled or self._motors is None):
             raise ValueError("回 home 前必須先使能馬達")
-        if self._motors is not None:
-            self._motors.set_home_return(home_return)
-        feedback_pitch = self.pitch_calibration.muzzle_from_motor(
-            self._feedback_position_rad
-        )
+        if self._yaw_sequence_phase is not None:
+            same_goal = (
+                abs(yaw_rad - self._yaw_target_angle_rad) <= math.radians(.02)
+                and self._yaw_restore_muzzle_rad is not None
+                and abs(muzzle_rad - self._yaw_restore_muzzle_rad) <= math.radians(.02)
+            )
+            self._deferred_aim = None if same_goal else (yaw_deg, muzzle_deg, home_return)
+            return
         yaw_target = self.yaw_calibration.motor_from_muzzle(yaw_rad)
         yaw_move_required = self._yaw_motion_required(yaw_target)
-        clearance_pitch = self._clearance_pitch_for_yaw(yaw_rad)
 
+        start = (self._yaw_feedback_position_rad, self._feedback_position_rad)
+        final = (yaw_target, self.pitch_calibration.motor_from_muzzle(muzzle_rad))
+        if yaw_move_required:
+            current_yaw = self.yaw_calibration.muzzle_from_motor(start[0])
+            commanded_yaw = self.yaw_calibration.muzzle_from_motor(self._yaw_last_command_rad)
+            widest_yaw = max((current_yaw, commanded_yaw, yaw_rad), key=abs)
+            stage_pitch = min(muzzle_rad, self._clearance_pitch_for_yaw(widest_yaw))
+            stage_motor = self.pitch_calibration.motor_from_muzzle(stage_pitch)
+            path = (start, (start[0], stage_motor), (yaw_target, stage_motor), final)
+        else:
+            path = (start, final)
+        if not all(self._recorded_path_is_safe(a, b) for a, b in zip(path, path[1:])):
+            raise ValueError("規劃路徑超出已記錄的雙軸工作區，目標未套用")
+
+        if self._motors is not None:
+            self._motors.set_home_return(home_return)
         self._apply_yaw_target(yaw_rad)
-        if yaw_move_required and (
-            feedback_pitch > clearance_pitch
-            or muzzle_rad >= clearance_pitch
-        ):
+        if yaw_move_required:
             self._begin_yaw_clearance_sequence(muzzle_rad)
             self._publish(
                 status=(
@@ -587,7 +588,15 @@ class MotorWorker:
         )
 
         if phase == "clearance":
-            if feedback_pitch <= self.yaw_release_pitch_rad:
+            # An upward-moving pitch may still coast across the clearance;
+            # release yaw only once the measured and commanded pitch are not rising.
+            pitch_not_rising = (
+                math.isfinite(self._command_velocity_rad_s)
+                and math.isfinite(self._feedback_velocity_rad_s)
+                and self._command_velocity_rad_s * self.pitch_calibration.motor_sign <= SEQUENCE_STOP_SPEED_RAD_S
+                and self._feedback_velocity_rad_s * self.pitch_calibration.motor_sign <= SEQUENCE_STOP_SPEED_RAD_S
+            )
+            if feedback_pitch <= self.yaw_release_pitch_rad and pitch_not_rising:
                 self._yaw_sequence_phase = "rotating"
                 self._publish(
                     yaw_sequence_phase="rotating",
@@ -628,6 +637,13 @@ class MotorWorker:
                 if not pitch_command_arrived or not pitch_feedback_arrived:
                     return
             if command_arrived and feedback_arrived:
+                current_yaw = self.yaw_calibration.muzzle_from_motor(self._yaw_feedback_position_rad)
+                if (not self._pose_allowed_by_activity(current_yaw, restore)
+                        or not math.isfinite(self._yaw_command_velocity_rad_s)
+                        or not math.isfinite(self._yaw_feedback_velocity_rad_s)
+                        or abs(self._yaw_command_velocity_rad_s) > SEQUENCE_STOP_SPEED_RAD_S
+                        or abs(self._yaw_feedback_velocity_rad_s) > SEQUENCE_STOP_SPEED_RAD_S):
+                    return
                 self._yaw_sequence_phase = "restoring"
                 if restore >= self.yaw_clearance_pitch_rad:
                     self._apply_pitch_target(
@@ -653,9 +669,20 @@ class MotorWorker:
                 abs(feedback_pitch - restore)
                 <= self.sequence_arrival_tolerance_rad
             )
-            if command_arrived and feedback_arrived:
+            if (command_arrived and feedback_arrived
+                    and math.isfinite(self._command_velocity_rad_s)
+                    and math.isfinite(self._feedback_velocity_rad_s)
+                    and abs(self._command_velocity_rad_s) <= SEQUENCE_STOP_SPEED_RAD_S
+                    and abs(self._feedback_velocity_rad_s) <= SEQUENCE_STOP_SPEED_RAD_S):
                 final_pitch_deg = math.degrees(restore)
+                deferred = self._deferred_aim
                 self._clear_yaw_sequence()
+                if deferred is not None:
+                    try:
+                        self._set_aim_targets(deferred[0], deferred[1], home_return=deferred[2])
+                    except (ValueError, RuntimeError) as exc:
+                        self._publish(status="新目標未套用；保持目前位置", error=str(exc))
+                    return
                 self._publish(
                     status=(
                         f"水平旋轉及垂直回復完成：砲口 {final_pitch_deg:+.2f}°"
@@ -696,6 +723,7 @@ class MotorWorker:
         self._yaw_interlock_hold_rad = None
         self._yaw_sequence_phase = None
         self._yaw_restore_muzzle_rad = None
+        self._deferred_aim = None
         self._publish(
             target_rad=self._target_rad,
             target_muzzle_rad=self._target_muzzle_rad,
@@ -796,8 +824,10 @@ class MotorWorker:
         self._enabled_at = time.monotonic()
         self._last_tick_at = self._enabled_at
         self._enabled = True
+        self._feedback_waiting = False
         self._yaw_sequence_phase = None
         self._yaw_restore_muzzle_rad = None
+        self._deferred_aim = None
         self._publish(
             enabled=True,
             target_rad=self._target_rad,
@@ -834,11 +864,13 @@ class MotorWorker:
         # whether it actually took effect.
         self._motors.disable()
         self._enabled = False
+        self._feedback_waiting = False
         self._command_velocity_rad_s = 0.0
         self._yaw_command_velocity_rad_s = 0.0
         self._yaw_interlock_hold_rad = None
         self._yaw_sequence_phase = None
         self._yaw_restore_muzzle_rad = None
+        self._deferred_aim = None
         self._publish(
             enabled=False,
             yaw_sequence_phase=None,
@@ -868,9 +900,17 @@ class MotorWorker:
                 self._set_aim_targets(float(yaw_deg), float(muzzle_deg))
             except (TypeError, ValueError) as exc:
                 self._publish(status="雙軸目標未套用", error=str(exc))
+        elif action == "aim_tagged":
+            try:
+                yaw_deg, muzzle_deg, request_id = value
+                self._set_aim_targets(float(yaw_deg), float(muzzle_deg))
+                self._publish(aim_request_id=int(request_id))
+            except (TypeError, ValueError) as exc:
+                self._publish(status="雙軸目標未套用", error=str(exc))
         elif action == "home":
             try:
-                self._set_aim_targets(0.0, MAX_MUZZLE_ELEVATION_DEG, home_return=True)
+                home_deg = math.degrees(self._recorded_home_muzzle_rad())
+                self._set_aim_targets(0.0, home_deg, home_return=True)
             except (ValueError, RuntimeError) as exc:
                 self._publish(status="home 目標未套用", error=str(exc))
         elif action == "calibration":
@@ -921,6 +961,7 @@ class MotorWorker:
                     position_rad=state.position_rad,
                     command_rad=state.position_rad,
                     motor_err=state.err,
+                    feedback_at=state.feedback_at,
                     ready=True,
                     status="已連線，等待馬達回饋狀態",
                 )
@@ -941,6 +982,7 @@ class MotorWorker:
                     yaw_target_rad=yaw_state.position_rad,
                     yaw_target_angle_rad=self._yaw_target_angle_rad,
                     yaw_motor_err=yaw_state.err,
+                    yaw_feedback_at=yaw_state.feedback_at,
                 )
 
             next_tick = time.monotonic()
@@ -955,6 +997,59 @@ class MotorWorker:
 
                 now = time.monotonic()
                 if self._enabled and self._motors is not None:
+                    pitch_state = self._motors.get_state(PITCH_MOTOR_ID)
+                    yaw_state = (self._motors.get_state(YAW_MOTOR_ID)
+                                 if self.yaw_calibration is not None else None)
+                    fresh = _fresh_enabled_feedback(pitch_state, now) and (
+                        self.yaw_calibration is None or _fresh_enabled_feedback(yaw_state, now)
+                    )
+                    workspace = getattr(self._motors, "_workspace", None)
+                    inside_workspace = (not fresh or yaw_state is None or workspace is None
+                                        or workspace_contains(workspace, yaw_state.position_rad,
+                                                              pitch_state.position_rad))
+                    if pitch_state is not None:
+                        self._publish(position_rad=pitch_state.position_rad,
+                                      velocity_rad_s=pitch_state.velocity_rad_s,
+                                      motor_err=pitch_state.err, feedback_at=pitch_state.feedback_at)
+                    if yaw_state is not None:
+                        self._publish(yaw_position_rad=yaw_state.position_rad,
+                                      yaw_velocity_rad_s=yaw_state.velocity_rad_s,
+                                      yaw_motor_err=yaw_state.err, yaw_feedback_at=yaw_state.feedback_at)
+                    stopped_after_gap = fresh and (
+                        abs(pitch_state.velocity_rad_s) <= SEQUENCE_STOP_SPEED_RAD_S
+                        and (yaw_state is None or abs(yaw_state.velocity_rad_s) <= SEQUENCE_STOP_SPEED_RAD_S)
+                    )
+                    if not fresh or not inside_workspace or (self._feedback_waiting and not stopped_after_gap):
+                        self._feedback_waiting = True
+                        reason = "feedback_outside_workspace" if fresh and not inside_workspace else "feedback_stale"
+                        self._publish(error=reason, status="馬達回饋失效、尚未停止或超出工作區；保持上一命令")
+                        self._motors.hold()
+                        self._motors.refresh()
+                        next_tick = time.monotonic()
+                        time.sleep(CONTROL_PERIOD_S)
+                        continue
+                    if self._feedback_waiting:
+                        self._feedback_waiting = False
+                        self._feedback_position_rad = self._last_command_rad = pitch_state.position_rad
+                        self._feedback_velocity_rad_s = self._command_velocity_rad_s = pitch_state.velocity_rad_s
+                        self._publish(error=None)
+                        if yaw_state is not None:
+                            self._yaw_feedback_position_rad = self._yaw_last_command_rad = yaw_state.position_rad
+                            self._yaw_feedback_velocity_rad_s = self._yaw_command_velocity_rad_s = yaw_state.velocity_rad_s
+                            desired = self._deferred_aim or (
+                                math.degrees(self._yaw_target_angle_rad),
+                                math.degrees(self._yaw_restore_muzzle_rad if self._yaw_restore_muzzle_rad is not None else self._target_muzzle_rad),
+                                bool(getattr(self._motors, "_home_return_requested", False)),
+                            )
+                            self._clear_yaw_sequence()
+                            self._yaw_interlock_hold_rad = None
+                            try:
+                                self._set_aim_targets(desired[0], desired[1], home_return=desired[2])
+                            except (ValueError, RuntimeError) as exc:
+                                self._apply_yaw_target(self.yaw_calibration.muzzle_from_motor(yaw_state.position_rad))
+                                self._apply_pitch_target(self.pitch_calibration.muzzle_from_motor(pitch_state.position_rad),
+                                                         "回饋恢復後路徑無效；保持目前位置")
+                                self._publish(error=str(exc))
                     dt = min(max(now - self._last_tick_at, 0.001), 0.02)
                     self._last_tick_at = now
                     self._update_yaw_clearance_sequence()
@@ -990,9 +1085,7 @@ class MotorWorker:
                             feedback_pitch = self.pitch_calibration.muzzle_from_motor(
                                 self._feedback_position_rad
                             )
-                            yaw_interlock_ready = (
-                                feedback_pitch <= self.max_pitch_for_yaw_rad
-                            )
+                            yaw_interlock_ready = self._yaw_feedback_clear(feedback_pitch)
                         if (
                             yaw_interlock_ready
                             and self._yaw_sequence_phase != "clearance"
@@ -1086,6 +1179,7 @@ class MotorWorker:
                     state = self._motors.get_state(PITCH_MOTOR_ID)
                     if state is not None:
                         self._feedback_position_rad = state.position_rad
+                        self._feedback_velocity_rad_s = state.velocity_rad_s
                         self._publish(
                             position_rad=state.position_rad,
                             velocity_rad_s=state.velocity_rad_s,
@@ -1094,11 +1188,9 @@ class MotorWorker:
                                 self._last_command_rad - state.position_rad
                             ),
                             motor_err=state.err,
-                            yaw_interlock_ready=(
-                                self.pitch_calibration.muzzle_from_motor(
-                                    state.position_rad
-                                )
-                                <= self.max_pitch_for_yaw_rad
+                            feedback_at=state.feedback_at,
+                            yaw_interlock_ready=self._yaw_feedback_clear(
+                                self.pitch_calibration.muzzle_from_motor(state.position_rad)
                             ),
                         )
                         if self._enabled:
@@ -1107,6 +1199,7 @@ class MotorWorker:
                         yaw_state = self._motors.get_state(YAW_MOTOR_ID)
                         if yaw_state is not None:
                             self._yaw_feedback_position_rad = yaw_state.position_rad
+                            self._yaw_feedback_velocity_rad_s = yaw_state.velocity_rad_s
                             self._publish(
                                 yaw_position_rad=yaw_state.position_rad,
                                 yaw_velocity_rad_s=yaw_state.velocity_rad_s,
@@ -1116,6 +1209,7 @@ class MotorWorker:
                                     - yaw_state.position_rad
                                 ),
                                 yaw_motor_err=yaw_state.err,
+                                yaw_feedback_at=yaw_state.feedback_at,
                             )
         except Exception as exc:  # surfaced in the GUI
             self._publish(status="控制器錯誤", error=str(exc), ready=False, enabled=False)
@@ -1567,7 +1661,7 @@ def _run_terminal_panel(
     print(
         "指令：status | enable | disable | move | set <垂直角度> | "
         "yaw <水平角度> | aim <水平角度> <垂直角度> | "
-        "calibrate | capture-origin | +1 | -1 | +5 | -5 | home | quit"
+        "calibrate | capture-level | capture-origin | +1 | -1 | +5 | -5 | home | quit"
     )
     print(f"set 的角度是砲口仰角，軟限制 {min_angle:+.1f}° 到 {max_angle:+.1f}°。")
     if worker.yaw_calibration is not None:
@@ -1623,9 +1717,47 @@ def _run_terminal_panel(
                 else:
                     print("兩軸目前已失能。")
                 print(
-                    "請手動將水平對準 0°、垂直放到初始 45°；"
+                    "請手動將水平對準 0°、垂直放到已記錄的 home 位置；"
                     "完成後輸入 capture-origin。"
                 )
+                continue
+            if command == "capture-level":
+                latest = worker.snapshot()
+                if latest.enabled or latest.motor_err != 0 or latest.yaw_motor_err != 0:
+                    print("拒絕校正：必須先失能，且兩顆馬達回饋 ERR 都必須為 0。")
+                    continue
+                answer = input("請支撐機構並用水平儀確認砲口仰角 0°；輸入 capture：").strip().lower()
+                if answer != "capture":
+                    print("取消水平基準校正。")
+                    continue
+                latest = worker.snapshot()
+                if (latest.enabled or latest.motor_err != 0 or latest.yaw_motor_err != 0
+                        or latest.position_rad is None or latest.feedback_at is None
+                        or latest.velocity_rad_s is None
+                        or not math.isfinite(latest.velocity_rad_s)
+                        or abs(latest.velocity_rad_s) > SEQUENCE_STOP_SPEED_RAD_S
+                        or not 0 <= time.monotonic() - latest.feedback_at <= .5):
+                    print("拒絕校正：未取得新鮮、靜止的失能馬達位置回饋。")
+                    continue
+                try:
+                    workspace = load_workspace_limit()
+                    if workspace is None or workspace.home_corridor is None:
+                        raise ValueError("未記錄 home 馬達位置")
+                    lower, upper = worker.position_limits[PITCH_MOTOR_ID]
+                    if not lower <= latest.position_rad <= upper:
+                        raise ValueError("水平 0° 馬達位置超出既有硬限制")
+                    proposed = PitchCalibration(latest.position_rad,
+                                                worker.pitch_calibration.motor_rad_per_muzzle_rad,
+                                                worker.pitch_calibration.motor_sign)
+                    constrain_pitch_travel_limit((lower, upper), proposed,
+                                                 workspace.home_corridor.home_pitch_rad)
+                    backup_path = save_level_reference_calibration(startup_pose, latest.position_rad)
+                    worker.request_calibration_reload(load_pitch_calibration(startup_pose),
+                                                      load_yaw_calibration(startup_pose))
+                except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
+                    print(f"水平基準校正失敗：{exc}")
+                    continue
+                print(f"已記錄水平 0°；home 編碼器位置未變。舊檔備份：{backup_path}")
                 continue
             if command == "capture-origin":
                 latest = worker.snapshot()
@@ -1636,17 +1768,21 @@ def _run_terminal_panel(
                     print("拒絕校正：尚未取得兩顆馬達的位置回饋。")
                     continue
                 answer = input(
-                    "確認目前是水平 0°、垂直 45°？輸入 capture："
+                    "確認目前是水平 0°、垂直已記錄的 home？輸入 capture："
                 ).strip().lower()
                 if answer != "capture":
                     print("取消擷取原點。")
                     continue
                 try:
+                    workspace = load_workspace_limit()
+                    if (workspace is None or workspace.home_corridor is None
+                            or abs(latest.position_rad - workspace.home_corridor.home_pitch_rad) > math.radians(.05)
+                            or abs(latest.yaw_position_rad - workspace.home_corridor.yaw_center_rad) > math.radians(.05)):
+                        raise ValueError("目前位置與記錄的 home 不同；請使用工作區校正工具重新記錄")
                     backup_path = save_manual_origin_calibration(
                         startup_pose,
                         yaw_motor_rad=latest.yaw_position_rad,
                         pitch_motor_rad=latest.position_rad,
-                        pitch_reference_deg=45.0,
                     )
                     pitch_calibration = load_pitch_calibration(startup_pose)
                     yaw_calibration = load_yaw_calibration(startup_pose)
@@ -1658,7 +1794,7 @@ def _run_terminal_panel(
                     yaw_calibration,
                 )
                 print(
-                    "已擷取手動原點：水平 0°、垂直 45°。"
+                    "已擷取手動 home；垂直水平 0° 量測基準保持不變。"
                     f"舊檔備份：{backup_path}"
                 )
                 print("馬達仍為失能；人員離開機構後才能輸入 enable。")
@@ -1717,8 +1853,8 @@ def _run_terminal_panel(
                     print("馬達尚未使能；請先輸入 enable。")
                 else:
                     worker.request_home()
-                    target_angle = MAX_MUZZLE_ELEVATION_DEG
-                    print("回 home：先在活動區水平置中，再經置中通道回到垂直 45°。")
+                    target_angle = math.degrees(worker._recorded_home_muzzle_rad())
+                    print(f"回 home：先水平置中，再回到記錄的馬達位置（推算仰角 {target_angle:.2f}°）。")
                 continue
             if target_angle is None:
                 latest = worker.snapshot()
@@ -1977,7 +2113,7 @@ def main() -> None:
         position_limits=position_limits,
     )
 
-    if args.cli or (os.name != "nt" and not os.environ.get("DISPLAY")):
+    if tk is None or args.cli or (os.name != "nt" and not os.environ.get("DISPLAY")):
         _run_terminal_panel(worker, args.min_angle, args.max_angle, args.startup_pose)
         return
 

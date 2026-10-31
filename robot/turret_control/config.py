@@ -105,6 +105,11 @@ class TurretConfig:
     pitch_axis_offset_y_m: float = 0.0
     pitch_axis_offset_z_m: float = 0.0
 
+    # Exit point relative to the pitch axis when pitch is level, in the
+    # yaw-zero frame. The point rotates with the pitch axis.
+    pitch_exit_offset_y_m: float = 0.0
+    pitch_exit_offset_z_m: float = 0.0
+
     # Mechanical zero: direction of the launcher when the motor is at zero.
     # Defaults are read from startup_pose.json so a manual origin capture also
     # applies to the autonomous controller on its next launch.
@@ -155,6 +160,9 @@ class TurretConfig:
     board_pose_smoothing_alpha: float = 0.35
     board_pose_stable_frames: int = 5
     board_pose_stale_timeout_s: float = 0.25
+    # Brief partial-observation fallback, measured from the last stable PnP.
+    board_pose_partial_max_age_s: float = 1.0
+    board_pose_partial_min_confidence: float = 0.65
     board_pose_fire_translation_m_s: float = 0.15
     board_pose_fire_rotation_rad_s: float = math.radians(8.0)
     board_pose_max_plausible_translation_m_s: float = 4.0
@@ -258,6 +266,10 @@ class TurretConfig:
             raise ValueError("stable_frames_required must be at least 1")
         if self.compensate_gravity and self.muzzle_speed_m_s <= 0:
             raise ValueError("muzzle_speed_m_s must be positive to compensate gravity")
+        if (self.use_axis_geometry and not self.camera_on_turret
+                and self.compensate_gravity
+                and (self.pitch_exit_offset_y_m != 0.0 or self.pitch_exit_offset_z_m != 0.0)):
+            raise ValueError("gravity with a rotating exit offset is not implemented")
         if self.gravity_m_s2 < 0:
             raise ValueError("gravity_m_s2 must not be negative")
         if self.small_hole_diameter_m <= 0 or self.large_hole_diameter_m <= 0:
@@ -282,6 +294,10 @@ class TurretConfig:
             raise ValueError("board_pose_stable_frames must be at least 1")
         if self.board_pose_stale_timeout_s <= 0:
             raise ValueError("board_pose_stale_timeout_s must be positive")
+        if not math.isfinite(self.board_pose_partial_max_age_s) or self.board_pose_partial_max_age_s <= 0:
+            raise ValueError("board_pose_partial_max_age_s must be positive")
+        if not 0.0 <= self.board_pose_partial_min_confidence <= 1.0:
+            raise ValueError("board_pose_partial_min_confidence must be in 0..1")
         pose_speed_values = (
             self.board_pose_fire_translation_m_s,
             self.board_pose_fire_rotation_rad_s,
@@ -326,6 +342,8 @@ class TurretConfig:
             self.pitch_axis_offset_x_m,
             self.pitch_axis_offset_y_m,
             self.pitch_axis_offset_z_m,
+            self.pitch_exit_offset_y_m,
+            self.pitch_exit_offset_z_m,
         )
         if not all(math.isfinite(value) for value in geometry_values):
             raise ValueError("camera and axis geometry values must be finite")

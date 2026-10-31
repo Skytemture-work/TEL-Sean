@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from .aiming import AimCommand, AimingController, TargetPixel
 from .backends import MotorBackend
 from .config import TurretConfig
+from .limits import workspace_contains
 
 
 class TurretController:
@@ -37,6 +40,18 @@ class TurretController:
             pitch_state.position_rad if pitch_state is not None else None,
         )
 
+        workspace = getattr(self.motors, "_workspace", None)
+        outside_workspace = (command.has_target and workspace is not None
+                             and not workspace_contains(workspace, command.target_yaw_rad, command.target_pitch_rad))
+        if outside_workspace:
+            command = replace(command, target_reachable=False, fire_allowed=False,
+                              blocked_reason="target is outside the motor workspace")
+
+        if outside_workspace or command.blocked_reason == "target is outside the mechanical limits":
+            self.aiming.reset_stability()
+            self.motors.hold()
+            return command
+
         if command.has_target:
             # The values are guaranteed non-None when has_target is true.
             send_targets = getattr(self.motors, "send_targets", None)
@@ -68,6 +83,11 @@ class TurretController:
                     command.target_pitch_rad,
                     self.config.max_motor_speed_rad_s,
                 )
+            motion_ready = getattr(self.motors, "motion_ready", None)
+            if callable(motion_ready) and not motion_ready(command.target_yaw_rad, command.target_pitch_rad):
+                self.aiming.reset_stability()
+                command = replace(command, stable=False, fire_allowed=False,
+                                  blocked_reason=command.blocked_reason or "waiting for safe two-axis movement")
         else:
             self.motors.hold()
 

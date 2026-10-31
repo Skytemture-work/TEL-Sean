@@ -7,13 +7,15 @@
 ## 1. 整體資料流
 
 ```text
-ZED 左眼影像
+ZED SDK 校正後左眼影像 + 左右眼立體深度
   → YOLO segmentation mask
   → 黑色靶面與孔位支持檢查（排除場外亮點、黑色鐵架）
   → 官方 3×4、±2 cm 幾何檢查／缺孔補點
   → 每幀 PnP 靶面姿態與 H01～H12 重投影
-  → 距離、視差、重力補償
+  → 優先 ZED 靶面深度平面；無有效平面時退回單孔深度或 PnP 幾何
+  → 相機／兩軸／轉動發射孔的幾何修正（目前按直線出球）
   → DAMIAO 水平／垂直絕對目標角（rad）
+  → 共用手動馬達執行緒：檢查路徑、降仰角、水平移動、回復仰角
   → 馬達回饋到位 + 安全閘門
   → fire_callback(target)
 ```
@@ -23,6 +25,14 @@ ZED 左眼影像
 1. 實作一次發射的 callback。
 2. 需要狀態時讀 HTTP API，或傳入 `telemetry_callback`。
 3. 不要再根據紫色線或像素位置自行算第二套角度。
+
+自動與手動使用同一套雙軸馬達工作執行緒（不能同時啟動兩個行程搶同一序列埠）。自動模式採 `posvel`、速度 `0.06 rad/s`、加速度 `0.05 rad/s²`；避讓完成、回饋新鮮且馬達停止後才能發射。移動中更新的目標會等目前避讓完成再重新規劃。路徑以馬達角度不超過 `0.1°` 的間隔檢查，仍需實機驗證。
+
+依操作人員確認，活動範圍為仰角 `0°～30°`／水平 `±34.5°`，`30°～33°` 依三角形收窄，`33°～home` 水平 `±10°`；home 保留已記錄的馬達位置，以水平零點和已確認的 `1:1` 比例換算約 `44.63°`。活動多邊形沒有再額外內縮 `0.5°`；水平 `±34.5°` 本身相對機構設計 `±35°` 保留 `0.5°`。
+
+實機入口採用 CAD 設計幾何：相機固定、仰角 `20°`，左眼在旋轉軸左側 `60 mm`；相機中心在旋轉軸前方 `101.662 mm`，並比基準面高 `1.998 mm`；垂直軸位於水平軸上方 `72.1 mm`。設計 home `45°` 時發射孔相對垂直軸前方 `150 mm`、上方 `96.5 mm`，發射孔與仰角一起轉動。此模型假設左眼光學中心與 CAD 相機中心同高、同前後位置，且相機無橫滾；仍須確認實機裝配及光學中心。
+
+依操作人員決定，目前採**直線出球、不做重力或空氣阻力補償**，距離仍用於幾何視差；球速 `20 m/s` 的舊預設不會用於實機瞄準。輕球不代表軌跡一定是直線，需在實際距離與球速下驗證落點。若將來開啟重力補償，須先實作轉動發射孔與彈道的聯合求解；目前組態會拒絕這種組合。
 
 孔位 ID 固定如下；計分策略可能讓同一個孔在射擊序列中出現多次。
 
@@ -41,20 +51,21 @@ H01  H04  H07
 python3 -m turret_control.run_board_real \
   --model ./best.pt \
   --device 0 \
-  --camera 0 \
-  --zed-uvc \
   --port /dev/ttyACM0 \
   --web-port 8080 \
-  --score-mode \
   --match-phase upper \
   --cooldown 1.0 \
   --target-timeout 6.0
 ```
 
 - `--port` 是 DAMIAO 轉接器，不是發射器的 VESC port；兩套硬體不要搶同一個裝置。
+- 預設使用 ZED SDK 的 HD720 校正後左眼影像、配對深度和 SDK 回傳的左眼相機內參；需要安裝可用的 ZED SDK 與 `pyzed`。SDK 無法開啟時會報錯，不會默默切換相機。
+- `--zed-uvc` 明確切換到不含雙眼深度的 UVC 原始影像；可搭配 `--zed-calibration /usr/local/zed/settings/SN實際序號.conf` 載入該相機原廠左眼原始影像內參。`--opencv-camera` 則使用一般 OpenCV 相機，`--camera` 選擇兩種 OpenCV 相機的編號。
 - `--match-phase` 依當場半場改成 `upper` 或 `lower`。
 - `--target-timeout` 是一個孔等不到成功發射時的略過秒數；整合測試可設 `0` 停用自動略過。
 - `--headless` 可關閉本機 OpenCV 視窗，HTTP 儀表板仍可用。
+- 競賽計分模式預設啟用，按 `G` 開始辨識紅燈；`--no-score-mode` 可切換一般模式。既有的 `--score-mode` 參數仍可使用。
+- 競賽模式啟用少孔遮蔽備援：最近一次穩定 PnP 後最多 1 秒內，若仍有至少一個符合位置、尺寸及信心度的孔，會以原距離和朝向做平移追蹤；單次降級期間最多成功發射一球。每兩次有效姿態間隔不得超過 0.25 秒，之後需重新取得穩定 PnP。
 - 模型預設依序尋找 `best_v2.pt`、`best.pt`、訓練目錄下的 `best.pt`，正式整合仍建議明確傳 `--model`。
 - 這個命令會連接並使能真實 DAMIAO 馬達；先確認急停、機械限位與支撐。
 
@@ -64,6 +75,8 @@ python3 -m turret_control.run_board_real \
 - `F`：只確認目前一發。現在的預設 callback 只記錄成功，尚未控制實際發射器。
 - `S`：略過目前孔位。
 - `Q` / `Esc`：離開並關閉裝置。
+
+少孔備援不能量測靶板或相機的旋轉、距離變化，也無法保證單孔不會誤匹配；應在比賽場地驗證。完全看不到孔或更新失敗時不會盲射。儀表板 `pose.source` 為 `pnp` 或 `partial`；後者的位置殘差是可見孔的平移一致性誤差，不代表完整姿態誤差。
 
 ## 3. Python 內嵌呼叫（建議整合方式）
 
@@ -109,11 +122,8 @@ try:
         [
             "--model", "./best.pt",
             "--device", "0",
-            "--camera", "0",
-            "--zed-uvc",
             "--port", "/dev/ttyACM0",
             "--web-port", "8080",
-            "--score-mode",
             "--match-phase", "upper",
             "--cooldown", "1.0",
             "--target-timeout", "6.0",
@@ -141,7 +151,8 @@ Callable[[BoardTarget], bool]
 | 欄位 | 單位 | 說明 |
 |---|---:|---|
 | `hole_id` | — | `H01`～`H12` |
-| `distance_m` | m | 每幀靶面姿態更新後的目前距離 |
+| `distance_m` | m | 孔位光軸深度；優先 ZED 靶面平面，再依序使用單孔深度與 PnP |
+| `distance_source` | — | `zed_plane`：ZED 深度平面；`zed_depth`：孔位邊緣深度；`board_pose`：PnP 估算 |
 | `u_px`, `v_px` | px | 孔心影像座標 |
 | `diameter_m` | m | 小孔 `0.20`、大孔 `0.40` |
 | `confidence` | 0～1 | YOLO 信心度 |
@@ -168,7 +179,7 @@ Callable[[BoardTarget], bool]
 - 相機解析度符合標定內參。
 - 靶面 PnP 有效、未逾時，且連續穩定。
 - 距離可用，視差／彈道計算成功。
-- 目標未超出機械限位與彈道射程。
+- 目標未超出機械限位且位於發射孔前方。
 - 水平、垂直馬達都有回饋，且連續到位。
 - 上一個發射嘗試已超過 cooldown。
 
@@ -214,7 +225,7 @@ pitch_change_deg = state["target"]["pitch"]["delta_deg"]
 | `vision.board_surface_found` | 是否找到有孔位支持的黑色靶面 |
 | `pose.state` / `pose.ready` | `invalid`、`settling`、`ready`；只有 ready 可發射 |
 | `pose.reprojection_error_px` | PnP 重投影誤差 |
-| `target.hole_id` / `distance_m` | 即將發射的孔與距離 |
+| `target.hole_id` / `distance_m` / `distance_source` | 即將發射的孔、光軸深度與距離來源 |
 | `target.yaw.current_deg` / `target_deg` / `delta_deg` | 砲口水平目前、目標、尚需變化量 |
 | `target.pitch.current_deg` / `target_deg` / `delta_deg` | 砲口垂直目前、目標、尚需變化量 |
 | `target.yaw.target_motor_deg` | DAMIAO 編碼器絕對目標，只供診斷 |
@@ -289,8 +300,7 @@ import 到影像控制迴圈。發射機構組需要把其中的硬體操作包�
 - reload 完成狀態。
 - `close()`／急停時停止推球與飛輪。
 
-發射速度必須和 `TurretConfig.muzzle_speed_m_s` 的實測值一致；若飛輪 RPM 改變卻沒有同步
-更新彈道模型，垂直瞄準角會錯。UART 的舊 `speed=0～100` 也不是 m/s，不能直接代入。
+目前實機瞄準不使用發射速度做彈道修正。若實測落點顯示需要補償重力或阻力，須量測出球速度、重新實作並驗證模型；UART 的舊 `speed=0～100` 不是 m/s。
 
 ## 7. 建議整合驗收順序
 
@@ -303,5 +313,5 @@ import 到影像控制迴圈。發射機構組需要把其中的硬體操作包�
 7. 移動車體、遮住靶面、拔掉馬達回饋：`firing.allowed` 必須變成 false，callback 不得發射。
 8. 最後才接球，以實體安全開關、急停與機械防護做低速單發測試。
 
-正式自動發射前仍須完成相機內參、相機到兩軸偏移、砲口偏移、真實球速與機構活動範圍的
-實測校正；目前 `TurretConfig` 內仍有暫值，程式會計算角度不代表角度已經校準正確。
+正式自動發射前仍須確認 ZED SDK 使用該相機的標定，並以實機驗證 CAD 安裝位置、方向、
+活動範圍與不同距離的落點；程式會計算角度不代表已完成實機校準。

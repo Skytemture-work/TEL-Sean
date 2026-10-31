@@ -247,7 +247,7 @@ def main() -> None:
         "--boundary-backoff-motor-deg",
         type=float,
         default=0.15,
-        help="在既有 0.5 度內縮之外再退讓的馬達角度",
+        help="相對已設定工作區邊界的額外向內退讓量（馬達角度）",
     )
     parser.add_argument("--dry-run", action="store_true", help="只驗證並顯示路徑")
     args = parser.parse_args()
@@ -263,7 +263,7 @@ def main() -> None:
     if workspace is None:
         raise SystemExit("找不到多邊形工作區")
     if workspace.home_corridor is None:
-        raise SystemExit("45° home 巡邊不適用目前 0°～35° 的垂直活動範圍")
+        raise SystemExit("未記錄 home 通道，無法執行巡邊")
     yaw_calibration = load_yaw_calibration(args.startup_pose)
     pitch_calibration = load_pitch_calibration(args.startup_pose)
     transition_pitch = math.degrees(
@@ -273,7 +273,7 @@ def main() -> None:
     )
     if transition_pitch > PITCH_MAX_DEG + 1e-6:
         raise SystemExit(
-            "45° home 巡邊不適用目前 0°～35° 的垂直活動範圍："
+            "記錄的 home 通道未與 0°～35° 活動範圍連接："
             f"轉接角為 {transition_pitch:.2f}°"
         )
     boundary = _build_boundary_path(workspace, args.boundary_backoff_motor_deg)
@@ -318,7 +318,7 @@ def main() -> None:
         # Explicit staging makes the 45-degree home interlock unambiguous.
         centered_low = (workspace.home_corridor.yaw_center_rad, current[1])
         _move_to(motors, centered_low, args.speed, "低姿態水平置中")
-        _move_to(motors, home, args.speed, "到 45° home")
+        _move_to(motors, home, args.speed, "到記錄的 home 位置")
         _move_to(motors, workspace.anchor, args.speed, "由 home 垂直下降至活動區")
         _move_to(motors, boundary[0], args.speed, "進入巡邊起點")
         for index, point in enumerate(boundary[1:] + boundary[:1], 2):

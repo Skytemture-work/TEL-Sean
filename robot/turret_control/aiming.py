@@ -71,6 +71,10 @@ class AimingController:
         self.config = config
         self._stable_frames = 0
 
+    def reset_stability(self) -> None:
+        """Require fresh settled observations after an external motion gate."""
+        self._stable_frames = 0
+
     def pixel_to_error(self, target: TargetPixel) -> tuple[float, float]:
         """Return yaw and pitch error in radians.
 
@@ -148,6 +152,8 @@ class AimingController:
                         pitch_axis_offset_x_m=0.0,
                         pitch_axis_offset_y_m=0.0,
                         pitch_axis_offset_z_m=0.0,
+                        pitch_exit_offset_y_m=0.0,
+                        pitch_exit_offset_z_m=0.0,
                     )
                 try:
                     wanted_yaw, wanted_pitch, geometry_result = aim_angles_from_target(

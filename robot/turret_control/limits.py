@@ -64,12 +64,20 @@ def constrain_pitch_activity_limit(bounds, calibration):
     return lower, upper
 
 
-def constrain_pitch_travel_limit(bounds, calibration):
-    """Allow the calibrated 0–45° range, subject to the workspace corridor."""
-    design = sorted(calibration.motor_from_muzzle(math.radians(angle)) for angle in (0.0, 45.0))
+def constrain_pitch_travel_limit(bounds, calibration, home_motor_rad=None):
+    """Intersect recorded travel with level and the independently recorded home."""
+    explicit_home = home_motor_rad is not None
+    if home_motor_rad is None:
+        home_motor_rad = calibration.motor_from_muzzle(math.radians(45.0))
+    if (not math.isfinite(home_motor_rad)
+            or calibration.muzzle_from_motor(home_motor_rad) <= 0):
+        raise ValueError("recorded home must be above the measured level position")
+    if explicit_home and not bounds[0] - 1e-10 <= home_motor_rad <= bounds[1] + 1e-10:
+        raise ValueError("recorded home is outside the retained pitch motor limits")
+    design = sorted((calibration.motor_from_muzzle(0.0), home_motor_rad))
     lower, upper = max(bounds[0], design[0]), min(bounds[1], design[1])
     if lower >= upper:
-        raise ValueError("recorded pitch limits do not overlap the 0–45° travel range")
+        raise ValueError("recorded pitch limits do not overlap the level-to-home travel range")
     return lower, upper
 
 
@@ -286,6 +294,61 @@ def workspace_contains(workspace: WorkspaceLimit, yaw_rad: float, pitch_rad: flo
     return workspace_base_contains(
         workspace, yaw_rad, pitch_rad
     ) or workspace_in_home_corridor(workspace, yaw_rad, pitch_rad)
+
+
+def workspace_segment_is_safe(workspace: WorkspaceLimit, start: Point, end: Point,
+                              max_step_rad: float = math.radians(.1)) -> bool:
+    """Check a motor-space segment at a bounded sample spacing.
+
+    NumPy batches the polygon checks so the motor worker does not spend tens
+    of milliseconds in Python loops. The scalar fallback has identical rules.
+    """
+    values = (*start, *end, max_step_rad)
+    if not all(math.isfinite(float(value)) for value in values) or max_step_rad <= 0:
+        raise ValueError("segment values must be finite and sampling step positive")
+    steps = max(1, math.ceil(max(abs(end[0] - start[0]), abs(end[1] - start[1])) / max_step_rad))
+    try:
+        import numpy as np
+    except ImportError:
+        return all(workspace_contains(
+            workspace, start[0] + (end[0] - start[0]) * index / steps,
+            start[1] + (end[1] - start[1]) * index / steps,
+        ) for index in range(steps + 1))
+    fraction = np.arange(steps + 1, dtype=np.float64) / steps
+    xs = start[0] + (end[0] - start[0]) * fraction
+    ys = start[1] + (end[1] - start[1]) * fraction
+
+    def inside_base(candidate_x):
+        inside = np.zeros(len(xs), dtype=bool)
+        on_edge = np.zeros(len(xs), dtype=bool)
+        margin_ok = np.ones(len(xs), dtype=bool)
+        for index, (ax, ay) in enumerate(workspace.vertices):
+            bx, by = workspace.vertices[(index + 1) % len(workspace.vertices)]
+            dx, dy = bx - ax, by - ay
+            length_sq = dx * dx + dy * dy
+            if length_sq <= 1e-24:
+                distance_sq = (candidate_x - ax) ** 2 + (ys - ay) ** 2
+            else:
+                projection = np.clip(((candidate_x - ax) * dx + (ys - ay) * dy) / length_sq, 0., 1.)
+                distance_sq = (candidate_x - ax - projection * dx) ** 2 + (ys - ay - projection * dy) ** 2
+            on_edge |= distance_sq <= 1e-18
+            if workspace.margin_rad > 0:
+                margin_ok &= distance_sq >= workspace.margin_rad ** 2
+            if ay != by:
+                crossing = (ay > ys) != (by > ys)
+                crossing_x = dx * (ys - ay) / dy + ax
+                inside ^= crossing & (candidate_x < crossing_x)
+        return (inside | on_edge) & margin_ok
+
+    base = inside_base(xs)
+    if workspace.symmetry_yaw_center_rad is not None:
+        base &= inside_base(2.0 * workspace.symmetry_yaw_center_rad - xs)
+    corridor = workspace.home_corridor
+    if corridor is not None:
+        lower, upper = sorted((corridor.home_pitch_rad, corridor.transition_pitch_rad))
+        base |= ((np.abs(xs - corridor.yaw_center_rad) <= corridor.yaw_tolerance_rad + 1e-12)
+                 & (ys >= lower) & (ys <= upper))
+    return bool(np.all(base))
 
 
 def clamp_workspace_target(
