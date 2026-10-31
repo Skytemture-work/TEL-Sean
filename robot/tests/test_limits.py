@@ -25,7 +25,6 @@ from turret_control.limits import (
     workspace_contains,
     workspace_segment_is_safe,
 )
-from turret_control.run_limit_calibration import _hard_limits_for_capture, _save_recovery_trace
 from turret_control.pitch import PitchCalibration, load_pitch_calibration
 from turret_control.run_vertical_panel import DEFAULT_STARTUP_POSE
 
@@ -39,17 +38,6 @@ class MotorLimitTests(unittest.TestCase):
         self.assertAlmostEqual(upper, .2)
         with self.assertRaisesRegex(ValueError, "outside the retained"):
             constrain_pitch_travel_limit((-.5, .2), calibration, home)
-
-    def test_recalibrating_home_does_not_move_measured_level(self):
-        workspace = load_workspace_limit()
-        calibration = load_pitch_calibration(DEFAULT_STARTUP_POSE)
-        hard, proposed, _ = _hard_limits_for_capture(
-            Path(__file__).resolve().parents[1] / "turret_control" / "mechanism_limits.json",
-            DEFAULT_STARTUP_POSE, workspace.home_corridor.yaw_center_rad,
-            workspace.home_corridor.home_pitch_rad, 45.,
-        )
-        self.assertAlmostEqual(proposed.motor_zero_rad, calibration.motor_zero_rad)
-        self.assertAlmostEqual(hard[1][0], workspace.home_corridor.home_pitch_rad)
 
     def test_yaw_design_limit_uses_calibration_and_preserves_stricter_limits(self):
         for sign in (-1, 1):
@@ -125,28 +113,6 @@ class MotorLimitTests(unittest.TestCase):
         feedback[0x03] = center
         backend.send_targets({0x03: (center, 0.2, 0.0, 0.0), 0x01: (home, 0.2, 0.0, 0.0)})
         self.assertAlmostEqual(sent[0x01], home)
-
-    def test_recovery_trace_serializes_numpy_float32(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "mechanism_limits_trace_latest.json"
-            _save_recovery_trace(
-                path,
-                samples=[
-                    {
-                        "elapsed_s": np.float32(0.05),
-                        "yaw_rad": np.float32(0.52),
-                        "pitch_rad": np.float32(-0.31),
-                    }
-                ],
-                duration_s=np.float32(30.0),
-                sample_hz=np.float32(20.0),
-            )
-
-            stored = json.loads(path.read_text(encoding="utf-8"))
-            self.assertAlmostEqual(stored["samples"][0]["elapsed_s"], 0.05, places=6)
-            self.assertAlmostEqual(stored["samples"][0]["yaw_rad"], 0.52, places=6)
-            self.assertAlmostEqual(stored["samples"][0]["pitch_rad"], -0.31, places=6)
-            self.assertFalse(path.with_suffix(".json.tmp").exists())
 
     def test_default_limits_are_loaded_in_motor_space(self):
         limits = load_motor_limits()

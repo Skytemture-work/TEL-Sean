@@ -101,8 +101,8 @@ def main(
     parser.add_argument(
         "--web-port",
         type=int,
-        default=0,
-        help="提供即時影像、孔位與砲塔資料儀表板的 port（例如 8080）",
+        default=8080,
+        help="即時影像、孔位與砲塔資料儀表板的 port（預設 8080；0 停用）",
     )
     parser.add_argument(
         "--virtual-board",

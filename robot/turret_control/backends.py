@@ -218,8 +218,8 @@ class DamiaoSerialBackend:
                 position_limits = load_motor_limits()
             except FileNotFoundError as exc:
                 raise RuntimeError(
-                    "mechanism_limits.json is missing; run "
-                    "turret_control.run_limit_calibration before enabling motors"
+                    "mechanism_limits.json is missing; restore the verified "
+                    "mechanism limits before enabling motors"
                 ) from exc
         self._position_limits = {
             int(motor_id): (float(bounds[0]), float(bounds[1]))

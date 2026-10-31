@@ -52,7 +52,6 @@ python3 -m turret_control.run_board_real \
   --model ./best.pt \
   --device 0 \
   --port /dev/ttyACM0 \
-  --web-port 8080 \
   --match-phase upper \
   --cooldown 1.0 \
   --target-timeout 6.0
@@ -64,6 +63,7 @@ python3 -m turret_control.run_board_real \
 - `--match-phase` 依當場半場改成 `upper` 或 `lower`。
 - `--target-timeout` 是一個孔等不到成功發射時的略過秒數；整合測試可設 `0` 停用自動略過。
 - `--headless` 可關閉本機 OpenCV 視窗，HTTP 儀表板仍可用。
+- 網頁儀表板預設使用 `8080` 埠；`--web-port 其他埠號` 可更改，`--web-port 0` 可停用。
 - 競賽計分模式預設啟用，按 `G` 開始辨識紅燈；`--no-score-mode` 可切換一般模式。既有的 `--score-mode` 參數仍可使用。
 - 競賽模式啟用少孔遮蔽備援：最近一次穩定 PnP 後最多 1 秒內，若仍有至少一個符合位置、尺寸及信心度的孔，會以原距離和朝向做平移追蹤；單次降級期間最多成功發射一球。每兩次有效姿態間隔不得超過 0.25 秒，之後需重新取得穩定 PnP。
 - 模型預設依序尋找 `best_v2.pt`、`best.pt`、訓練目錄下的 `best.pt`，正式整合仍建議明確傳 `--model`。
@@ -187,7 +187,7 @@ Callable[[BoardTarget], bool]
 
 ## 4. 狀態與影像的讀取方式
 
-啟用 `--web-port 8080` 後：
+儀表板預設啟用於 `8080` 埠，提供：
 
 | 路徑 | 內容 |
 |---|---|

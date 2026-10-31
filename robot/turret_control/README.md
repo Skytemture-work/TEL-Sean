@@ -64,7 +64,6 @@ YOLO 若只有一個類別，`classify_by_size()` 會用「大孔是小孔的 2 
 | `ballistics.py` | 視差修正 + 重力彈道求解（純數學） |
 | `backends.py` | `MockMotorBackend`（安全模擬）與 `DamiaoSerialBackend`（實機） |
 | `limits.py` | 馬達座標安全範圍讀寫與最後一道軟體限位 |
-| `run_limit_calibration.py` | 失能後手動示教 home 與水平／垂直安全活動範圍 |
 | `controller.py` | 接合瞄準與馬達輸出 |
 | `control_loop.py` | 200 Hz 固定頻率迴圈 + 偵測執行緒 |
 | `board.py` | 靶板模型：測距、尺寸分類、接戰排序 |
@@ -111,15 +110,7 @@ python3 -m turret_control.run_vertical_panel --cli
 # 垂直軸預設使用實機已驗證可移動的位置－速度模式；必要時才覆寫為 MIT
 python3 -m turret_control.run_vertical_panel --cli --control-mode mit
 
-# 手動示教：失能兩顆馬達；完成 home 後，用手沿安全外框走一圈
-# 程式先收集 30 秒；若尚未回到起點會繼續錄，直到閉合或再過 30 秒
-# 原始樣本會先自動存到 mechanism_limits_trace_latest.json，再進行輪廓驗證
-# 預設從整個輪廓向內保留 0.5 個馬達角度，不會把工作區錯當成長方形
-python3 -m turret_control.run_limit_calibration
-# 若只重測活動範圍、不更新 home 原點：
-python3 -m turret_control.run_limit_calibration --skip-origin
-
-# 水平設計上限由校正原點換算為 -34.5°～+34.5°；不必依靠描邊取得左右極限。
+# 水平設計上限由校正原點換算為 -34.5°～+34.5°。
 # 已記錄的雙軸工作區及較嚴格的限位仍生效，實際可達範圍可能較窄。
 # 0°～30° 水平 ±34.5°；30°～33° 依三角形收窄；33°～home 水平 ±10°。
 
@@ -142,8 +133,9 @@ python3 -m turret_control.run_yolo_demo --board --device cpu --zed-uvc
 # 預覽視窗按 p 可在終端列印目前完整計畫，按 q/Esc 離開
 
 # 實機自動瞄準 + 區網即時儀表板（會連接並使能真實馬達，先確認急停）
-python3 -m turret_control.run_board_real --web-port 8080
+python3 -m turret_control.run_board_real
 # 同一區網的電腦／平板開啟：http://<robot-ip>:8080
+# 儀表板預設啟用；--web-port 其他埠號 可更改，--web-port 0 可停用
 
 # 測試
 python3 -m unittest discover -s tests
@@ -172,7 +164,7 @@ python3 -m unittest discover -s tests
 絕對角度，正值向右、負值向左，限制會由 `mechanism_limits.json` 的水平馬達端點換算（目前暫值為
 `-34.5°～+34.5°`）。水平移動前會依起點及目標的最大水平偏角選擇避讓仰角，完成水平移動後再回復目標仰角。`home` 指令先水平置中，再回到已記錄的 home 編碼器位置。
 
-工作區依操作人員實測確認的物理角度換算：仰角 `0°～30°` 水平 `±34.5°`；高於 `30°` 後依三角形從 `±25°` 收窄至 `33°` 的 `±10°`；`33°` 到記錄的 home 為 `±10°` 通道。此多邊形已是確認後的軟體邊界，因此未再額外內縮 `0.5°`；水平 `±34.5°` 相對 `±35°` 機構設計仍保有 `0.5°`。此前的多邊形與原始描邊資料保留在限制檔中。`1:1` 垂直比例仍需以中間角度驗證。
+工作區依操作人員實測確認的物理角度換算：仰角 `0°～30°` 水平 `±34.5°`；高於 `30°` 後依三角形從 `±25°` 收窄至 `33°` 的 `±10°`；`33°` 到記錄的 home 為 `±10°` 通道。此多邊形已是確認後的軟體邊界，因此未再額外內縮 `0.5°`；水平 `±34.5°` 相對 `±35°` 機構設計仍保有 `0.5°`。此前的多邊形與原始描邊資料保留在限制檔中。垂直比例 `1:1` 已由操作人員確認。
 實機方向校正為 `yaw_sign=-1`：
 馬達編碼器角度減少時，砲塔實際向右。
 
@@ -180,7 +172,7 @@ CLI 的 `aim <水平角度> <垂直角度>` 與自動瞄準共用分階段避讓
 `enable` 與 `disable` 會在輸入後直接執行，不會再要求輸入 `yes`；其中 `disable`
 可能讓垂直軸下墜，輸入前仍需先支撐機構。一般的 `set`、`yaw`、`aim` 也都不需要確認。
 
-需要重新量測水平基準時，在 CLI 失能並支撐機構後，使用水平儀調整砲口仰角至 `0°`，輸入 `capture-level` 並確認。此操作保留已記錄的 home 馬達位置及比例；若要重新記錄 home 與工作區，使用 `run_limit_calibration`。舊校正檔會備份成 `startup_pose.json.bak`，馬達內部零點不變。
+需要重新量測水平基準時，在 CLI 失能並支撐機構後，使用水平儀調整砲口仰角至 `0°`，輸入 `capture-level` 並確認。此操作保留已記錄的 home 馬達位置及比例；若日後需要更改 home 或工作區，應重新確認機構及更新相應設定，目前沒有自動錄製工具。舊校正檔會備份成 `startup_pose.json.bak`，馬達內部零點不變。
 
 `--board` 模式只開相機與 YOLO，不開 CAN、不建立馬達控制器；必須偵測到 12
 個孔且尺寸分類成功，畫面才會顯示 `BOARD READY`。這是接上真機構前的影像流程驗證。
