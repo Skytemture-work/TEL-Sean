@@ -1,6 +1,6 @@
 {
   "captured_at": "2026-10-27T23:10:39+08:00",
-  "source": "manual closed-outline workspace trace from DAMIAO motor feedback",
+  "source": "manual workspace trace plus operator-confirmed 30–35 degree triangular activity extension",
   "units": {
     "motor_position": "rad",
     "display": "deg"
@@ -31,7 +31,7 @@
       "max_rad": 0.22106507420539856,
       "min_motor_deg": -31.965773674185332,
       "max_motor_deg": 12.666095749715698,
-      "limit_source": "0–30 degree activity range; 30–45 degree centered home transit only"
+      "limit_source": "0–35 degree activity range; 33–45 degree centered home corridor"
     }
   },
   "workspace": {
@@ -40,6 +40,13 @@
     "pitch_motor_id": "0x01",
     "margin_motor_deg": 0.5,
     "simplify_motor_deg": 0.25,
+    "activity_extension": {
+      "type": "linear_yaw_pitch_triangle",
+      "base_pitch_deg": 30.0,
+      "apex_pitch_deg": 35.0,
+      "base_yaw_half_width_deg": 25.0,
+      "apex_yaw_deg": 0.0
+    },
     "closure_gap_motor_deg": 1.001539183305738,
     "closure_seam_trimmed_samples": 222,
     "symmetry_yaw_center_rad": 0.5170900821685791,
@@ -47,8 +54,8 @@
       "yaw_center_rad": 0.5170900821685791,
       "yaw_tolerance_motor_deg": 10.0,
       "home_pitch_rad": -0.5579079985618591,
-      "transition_pitch_rad": -0.2982502076394398,
-      "reference_source": "45-degree home with centered transit to 30-degree activity range; physical yaw tolerance ±10 degrees, target yaw 0"
+      "transition_pitch_rad": -0.35018184582392375,
+      "reference_source": "45-degree home with centered transit to 33-degree home corridor; physical yaw tolerance ±10 degrees, target yaw 0"
     },
     "hard_limit_violation_count": 51,
     "previous_hard_limits_rad": {
@@ -67,20 +74,32 @@
     },
     "vertices_rad": [
       {
-        "yaw_rad": -0.0937751560294362,
-        "pitch_rad": -0.3069769538994115
+        "yaw_rad": 1.128129853291794,
+        "pitch_rad": 0.22996625339057
       },
       {
-        "yaw_rad": 1.1279553203665944,
-        "pitch_rad": -0.3069769538994115
+        "yaw_rad": -0.093949688954635,
+        "pitch_rad": 0.22996625339057
       },
       {
-        "yaw_rad": 1.1279553203665944,
-        "pitch_rad": 0.24280919134616852
+        "yaw_rad": -0.093949688954636,
+        "pitch_rad": -0.307151486824611
       },
       {
-        "yaw_rad": -0.0937751560294362,
-        "pitch_rad": 0.24280919134616852
+        "yaw_rad": 0.079883450758677,
+        "pitch_rad": -0.307151486824611
+      },
+      {
+        "yaw_rad": 0.517090082168579,
+        "pitch_rad": -0.393877483643946
+      },
+      {
+        "yaw_rad": 0.954296713578481,
+        "pitch_rad": -0.307151486824611
+      },
+      {
+        "yaw_rad": 1.128129853291794,
+        "pitch_rad": -0.307151486824611
       }
     ],
     "captured_boundary_samples_rad": [
@@ -3249,13 +3268,13 @@
       -0.06466010212898254,
       1.101892113685608
     ],
-    "pitch_activity_limit_source": "operator specified physical elevation 0 to 30 degrees; 45-degree home with centered vertical-only transit",
+    "pitch_activity_limit_source": "operator specified physical elevation 0 to 35 degrees with a 30–35 degree yaw triangle; 33–45 degree centered home corridor",
     "inactive_calibration_home_corridor": {
       "yaw_center_rad": 0.5170900821685791,
       "yaw_tolerance_motor_deg": 0.25,
       "home_pitch_rad": -0.5579079985618591,
-      "transition_pitch_rad": -0.2982502076394398,
-      "reference_source": "45-degree home; centered transit to 30-degree activity range"
+      "transition_pitch_rad": -0.35018184582392375,
+      "reference_source": "45-degree home; centered transit to 33-degree home corridor"
     }
   }
 }

@@ -10,7 +10,7 @@
 #   VESC_LEFT_PORT / VESC_RIGHT_PORT：射擊雙馬達轉速控制（UART）
 #
 # 注意：
-# 1. ESP32 的 yaw/pitch (0~100) 由 Xavier 轉成 DM 目標角：Yaw -35~+35°、Pitch 0~45°。
+# 1. ESP32 的 yaw/pitch (0~100) 由 Xavier 轉成 DM 目標角：Yaw -34.5~+34.5°、Pitch 0~45°。
 # 2. FIRE 每次由 0 變 1，觸發一個射擊循環。
 # 3. 每個射擊循環包含 1700 -> 3000 pulses -> 反向回零 -> 正向回零。
 # 4. 每格累積 3 次循環後，才允許彈藥倉轉動一格。
@@ -57,8 +57,8 @@ DM_MAX_TRACKING_ERROR_DEG = 10.0
 DM_STALL_TIMEOUT_S = 2.0
 DM_MIN_PITCH_DEG = 0.0
 DM_MAX_PITCH_DEG = 45.0
-DM_MIN_YAW_DEG = -35.0
-DM_MAX_YAW_DEG = 35.0
+DM_MIN_YAW_DEG = -34.5
+DM_MAX_YAW_DEG = 34.5
 DM_MAX_PITCH_FOR_YAW_DEG = 35.0
 
 # 雙 VESC 射擊馬達：請依實際裝置名稱調整。
@@ -480,7 +480,7 @@ class ManualController:
 
     @staticmethod
     def _packet_axis_to_degrees(yaw_value, pitch_value):
-        """ESP32 yaw/pitch 0..100 -> 水平角 -35..+35°、砲口仰角 0..45°。"""
+        """ESP32 yaw/pitch 0..100 -> 水平角 -34.5..+34.5°、砲口仰角 0..45°。"""
         yaw_value = max(0, min(100, int(yaw_value)))
         pitch_value = max(0, min(100, int(pitch_value)))
         yaw_deg = DM_MIN_YAW_DEG + (DM_MAX_YAW_DEG - DM_MIN_YAW_DEG) * yaw_value / 100.0

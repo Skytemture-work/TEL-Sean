@@ -11,6 +11,7 @@ from typing import Iterable, Tuple
 from .backends import DamiaoSerialBackend
 from .limits import (
     DEFAULT_LIMITS_PATH,
+    PITCH_MAX_DEG,
     WorkspaceLimit,
     load_motor_limits,
     load_workspace_limit,
@@ -67,24 +68,32 @@ def _build_boundary_path(
 ) -> Tuple[Tuple[float, float], ...]:
     if workspace.home_corridor is None:
         raise ValueError("workspace does not contain the calibrated 45-degree home corridor")
-    backoff_rad = math.radians(backoff_motor_deg)
-    points = tuple(
-        _boundary_point(workspace, vertex, backoff_rad)
-        for vertex in workspace.vertices
-    )
-    if len(points) < 3:
+    requested_backoff_rad = math.radians(backoff_motor_deg)
+    if len(workspace.vertices) < 3:
         raise ValueError("workspace boundary needs at least three waypoints")
-    # Check each complete edge densely before any motor can be enabled.
-    for start, end in zip(points, points[1:] + points[:1]):
-        for step in range(101):
-            fraction = step / 100.0
-            point = (
+
+    # A concave extension, such as the 30–35 degree triangle, can need more
+    # radial backoff at its inward corners than on its straight edges.  Grow
+    # the requested backoff conservatively until the complete waypoint loop is
+    # itself inside the stored inset workspace.
+    for extra_backoff_deg in (0.0, 0.1, 0.2, 0.4, 0.8, 1.2):
+        backoff_rad = requested_backoff_rad + math.radians(extra_backoff_deg)
+        points = tuple(
+            _boundary_point(workspace, vertex, backoff_rad)
+            for vertex in workspace.vertices
+        )
+        # Check each complete edge densely before any motor can be enabled.
+        if all(
+            workspace_base_contains(
+                workspace,
                 start[0] + (end[0] - start[0]) * fraction,
                 start[1] + (end[1] - start[1]) * fraction,
             )
-            if not workspace_base_contains(workspace, *point):
-                raise ValueError("generated boundary edge leaves the safe inset workspace")
-    return points
+            for start, end in zip(points, points[1:] + points[:1])
+            for fraction in (step / 100.0 for step in range(101))
+        ):
+            return points
+    raise ValueError("generated boundary edge leaves the safe inset workspace")
 
 
 def _feedback_pair(motors: DamiaoSerialBackend) -> Tuple[float, float]:
@@ -254,11 +263,19 @@ def main() -> None:
     if workspace is None:
         raise SystemExit("找不到多邊形工作區")
     if workspace.home_corridor is None:
-        raise SystemExit("45° home 巡邊不適用目前 0°～30° 的垂直活動範圍")
+        raise SystemExit("45° home 巡邊不適用目前 0°～35° 的垂直活動範圍")
     yaw_calibration = load_yaw_calibration(args.startup_pose)
     pitch_calibration = load_pitch_calibration(args.startup_pose)
-    if math.degrees(pitch_calibration.muzzle_from_motor(workspace.home_corridor.home_pitch_rad)) > 30.0:
-        raise SystemExit("45° home 巡邊不適用目前 0°～30° 的垂直活動範圍")
+    transition_pitch = math.degrees(
+        pitch_calibration.muzzle_from_motor(
+            workspace.home_corridor.transition_pitch_rad
+        )
+    )
+    if transition_pitch > PITCH_MAX_DEG + 1e-6:
+        raise SystemExit(
+            "45° home 巡邊不適用目前 0°～35° 的垂直活動範圍："
+            f"轉接角為 {transition_pitch:.2f}°"
+        )
     boundary = _build_boundary_path(workspace, args.boundary_backoff_motor_deg)
     home = (
         workspace.home_corridor.yaw_center_rad,

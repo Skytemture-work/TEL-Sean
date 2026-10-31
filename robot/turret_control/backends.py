@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional, Protocol, Sequence, Tuple
 
 from .limits import (
+    PITCH_MAX_DEG,
     WorkspaceLimit,
     clamp_motor_position,
     clamp_workspace_target,
@@ -544,18 +545,18 @@ class DamiaoSerialBackend:
             if motor_id == 0x01 and hasattr(self, "_pitch_calibration"):
                 calibration = self._pitch_calibration
                 desired_elevation = calibration.muzzle_from_motor(position)
-                if desired_elevation > math.radians(30.0) and not getattr(self, "_home_return_requested", False):
+                if desired_elevation > math.radians(PITCH_MAX_DEG) and not getattr(self, "_home_return_requested", False):
                     state = self.get_state(motor_id)
                     measured = (
                         calibration.muzzle_from_motor(state.position_rad)
                         if state is not None and state.err is not None
                         and state.err < 0x8 and math.isfinite(state.position_rad)
-                        else math.radians(30.0)
+                        else math.radians(PITCH_MAX_DEG)
                     )
                     # Home and the vertical-only exit corridor may be held or
                     # exited. Ordinary commands cannot raise beyond the larger
-                    # of 30° and the actual feedback position.
-                    allowed_elevation = min(desired_elevation, max(math.radians(30.0), measured))
+                    # of 35° and the actual feedback position.
+                    allowed_elevation = min(desired_elevation, max(math.radians(PITCH_MAX_DEG), measured))
                     position = calibration.motor_from_muzzle(allowed_elevation)
             prepared[motor_id] = (position, speed, velocity, torque)
 

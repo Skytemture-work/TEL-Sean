@@ -25,7 +25,13 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 
 from .backends import DamiaoSerialBackend
-from .limits import PITCH_MAX_DEG, load_motor_limits
+from .limits import (
+    HOME_CORRIDOR_TRANSITION_DEG,
+    PITCH_ACTIVITY_TRANSITION_DEG,
+    PITCH_MAX_DEG,
+    load_motor_limits,
+    max_activity_pitch_for_yaw_deg,
+)
 from .pitch import (
     PitchCalibration,
     load_pitch_calibration,
@@ -47,6 +53,7 @@ MAX_TURRET_YAW_DEG = 34.5
 MAX_PITCH_FOR_YAW_DEG = 35.0
 YAW_RELEASE_MARGIN_DEG = 0.5
 YAW_CLEARANCE_PITCH_DEG = MAX_PITCH_FOR_YAW_DEG - YAW_RELEASE_MARGIN_DEG
+HOME_CORRIDOR_YAW_TOLERANCE_DEG = 10.0
 YAW_MOVE_EPSILON_DEG = 0.05
 SEQUENCE_ARRIVAL_TOLERANCE_DEG = 0.5
 
@@ -172,9 +179,9 @@ class MotorWorker:
             )
         self.yaw_clearance_pitch_rad = math.radians(yaw_clearance_pitch_deg)
         self.position_limits = dict(position_limits or load_motor_limits())
-        # The mechanism rule is strictly "above 35 degrees is forbidden".
-        # Command 34.5 degrees for a little settling margin, but release yaw as
-        # soon as measured pitch reaches the valid 35.0-degree boundary.
+        # 35 degrees is the centered apex of the normal activity region.  The
+        # actual clearance target is calculated from the requested yaw so the
+        # 30–35 degree triangular workspace is respected.
         self.yaw_release_pitch_rad = self.max_pitch_for_yaw_rad
         self.sequence_arrival_tolerance_rad = math.radians(
             SEQUENCE_ARRIVAL_TOLERANCE_DEG
@@ -293,6 +300,17 @@ class MotorWorker:
                 f"{math.degrees(self.min_muzzle_rad):+.1f}° 到 "
                 f"{math.degrees(self.max_muzzle_rad):+.1f}°"
             )
+        if (
+            self.yaw_calibration is not None
+            and self._yaw_feedback_position_rad is not None
+        ):
+            current_yaw_rad = self.yaw_calibration.muzzle_from_motor(
+                self._yaw_feedback_position_rad
+            )
+            if not self._pose_allowed_by_activity(current_yaw_rad, muzzle_rad):
+                raise ValueError(
+                    self._pose_limit_error(math.degrees(current_yaw_rad), muzzle_deg)
+                )
 
         if self._motors is not None:
             self._motors.set_home_return(False)
@@ -336,18 +354,59 @@ class MotorWorker:
             error=None,
         )
 
+    def _clearance_pitch_for_yaw(self, yaw_rad: float) -> float:
+        """Return a margin-safe pitch for the requested horizontal target."""
+
+        boundary = math.radians(self._activity_pitch_limit_for_yaw(yaw_rad))
+        return max(
+            self.min_muzzle_rad,
+            boundary - math.radians(YAW_RELEASE_MARGIN_DEG),
+        )
+
+    def _activity_pitch_limit_for_yaw(self, yaw_rad: float) -> float:
+        """Return the triangle's normal-activity pitch ceiling."""
+
+        return max_activity_pitch_for_yaw_deg(
+            math.degrees(yaw_rad),
+            activity_max_deg=math.degrees(self.max_pitch_for_yaw_rad),
+            transition_deg=PITCH_ACTIVITY_TRANSITION_DEG,
+        )
+
+    def _pose_allowed_by_activity(self, yaw_rad: float, muzzle_rad: float) -> bool:
+        """Check the normal triangle or the centered high-pitch corridor."""
+
+        pitch_deg = math.degrees(muzzle_rad)
+        if pitch_deg <= self._activity_pitch_limit_for_yaw(yaw_rad) + 1e-6:
+            return True
+        return (
+            pitch_deg >= HOME_CORRIDOR_TRANSITION_DEG - 1e-6
+            and abs(math.degrees(yaw_rad))
+            <= HOME_CORRIDOR_YAW_TOLERANCE_DEG + 1e-6
+        )
+
+    @staticmethod
+    def _pose_limit_error(yaw_deg: float, muzzle_deg: float) -> str:
+        return (
+            f"水平 {yaw_deg:+.1f}° 與垂直 {muzzle_deg:.1f}° 的組合超出活動區；"
+            "30°～35° 的活動範圍會隨水平角收窄，33°以上只能在水平 ±10° home corridor"
+        )
+
     def _begin_yaw_clearance_sequence(self, restore_muzzle_rad: float) -> None:
-        """Lower pitch; start yaw below 35 degrees; then finish the final pose."""
+        """Lower into the yaw-dependent activity region, then restore pitch."""
         self._yaw_sequence_phase = "clearance"
         self._yaw_restore_muzzle_rad = restore_muzzle_rad
+        self.yaw_clearance_pitch_rad = self._clearance_pitch_for_yaw(
+            self._yaw_target_angle_rad
+        )
+        self.yaw_release_pitch_rad = self.yaw_clearance_pitch_rad
         active_pitch_rad = (
             restore_muzzle_rad
-            if restore_muzzle_rad < self.max_pitch_for_yaw_rad
+            if restore_muzzle_rad < self.yaw_clearance_pitch_rad
             else self.yaw_clearance_pitch_rad
         )
         self._apply_pitch_target(
             active_pitch_rad,
-            f"水平自動避讓：垂直先降到 {math.degrees(self.max_pitch_for_yaw_rad):.1f}° 以下，確認安全後雙軸同時移動",
+            f"水平自動避讓：依目標水平角先降到 {math.degrees(self.yaw_clearance_pitch_rad):.1f}° 以下，確認安全後雙軸同時移動",
         )
         self._publish(
             yaw_sequence_phase="clearance",
@@ -428,15 +487,18 @@ class MotorWorker:
         feedback_pitch = self.pitch_calibration.muzzle_from_motor(
             self._feedback_position_rad
         )
+        clearance_pitch = self._clearance_pitch_for_yaw(yaw_rad)
         restore_muzzle = (
             self._yaw_restore_muzzle_rad
             if self._yaw_sequence_phase == "restoring"
             and self._yaw_restore_muzzle_rad is not None
             else self._target_muzzle_rad
         )
+        if not self._pose_allowed_by_activity(yaw_rad, restore_muzzle):
+            raise ValueError(self._pose_limit_error(yaw_deg, math.degrees(restore_muzzle)))
         if (
-            feedback_pitch > self.max_pitch_for_yaw_rad
-            or restore_muzzle >= self.max_pitch_for_yaw_rad
+            feedback_pitch > clearance_pitch
+            or restore_muzzle >= clearance_pitch
         ):
             self._begin_yaw_clearance_sequence(restore_muzzle)
             return
@@ -470,6 +532,8 @@ class MotorWorker:
                 f"砲口仰角超出安全限制：{math.degrees(self.min_muzzle_rad):.1f}° 到 "
                 f"{math.degrees(self.max_muzzle_rad):.1f}°"
             )
+        if not home_return and not self._pose_allowed_by_activity(yaw_rad, muzzle_rad):
+            raise ValueError(self._pose_limit_error(yaw_deg, muzzle_deg))
         if self._feedback_position_rad is None:
             raise ValueError("尚未取得垂直馬達回饋，禁止雙軸移動")
         if self._yaw_feedback_position_rad is None:
@@ -483,16 +547,17 @@ class MotorWorker:
         )
         yaw_target = self.yaw_calibration.motor_from_muzzle(yaw_rad)
         yaw_move_required = self._yaw_motion_required(yaw_target)
+        clearance_pitch = self._clearance_pitch_for_yaw(yaw_rad)
 
         self._apply_yaw_target(yaw_rad)
         if yaw_move_required and (
-            feedback_pitch > self.max_pitch_for_yaw_rad
-            or muzzle_rad >= self.max_pitch_for_yaw_rad
+            feedback_pitch > clearance_pitch
+            or muzzle_rad >= clearance_pitch
         ):
             self._begin_yaw_clearance_sequence(muzzle_rad)
             self._publish(
                 status=(
-                    f"雙軸自動避讓：先到 {math.degrees(self.yaw_clearance_pitch_rad):.1f}°，"
+                    f"雙軸自動避讓：依水平目標先到 {math.degrees(self.yaw_clearance_pitch_rad):.1f}°，"
                     f"水平轉到 {yaw_deg:+.2f}°，再到垂直 {muzzle_deg:+.2f}°"
                 ),
                 error=None,
@@ -526,7 +591,10 @@ class MotorWorker:
                 self._yaw_sequence_phase = "rotating"
                 self._publish(
                     yaw_sequence_phase="rotating",
-                    status=f"垂直已進入 {math.degrees(self.max_pitch_for_yaw_rad):.1f}° 活動範圍；開始水平、垂直同時移動",
+                    status=(
+                        "垂直已進入水平目標的安全活動範圍；"
+                        "開始水平、垂直同時移動"
+                    ),
                     error=None,
                 )
             return
@@ -546,7 +614,7 @@ class MotorWorker:
             if restore is None:
                 self._clear_yaw_sequence()
                 return
-            if restore >= self.max_pitch_for_yaw_rad:
+            if restore >= self.yaw_clearance_pitch_rad:
                 stage_motor = self.pitch_calibration.motor_from_muzzle(
                     self.yaw_clearance_pitch_rad
                 )
@@ -555,13 +623,13 @@ class MotorWorker:
                     <= self.sequence_arrival_tolerance_rad
                 )
                 pitch_feedback_arrived = (
-                    feedback_pitch <= self.max_pitch_for_yaw_rad
+                    feedback_pitch <= self.yaw_clearance_pitch_rad
                 )
                 if not pitch_command_arrived or not pitch_feedback_arrived:
                     return
             if command_arrived and feedback_arrived:
                 self._yaw_sequence_phase = "restoring"
-                if restore >= self.max_pitch_for_yaw_rad:
+                if restore >= self.yaw_clearance_pitch_rad:
                     self._apply_pitch_target(
                         restore,
                         "水平已到位；回復最終垂直角度",

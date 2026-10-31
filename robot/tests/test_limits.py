@@ -53,7 +53,7 @@ class MotorLimitTests(unittest.TestCase):
             lower, upper = constrain_pitch_activity_limit((-10.0, 10.0), calibration)
             physical = sorted(math.degrees(calibration.muzzle_from_motor(v)) for v in (lower, upper))
             self.assertAlmostEqual(physical[0], 0.0)
-            self.assertAlmostEqual(physical[1], 30.0)
+            self.assertAlmostEqual(physical[1], 35.0)
         backend = DamiaoSerialBackend.__new__(DamiaoSerialBackend)
         backend._motors = {0x01: object()}
         backend._position_limits = {0x01: (0.0, 0.6)}
@@ -94,7 +94,7 @@ class MotorLimitTests(unittest.TestCase):
         feedback[0x01] = pitch.motor_from_muzzle(math.radians(20))
         feedback[0x03] = center
         backend.send_targets({0x03: (center, 0.2, 0.0, 0.0), 0x01: (home, 0.2, 0.0, 0.0)})
-        self.assertAlmostEqual(sent[0x01], pitch.motor_from_muzzle(math.radians(30)))
+        self.assertAlmostEqual(sent[0x01], pitch.motor_from_muzzle(math.radians(35)))
         feedback[0x03] = yaw.motor_from_muzzle(math.radians(9))
         backend.set_home_return(True)
         backend.send_targets({0x03: (center, 0.2, 0.0, 0.0), 0x01: (home, 0.2, 0.0, 0.0)})

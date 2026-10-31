@@ -15,6 +15,7 @@ from turret_control.limits import (
     constrain_pitch_activity_limit,
     load_axis_limits,
     load_workspace_limit,
+    max_activity_pitch_for_yaw_deg,
     workspace_contains,
 )
 from turret_control.run_vertical_panel import (
@@ -85,6 +86,12 @@ class PitchCalibrationTests(unittest.TestCase):
                 workspace, center, pitch.motor_from_muzzle(math.radians(elevation))
             ), msg=f"centered elevation {elevation}° is outside workspace")
 
+    def test_activity_pitch_limit_narrows_linearly_with_yaw(self):
+        self.assertAlmostEqual(max_activity_pitch_for_yaw_deg(0.0), 35.0)
+        self.assertAlmostEqual(max_activity_pitch_for_yaw_deg(12.5), 32.5)
+        self.assertAlmostEqual(max_activity_pitch_for_yaw_deg(25.0), 30.0)
+        self.assertAlmostEqual(max_activity_pitch_for_yaw_deg(34.5), 30.0)
+
     def test_captured_initial_motor_pose_is_forty_five_degrees_up(self):
         calibration = load_pitch_calibration(DEFAULT_STARTUP_POSE)
         initial_motor_rad = calibration.motor_from_muzzle(math.radians(45.0))
@@ -104,19 +111,33 @@ class PitchCalibrationTests(unittest.TestCase):
             for value in (config.pitch_min_rad, config.pitch_max_rad)
         )
         self.assertGreaterEqual(physical_limits[0], 0.0)
-        self.assertAlmostEqual(physical_limits[1], 30.0)
-        self.assertAlmostEqual(max(math.degrees(calibration.muzzle_from_motor(v)) for v in activity), 30.0)
+        self.assertAlmostEqual(physical_limits[1], 35.0)
+        self.assertAlmostEqual(max(math.degrees(calibration.muzzle_from_motor(v)) for v in activity), 35.0)
 
     def test_home_exit_corridor_allows_ten_degrees_yaw_above_activity_range(self):
         yaw = load_yaw_calibration(DEFAULT_STARTUP_POSE)
         pitch = load_pitch_calibration(DEFAULT_STARTUP_POSE)
         workspace = load_workspace_limit()
-        for elevation in (30.1, 35.0, 45.0):
+        pitch_pos = pitch.motor_from_muzzle(math.radians(32.5))
+        for angle in (-10.0, 0.0, 10.0):
+            self.assertTrue(
+                workspace_contains(workspace, yaw.motor_from_muzzle(math.radians(angle)), pitch_pos)
+            )
+        for angle in (-20.0, 20.0):
+            self.assertFalse(
+                workspace_contains(workspace, yaw.motor_from_muzzle(math.radians(angle)), pitch_pos)
+            )
+
+        for elevation in (33.0, 34.0, 35.0, 45.0):
             pitch_pos = pitch.motor_from_muzzle(math.radians(elevation))
             for angle in (-10.0, 0.0, 10.0):
-                self.assertTrue(workspace_contains(workspace, yaw.motor_from_muzzle(math.radians(angle)), pitch_pos))
+                self.assertTrue(
+                    workspace_contains(workspace, yaw.motor_from_muzzle(math.radians(angle)), pitch_pos)
+                )
             for angle in (-10.1, 10.1):
-                self.assertFalse(workspace_contains(workspace, yaw.motor_from_muzzle(math.radians(angle)), pitch_pos))
+                self.assertFalse(
+                    workspace_contains(workspace, yaw.motor_from_muzzle(math.radians(angle)), pitch_pos)
+                )
 
     def test_explicit_home_centers_before_rising_above_activity_range(self):
         pitch = PitchCalibration(motor_zero_rad=0.2, motor_sign=-1)
@@ -169,13 +190,13 @@ class PitchCalibrationTests(unittest.TestCase):
         )
         self.assertIsNone(worker.snapshot().yaw_sequence_phase)
 
-        worker._set_target(45.0)
+        worker._set_target(30.5)
         worker._feedback_position_rad = pitch.motor_from_muzzle(math.radians(45.0))
         worker._set_yaw_target(20.0)
         snapshot = worker.snapshot()
         self.assertEqual(snapshot.yaw_sequence_phase, "clearance")
-        self.assertAlmostEqual(snapshot.target_muzzle_rad, math.radians(34.5))
-        self.assertAlmostEqual(snapshot.yaw_restore_muzzle_rad, math.radians(45.0))
+        self.assertAlmostEqual(snapshot.target_muzzle_rad, math.radians(30.5))
+        self.assertAlmostEqual(snapshot.yaw_restore_muzzle_rad, math.radians(30.5))
         self.assertAlmostEqual(snapshot.yaw_target_angle_rad, math.radians(20.0))
 
         with self.assertRaises(ValueError):
@@ -199,7 +220,7 @@ class PitchCalibrationTests(unittest.TestCase):
         worker._set_aim_targets(-10.0, 36.0)
         snapshot = worker.snapshot()
         self.assertEqual(snapshot.yaw_sequence_phase, "clearance")
-        self.assertAlmostEqual(snapshot.target_muzzle_rad, math.radians(34.5))
+        self.assertAlmostEqual(snapshot.target_muzzle_rad, math.radians(32.5))
         self.assertAlmostEqual(snapshot.yaw_restore_muzzle_rad, math.radians(36.0))
         self.assertAlmostEqual(snapshot.yaw_target_angle_rad, math.radians(-10.0))
 
@@ -209,20 +230,20 @@ class PitchCalibrationTests(unittest.TestCase):
         worker = self.make_worker(pitch, yaw)
         worker._feedback_position_rad = pitch.motor_from_muzzle(math.radians(45.0))
         worker._yaw_feedback_position_rad = yaw.motor_from_muzzle(0.0)
-        worker._set_target(45.0)
+        worker._set_target(30.5)
 
         worker._set_yaw_target(20.0)
         self.assertEqual(worker.snapshot().yaw_sequence_phase, "clearance")
 
-        safe_command = pitch.motor_from_muzzle(math.radians(34.5))
-        boundary_feedback = pitch.motor_from_muzzle(math.radians(35.0))
+        safe_command = pitch.motor_from_muzzle(math.radians(30.5))
+        boundary_feedback = pitch.motor_from_muzzle(math.radians(30.4))
         worker._last_command_rad = safe_command
         worker._feedback_position_rad = boundary_feedback
         worker._update_yaw_clearance_sequence()
         self.assertEqual(worker.snapshot().yaw_sequence_phase, "rotating")
         self.assertAlmostEqual(
             worker.snapshot().target_muzzle_rad,
-            math.radians(34.5),
+            math.radians(30.5),
         )
 
         yaw_target = yaw.motor_from_muzzle(math.radians(20.0))
@@ -231,9 +252,9 @@ class PitchCalibrationTests(unittest.TestCase):
         worker._update_yaw_clearance_sequence()
         snapshot = worker.snapshot()
         self.assertEqual(snapshot.yaw_sequence_phase, "restoring")
-        self.assertAlmostEqual(snapshot.target_muzzle_rad, math.radians(45.0))
+        self.assertAlmostEqual(snapshot.target_muzzle_rad, math.radians(30.5))
 
-        restored_motor = pitch.motor_from_muzzle(math.radians(45.0))
+        restored_motor = pitch.motor_from_muzzle(math.radians(30.5))
         worker._last_command_rad = restored_motor
         worker._feedback_position_rad = restored_motor
         worker._update_yaw_clearance_sequence()
@@ -251,7 +272,7 @@ class PitchCalibrationTests(unittest.TestCase):
         self.assertEqual(snapshot.yaw_sequence_phase, "clearance")
         self.assertAlmostEqual(snapshot.target_muzzle_rad, math.radians(20.0))
 
-        worker._feedback_position_rad = pitch.motor_from_muzzle(math.radians(34.4))
+        worker._feedback_position_rad = pitch.motor_from_muzzle(math.radians(30.4))
         worker._update_yaw_clearance_sequence()
         snapshot = worker.snapshot()
         self.assertEqual(snapshot.yaw_sequence_phase, "rotating")
@@ -264,20 +285,20 @@ class PitchCalibrationTests(unittest.TestCase):
         worker._feedback_position_rad = pitch.motor_from_muzzle(math.radians(45.0))
         worker._yaw_feedback_position_rad = yaw.motor_from_muzzle(0.0)
 
-        worker._set_aim_targets(20.0, 35.0)
+        worker._set_aim_targets(10.0, 35.0)
         snapshot = worker.snapshot()
         self.assertEqual(snapshot.yaw_sequence_phase, "clearance")
-        self.assertAlmostEqual(snapshot.target_muzzle_rad, math.radians(34.5))
+        self.assertAlmostEqual(snapshot.target_muzzle_rad, math.radians(32.5))
         self.assertAlmostEqual(snapshot.yaw_restore_muzzle_rad, math.radians(35.0))
 
-        safe_command = pitch.motor_from_muzzle(math.radians(34.5))
-        boundary_feedback = pitch.motor_from_muzzle(math.radians(35.0))
+        safe_command = pitch.motor_from_muzzle(math.radians(32.5))
+        boundary_feedback = pitch.motor_from_muzzle(math.radians(32.4))
         worker._last_command_rad = safe_command
         worker._feedback_position_rad = boundary_feedback
         worker._update_yaw_clearance_sequence()
         self.assertEqual(worker.snapshot().yaw_sequence_phase, "rotating")
 
-        yaw_target = yaw.motor_from_muzzle(math.radians(20.0))
+        yaw_target = yaw.motor_from_muzzle(math.radians(10.0))
         worker._yaw_last_command_rad = yaw_target
         worker._yaw_feedback_position_rad = yaw_target
         worker._update_yaw_clearance_sequence()
