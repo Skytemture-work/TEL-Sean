@@ -123,9 +123,16 @@ def _sequence_state(position: int, plan_index: int, target: Any) -> str:
     return "pending"
 
 
-def _plan_telemetry(plan: Any, board_plan: Any) -> Dict[str, Any]:
+def _plan_telemetry(
+    plan: Any,
+    board_plan: Any,
+    *,
+    detection_only: bool = False,
+    confirmed_holes=(),
+) -> Dict[str, Any]:
     targets = list(getattr(plan, "targets", ()) or ())
     plan_index = int(getattr(plan, "index", 0)) if plan is not None else 0
+    confirmed_set = set(confirmed_holes or ())
     if plan_index >= len(targets):
         current_position = None
     else:
@@ -136,6 +143,7 @@ def _plan_telemetry(plan: Any, board_plan: Any) -> Dict[str, Any]:
             "hole_id": hole_id,
             "state": "unscheduled",
             "fired_shots": 0,
+            "confirmed_shots": 0,
             "pending_shots": 0,
             "skipped_shots": 0,
             "scheduled_shots": 0,
@@ -154,7 +162,10 @@ def _plan_telemetry(plan: Any, board_plan: Any) -> Dict[str, Any]:
     sequence = []
     for position, target in enumerate(targets):
         hole_id = getattr(target, "hole_id", None) or "H??"
-        state = _sequence_state(position, plan_index, target)
+        if detection_only and position < plan_index and hole_id in confirmed_set:
+            state = "confirmed"
+        else:
+            state = _sequence_state(position, plan_index, target)
         sequence.append(
             {
                 "shot_number": position + 1,
@@ -169,6 +180,8 @@ def _plan_telemetry(plan: Any, board_plan: Any) -> Dict[str, Any]:
         stats["scheduled_shots"] += 1
         if state == "fired":
             stats["fired_shots"] += 1
+        elif state == "confirmed":
+            stats["confirmed_shots"] += 1
         elif state == "skipped":
             stats["skipped_shots"] += 1
         else:
@@ -190,6 +203,8 @@ def _plan_telemetry(plan: Any, board_plan: Any) -> Dict[str, Any]:
             stats["state"] = "pending"
         elif stats["fired_shots"]:
             stats["state"] = "fired"
+        elif stats["confirmed_shots"]:
+            stats["state"] = "confirmed"
         elif stats["skipped_shots"]:
             stats["state"] = "skipped"
 
@@ -204,6 +219,7 @@ def _plan_telemetry(plan: Any, board_plan: Any) -> Dict[str, Any]:
         item["hole_id"] for item in holes if item["pending_shots"] > 0
     ]
     fired_shots = sum(item["fired_shots"] for item in holes)
+    confirmed_shots = sum(item["confirmed_shots"] for item in holes)
     skipped_shots = sum(item["skipped_shots"] for item in holes)
     pending_shots = sum(item["pending_shots"] for item in holes)
 
@@ -211,11 +227,15 @@ def _plan_telemetry(plan: Any, board_plan: Any) -> Dict[str, Any]:
         "index": plan_index,
         "total_shots": len(targets),
         "fired_shots": fired_shots,
+        "confirmed_shots": confirmed_shots,
         "skipped_shots": skipped_shots,
         "pending_shots": pending_shots,
         "remaining_shots": max(0, len(targets) - plan_index),
         "finished": bool(targets) and current_position is None,
         "fired_holes": fired_holes,
+        "confirmed_holes": [
+            item["hole_id"] for item in holes if item["confirmed_shots"] > 0
+        ],
         "unfired_holes": unfired_holes,
         "pending_holes": pending_holes,
         "holes": holes,
@@ -244,12 +264,19 @@ def build_dashboard_snapshot(
     current_yaw_motor_rad: Optional[float] = None,
     current_pitch_motor_rad: Optional[float] = None,
     depth_plane: Any = None,
+    detection_only: bool = False,
+    confirmed_holes=(),
 ) -> Dict[str, Any]:
     """Convert live controller objects into browser-safe telemetry."""
 
     command = getattr(engagement_status, "command", None)
     target = getattr(engagement_status, "target", None)
-    plan_data = _plan_telemetry(plan, board_plan)
+    plan_data = _plan_telemetry(
+        plan,
+        board_plan,
+        detection_only=detection_only,
+        confirmed_holes=confirmed_holes,
+    )
 
     yaw = _axis_telemetry(
         getattr(command, "target_yaw_rad", None),
@@ -303,6 +330,7 @@ def build_dashboard_snapshot(
             "score_mode": bool(score_mode),
             "match_phase": match_phase,
             "frame_size_ok": bool(frame_size_ok),
+            "detection_only": bool(detection_only),
         },
         "vision": {
             "raw_detections": int(raw_detection_count),
@@ -373,6 +401,12 @@ def build_dashboard_snapshot(
             "command_pitch_error_deg": _degrees(
                 getattr(command, "pitch_error_rad", None)
             ),
+            # ``yaw``/``pitch`` are converted back from motor space to the
+            # physical muzzle-axis frame by _axis_telemetry.  Expose these
+            # names explicitly so the UI cannot confuse them with camera
+            # pixel bearings or motor encoder coordinates.
+            "muzzle_yaw_deg": yaw["target_deg"],
+            "muzzle_pitch_deg": pitch["target_deg"],
             "yaw": yaw,
             "pitch": pitch,
         },

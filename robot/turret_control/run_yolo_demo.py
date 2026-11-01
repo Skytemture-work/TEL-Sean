@@ -21,7 +21,7 @@ import cv2
 from .backends import MockMotorBackend
 from .board import EngagementPlan, build_plan
 from .board_surface import detect_dark_board_surface, filter_targets_to_surface
-from .config import TurretConfig
+from .config import TurretConfig, with_zed2_hd720_uvc_calibration
 from .controller import TurretController
 from .detection import boxes_to_board_targets, select_best_box
 from .scoring_light import detect_score_light_scores
@@ -257,6 +257,8 @@ def main() -> None:
         raise SystemExit(f"Cannot open camera /dev/video{args.camera}")
 
     config = TurretConfig()
+    if args.zed_uvc:
+        config = with_zed2_hd720_uvc_calibration(config)
     if args.board:
         run_board_preview(
             model,

@@ -4,7 +4,7 @@ All angles in this package are radians.  Motor IDs, zero positions and limits
 must be measured on the real mechanism before using the CAN backend.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 from pathlib import Path
 from types import SimpleNamespace
@@ -59,14 +59,14 @@ _DEFAULT_PITCH_LIMITS = constrain_pitch_activity_limit(
 
 @dataclass(frozen=True)
 class TurretConfig:
-    # Camera intrinsics.  Replace these with the calibrated camera values.
+    # Default ZED 2 (SN 21947470) HD720 SDK VIEW.LEFT intrinsics.  The SDK
+    # image is rectified, so lens distortion has already been removed.
     image_width_px: int = 1280
     image_height_px: int = 720
-    focal_length_x_px: float = 700.0
-    focal_length_y_px: float = 700.0
-    # Calibrated optical centre.  None keeps the legacy image-centre fallback.
-    camera_principal_x_px: Optional[float] = None
-    camera_principal_y_px: Optional[float] = None
+    focal_length_x_px: float = 527.3349
+    focal_length_y_px: float = 527.3349
+    camera_principal_x_px: Optional[float] = 651.10596
+    camera_principal_y_px: Optional[float] = 371.00671
     # OpenCV order: k1, k2, p1, p2[, k3, ...].  Rectified ZED images use zero.
     camera_distortion_coeffs: Tuple[float, ...] = (0.0, 0.0, 0.0, 0.0, 0.0)
 
@@ -109,6 +109,11 @@ class TurretConfig:
     # yaw-zero frame. The point rotates with the pitch axis.
     pitch_exit_offset_y_m: float = 0.0
     pitch_exit_offset_z_m: float = 0.0
+
+    # Deliberately false until the signed camera-to-axis coordinates and the
+    # camera-to-yaw alignment have been verified against the built mechanism.
+    # The real-board entry point uses this as a hard motor-enable interlock.
+    mechanism_geometry_verified: bool = False
 
     # Mechanical zero: direction of the launcher when the motor is at zero.
     # Defaults are read from startup_pose.json so a manual origin capture also
@@ -384,3 +389,49 @@ class TurretConfig:
             self.pitch_axis_offset_y_m,
             self.pitch_axis_offset_z_m,
         )
+
+
+def with_zed2_hd720_uvc_calibration(config: TurretConfig) -> TurretConfig:
+    """Use the factory raw-left calibration for ZED 2 SN 21947470 UVC frames.
+
+    OpenCV's ZED UVC side-by-side stream is unrectified; callers first crop its
+    left 1280x720 half, then use this profile. SDK ``VIEW.LEFT`` frames should
+    keep the rectified defaults above instead.
+    """
+    if (config.image_width_px, config.image_height_px) != (1280, 720):
+        raise ValueError("ZED 2 UVC calibration is valid only for 1280x720 left frames")
+    return replace(
+        config,
+        focal_length_x_px=529.09,
+        focal_length_y_px=528.88,
+        camera_principal_x_px=646.775,
+        camera_principal_y_px=363.19,
+        camera_distortion_coeffs=(
+            -0.0448952,
+            0.0143729,
+            3.25557e-05,
+            0.000627134,
+            -0.00642685,
+        ),
+    )
+
+
+def with_recorded_mechanism_geometry(config: TurretConfig) -> TurretConfig:
+    """Apply the measured camera-to-axis geometry for real aiming checks.
+
+    These are the signed measurements recorded in ``mechanism_geometry.json``:
+    the camera is pitched 20 degrees above the yaw-axis frame, the yaw axis is
+    101.662 mm behind the camera, and the pitch axis is 72.1 mm above it.
+    Callers should use this explicitly when they intend to enable real motors.
+    """
+    return replace(
+        config,
+        camera_to_yaw_pitch_rad=math.radians(20.0),
+        yaw_axis_offset_x_m=0.0,
+        yaw_axis_offset_y_m=0.0,
+        yaw_axis_offset_z_m=-0.101662,
+        pitch_axis_offset_x_m=0.0,
+        pitch_axis_offset_y_m=0.0721,
+        pitch_axis_offset_z_m=0.0,
+        mechanism_geometry_verified=True,
+    )

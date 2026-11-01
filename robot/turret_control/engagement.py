@@ -87,6 +87,8 @@ class BoardEngagement:
         # the hardware transport again on every tick.
         self._last_fire_attempt_at: Optional[float] = None
         self._target_started_at: Optional[float] = None
+        self._aiming_enabled = True
+        self._aiming_blocked_reason: Optional[str] = None
         self._firing_enabled = True
         self._firing_blocked_reason: Optional[str] = None
         self.shots = 0
@@ -118,6 +120,25 @@ class BoardEngagement:
             reason or "external firing safety gate"
         )
 
+    def set_aiming_enabled(
+        self,
+        enabled: bool,
+        reason: Optional[str] = None,
+    ) -> None:
+        """Enable target tracking only after the vehicle has settled.
+
+        When disabled, the current engagement plan is retained but the turret
+        is commanded to hold its present position.  This keeps the control
+        frames flowing while preventing the aiming loop from chasing a target
+        during vehicle motion.  The firing gate remains independent and must
+        still be enabled separately.
+        """
+
+        self._aiming_enabled = bool(enabled)
+        self._aiming_blocked_reason = None if enabled else (
+            reason or "external aiming safety gate"
+        )
+
     def update(self) -> EngagementStatus:
         """One tick.  Always drives the motors, target or not."""
         now = self._clock()
@@ -138,6 +159,23 @@ class BoardEngagement:
             self._target_started_at = now
 
         target = self.plan.current()
+
+        if not self._aiming_enabled:
+            command = self.turret.update(None)
+            command = replace(
+                command,
+                blocked_reason=self._aiming_blocked_reason,
+            )
+            # Vehicle settling is not a failed target attempt.  Keep the
+            # current plan and restart its timeout once aiming is re-enabled.
+            self._target_started_at = now
+            return EngagementStatus(
+                command=command,
+                target=target,
+                index=self.plan.index,
+                remaining=self.plan.remaining,
+            )
+
         command = self.turret.update(target.to_pixel())
         if not self._firing_enabled:
             command = replace(

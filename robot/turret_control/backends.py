@@ -218,8 +218,8 @@ class DamiaoSerialBackend:
                 position_limits = load_motor_limits()
             except FileNotFoundError as exc:
                 raise RuntimeError(
-                    "mechanism_limits.json is missing; restore the verified "
-                    "mechanism limits before enabling motors"
+                    "mechanism_limits.json is missing; provide or restore the "
+                    "verified motor limits before enabling motors"
                 ) from exc
         self._position_limits = {
             int(motor_id): (float(bounds[0]), float(bounds[1]))
@@ -395,13 +395,26 @@ class DamiaoSerialBackend:
         # frame only after enable can otherwise create a sudden torque/position
         # error from a stale feedback sample.  Pre-loading the current pose and
         # holding it briefly makes startup much softer, especially in MIT mode.
-        self.refresh()
+        # The USB-CAN adapter can deliver the two response frames on different
+        # serial reads.  Retry the read-only status request briefly, but never
+        # enable a motor whose position feedback is still missing.
         startup_positions = {}
+        feedback_deadline = time.monotonic() + 1.0
+        while time.monotonic() < feedback_deadline:
+            self.refresh()
+            startup_positions = {}
+            for motor_id in self._motors:
+                state = self.get_state(motor_id)
+                if state is not None and state.err is not None:
+                    startup_positions[motor_id] = state.position_rad
+            if len(startup_positions) == len(self._motors):
+                break
+            time.sleep(0.01)
         for motor_id in self._motors:
-            state = self.get_state(motor_id)
-            if state is None or state.err is None:
-                raise RuntimeError(f"no feedback from motor 0x{motor_id:02X} before enable")
-            startup_positions[motor_id] = state.position_rad
+            if motor_id not in startup_positions:
+                raise RuntimeError(
+                    f"no feedback from motor 0x{motor_id:02X} before enable"
+                )
 
         if 0x03 in startup_positions and 0x03 in self._position_limits:
             lower, upper = self._position_limits[0x03]

@@ -166,7 +166,7 @@ class DashboardTelemetryTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
 
-        self.assertIn("Vision Fire Control", page)
+        self.assertIn("Vision Detection Preview", page)
         self.assertTrue(status["system"]["online"])
         self.assertEqual(health, b"ok")
 

@@ -55,6 +55,10 @@ class TurretGeometryTests(unittest.TestCase):
         config = TurretConfig(
             image_width_px=1280,
             image_height_px=720,
+            focal_length_x_px=700.0,
+            focal_length_y_px=700.0,
+            camera_principal_x_px=640.0,
+            camera_principal_y_px=360.0,
             yaw_zero_rad=0.0,
             yaw_sign=1,
             pitch_zero_rad=0.0,
@@ -70,6 +74,10 @@ class TurretGeometryTests(unittest.TestCase):
         config = TurretConfig(
             image_width_px=1280,
             image_height_px=720,
+            focal_length_x_px=700.0,
+            focal_length_y_px=700.0,
+            camera_principal_x_px=640.0,
+            camera_principal_y_px=360.0,
             yaw_zero_rad=0.0,
             yaw_sign=1,
             pitch_zero_rad=0.0,

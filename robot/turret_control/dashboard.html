@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
-  <title>TEL Vision Fire Control</title>
+  <title>TEL Vision — 純偵測預覽</title>
   <style>
     :root {
       --bg: #070b12;
@@ -272,6 +272,31 @@
       background: rgba(72, 226, 156, .07);
     }
 
+    .manual-controls {
+      display: flex;
+      gap: 8px;
+      margin: 0 15px 8px;
+    }
+
+    .manual-controls button {
+      flex: 1;
+      min-height: 38px;
+      padding: 8px 10px;
+      border: 1px solid rgba(53, 217, 255, .35);
+      border-radius: 9px;
+      color: var(--text);
+      background: rgba(53, 217, 255, .09);
+      cursor: pointer;
+      font: inherit;
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .manual-controls button:hover { background: rgba(53, 217, 255, .17); }
+    .manual-controls button:disabled { cursor: wait; opacity: .5; }
+    .manual-controls button.reset { border-color: rgba(255, 200, 90, .35); background: rgba(255, 200, 90, .08); }
+    .manual-status { min-height: 18px; margin: 0 15px 11px; color: var(--muted); font-size: 11px; }
+
     .axis-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; padding: 0 15px; }
 
     .axis-card {
@@ -429,8 +454,8 @@
       <div class="brand">
         <div class="brand-mark">TEL</div>
         <div>
-          <h1>Vision Fire Control</h1>
-          <div class="subtitle">REAL-TIME TARGETING / 12-HOLE BOARD</div>
+          <h1>Vision Detection Preview</h1>
+          <div class="subtitle">純偵測／唯讀：下一孔位、位置、距離與角度</div>
         </div>
       </div>
       <div class="connection" id="connection">
@@ -443,8 +468,9 @@
     <section class="summary-grid">
       <article class="summary"><span class="eyebrow">下一孔位</span><strong id="sumNext">—</strong><small id="sumShot">尚未建立計畫</small></article>
       <article class="summary"><span class="eyebrow">目標距離</span><strong id="sumDistance">—</strong><small>相機光軸深度</small></article>
-      <article class="summary"><span class="eyebrow">已發射</span><strong id="sumFired">0</strong><small id="sumFiredHoles">0 個孔位</small></article>
-      <article class="summary"><span class="eyebrow">剩餘球數</span><strong id="sumRemaining">0</strong><small id="sumTotal">共 0 球</small></article>
+      <article class="summary"><span class="eyebrow" id="sumFiredLabel">已發射</span><strong id="sumFired">0</strong><small id="sumFiredMeta">0 個孔位</small></article>
+      <article class="summary"><span class="eyebrow">計畫剩餘</span><strong id="sumRemaining">0</strong><small id="sumTotal">共 0 球</small></article>
+      <article class="summary"><span class="eyebrow">球倉容量</span><strong id="sumCapacity">—</strong><small>實體可裝顆數</small></article>
       <article class="summary"><span class="eyebrow">靶面姿態</span><strong id="sumPose">—</strong><small id="sumPoseMeta">等待 PnP</small></article>
       <article class="summary"><span class="eyebrow">發射閘門</span><strong id="sumGate">鎖定</strong><small id="sumGateMeta">尚未就緒</small></article>
     </section>
@@ -470,7 +496,7 @@
 
       <aside class="panel target-panel">
         <div class="panel-head">
-          <div class="panel-title">即將發射孔位</div>
+          <div class="panel-title">下一個孔位（唯讀計算）</div>
           <div class="panel-meta" id="modeMeta">NORMAL / —</div>
         </div>
         <div class="target-hero">
@@ -484,9 +510,15 @@
 
         <div class="safety" id="safetyMessage">等待目標與姿態資料</div>
 
+        <div class="manual-controls">
+          <button id="confirmNext" type="button">人工確認此孔 → 下一孔</button>
+          <button id="resetPlan" class="reset" type="button">重設順序</button>
+        </div>
+        <div class="manual-status" id="manualStatus">等待可確認的孔位</div>
+
         <div class="axis-grid">
           <section class="axis-card">
-            <div class="axis-name"><span>水平 YAW</span><span class="axis-direction" id="yawDirection">—</span></div>
+            <div class="axis-name"><span>砲口水平角 YAW</span><span class="axis-direction" id="yawDirection">—</span></div>
             <div class="axis-delta" id="yawDelta">—</div>
             <div class="delta-track"><i class="delta-fill" id="yawFill"></i></div>
             <div class="axis-values">
@@ -495,7 +527,7 @@
             </div>
           </section>
           <section class="axis-card">
-            <div class="axis-name"><span>垂直 PITCH</span><span class="axis-direction" id="pitchDirection">—</span></div>
+            <div class="axis-name"><span>砲口垂直角 PITCH</span><span class="axis-direction" id="pitchDirection">—</span></div>
             <div class="axis-delta" id="pitchDelta">—</div>
             <div class="delta-track"><i class="delta-fill" id="pitchFill"></i></div>
             <div class="axis-values">
@@ -509,8 +541,10 @@
           <div class="mini"><span class="eyebrow">水平軸距離</span><b id="yawAxisDistance">—</b></div>
           <div class="mini"><span class="eyebrow">垂直軸距離</span><b id="pitchAxisDistance">—</b></div>
           <div class="mini"><span class="eyebrow">可達性</span><b id="reachable">—</b></div>
-          <div class="mini"><span class="eyebrow">水平命令偏角</span><b id="commandYaw">—</b></div>
-          <div class="mini"><span class="eyebrow">垂直命令偏角</span><b id="commandPitch">—</b></div>
+          <div class="mini"><span class="eyebrow">推算砲口水平角</span><b id="muzzleYaw">—</b></div>
+          <div class="mini"><span class="eyebrow">推算砲口垂直角</span><b id="muzzlePitch">—</b></div>
+          <div class="mini"><span class="eyebrow">馬達命令偏角（相對零位）</span><b id="commandYaw">—</b></div>
+          <div class="mini"><span class="eyebrow">馬達命令偏角（相對零位）</span><b id="commandPitch">—</b></div>
           <div class="mini"><span class="eyebrow">操作確認</span><b id="operatorConfirm">—</b></div>
         </div>
 
@@ -530,8 +564,8 @@
         <div class="board-content">
           <div class="board-grid" id="boardGrid"></div>
           <div class="hole-lists">
-            <div class="chip-row"><span class="chip-label">已發射孔位</span><div class="chips" id="firedHoles"></div></div>
-            <div class="chip-row"><span class="chip-label">未發射孔位</span><div class="chips" id="unfiredHoles"></div></div>
+            <div class="chip-row"><span class="chip-label" id="firedHolesLabel">已發射孔位</span><div class="chips" id="firedHoles"></div></div>
+            <div class="chip-row"><span class="chip-label" id="unfiredHolesLabel">未發射孔位</span><div class="chips" id="unfiredHoles"></div></div>
             <div class="chip-row"><span class="chip-label">仍在計畫</span><div class="chips" id="pendingHoles"></div></div>
           </div>
         </div>
@@ -554,7 +588,7 @@
 
   <script>
     const boardOrder = ["H10", "H11", "H12", "H03", "H06", "H09", "H02", "H05", "H08", "H01", "H04", "H07"];
-    const stateText = { current: "即將發射", fired: "已發射", pending: "待發射", skipped: "已略過", unscheduled: "未排程" };
+    const stateText = { current: "目前孔位", confirmed: "已人工確認", fired: "已發射", pending: "待確認", skipped: "已略過", unscheduled: "未排程" };
     const $ = id => document.getElementById(id);
 
     function text(id, value) { $(id).textContent = value; }
@@ -566,6 +600,10 @@
     function integer(value) { return value === null || value === undefined ? "—" : String(value); }
     function phaseName(value) { return value === "upper" ? "上半場" : value === "lower" ? "下半場" : "一般模式"; }
 
+    // Visual scale only: these are the physical working ranges of each axis.
+    // The bar still shows the signed target error from its center point.
+    const axisDisplayLimitDeg = { yaw: 34.5, pitch: 30.0 };
+
     function renderAxis(prefix, axis) {
       axis = axis || {};
       text(`${prefix}Direction`, axis.direction || "—");
@@ -573,8 +611,9 @@
       text(`${prefix}Current`, fmt(axis.current_deg, 2, "°"));
       text(`${prefix}Target`, fmt(axis.target_deg, 2, "°"));
       const fill = $(`${prefix}Fill`);
-      const value = Math.max(-12, Math.min(12, Number(axis.delta_deg || 0)));
-      const width = Math.abs(value) / 12 * 50;
+      const limit = axisDisplayLimitDeg[prefix] || 30.0;
+      const value = Math.max(-limit, Math.min(limit, Number(axis.delta_deg || 0)));
+      const width = Math.abs(value) / limit * 50;
       fill.style.width = `${width}%`;
       fill.style.left = value >= 0 ? "50%" : `${50 - width}%`;
       fill.style.background = Math.abs(value) < .05 ? "var(--green)" : "var(--cyan)";
@@ -598,12 +637,12 @@
       });
     }
 
-    function renderBoard(holes) {
+    function renderBoard(holes, detectionOnly = false) {
       const byId = new Map((holes || []).map(hole => [hole.hole_id, hole]));
       const grid = $("boardGrid");
       grid.replaceChildren();
       boardOrder.forEach(holeId => {
-        const hole = byId.get(holeId) || { hole_id: holeId, state: "unscheduled", fired_shots: 0, pending_shots: 0, skipped_shots: 0 };
+        const hole = byId.get(holeId) || { hole_id: holeId, state: "unscheduled", fired_shots: 0, confirmed_shots: 0, pending_shots: 0, skipped_shots: 0 };
         const tile = document.createElement("div");
         tile.className = `hole ${hole.state || "unscheduled"}`;
         const name = document.createElement("b");
@@ -613,7 +652,9 @@
         status.textContent = stateText[hole.state] || hole.state;
         const counts = document.createElement("span");
         counts.className = "hole-counts";
-        counts.textContent = `已射 ${hole.fired_shots || 0} ｜ 待射 ${hole.pending_shots || 0} ｜ 略過 ${hole.skipped_shots || 0}`;
+        counts.textContent = detectionOnly
+          ? `已確認 ${hole.confirmed_shots || 0} ｜ 待確認 ${hole.pending_shots || 0}`
+          : `已射 ${hole.fired_shots || 0} ｜ 待射 ${hole.pending_shots || 0} ｜ 略過 ${hole.skipped_shots || 0}`;
         const distance = document.createElement("span");
         distance.className = "hole-distance";
         distance.textContent = `距離 ${fmt(hole.distance_m, 2, " m")}`;
@@ -622,7 +663,7 @@
       });
     }
 
-    function renderQueue(plan) {
+    function renderQueue(plan, detectionOnly = false) {
       const body = $("queueBody");
       body.replaceChildren();
       const sequence = plan.sequence || [];
@@ -646,12 +687,14 @@
         const row = document.createElement("tr");
         const cell = document.createElement("td");
         cell.colSpan = 4;
-        cell.textContent = "尚未建立射擊計畫";
+        cell.textContent = detectionOnly ? "尚未建立辨識計畫" : "尚未建立射擊計畫";
         cell.style.color = "var(--muted)";
         row.append(cell);
         body.append(row);
       }
-      text("queueMeta", `${plan.fired_shots || 0} 已射 / ${plan.pending_shots || 0} 待射 / ${plan.total_shots || 0} 總計`);
+      text("queueMeta", detectionOnly
+        ? `${plan.confirmed_shots || 0} 已確認 / ${plan.pending_shots || 0} 待確認 / ${plan.total_shots || 0} 孔`
+        : `${plan.fired_shots || 0} 已射 / ${plan.pending_shots || 0} 待射 / ${plan.total_shots || 0} 總計`);
     }
 
     function render(data) {
@@ -662,19 +705,25 @@
       const target = data.target || {};
       const plan = data.plan || {};
       const score = data.score || {};
+      const detectionOnly = Boolean(system.detection_only);
 
       text("sumNext", target.hole_id || "—");
       text("sumShot", plan.total_shots ? `第 ${Math.min((plan.index || 0) + 1, plan.total_shots)} / ${plan.total_shots} 球` : "尚未建立計畫");
       text("sumDistance", target.distance_m === null || target.distance_m === undefined ? "—" : `${target.distance_m.toFixed(2)} m`);
-      text("sumFired", integer(plan.fired_shots || 0));
-      text("sumFiredHoles", `${(plan.fired_holes || []).length} 個孔位`);
+      text("sumFired", integer(detectionOnly ? (plan.confirmed_shots || 0) : (plan.fired_shots || 0)));
+      text("sumFiredMeta", detectionOnly ? "已確認孔位" : `${(plan.fired_holes || []).length} 個孔位`);
       text("sumRemaining", integer(plan.remaining_shots || 0));
       text("sumTotal", `共 ${plan.total_shots || 0} 球`);
+      text("sumCapacity", system.ammo_capacity === null || system.ammo_capacity === undefined ? "—" : `${system.ammo_capacity}`);
       text("sumPose", pose.source === "partial" && pose.state === "ready" ? "單孔／少孔追蹤" : (({ ready: "穩定", settling: "收斂中", invalid: "無效", virtual: "虛擬" })[pose.state] || "—"));
       text("sumPoseMeta", pose.reprojection_error_px === null || pose.reprojection_error_px === undefined ? "等待 PnP" : `${pose.source === "partial" ? "平移殘差" : "重投影誤差"} ${pose.reprojection_error_px.toFixed(2)} px`);
       text("sumGate", firing.allowed ? "就緒" : "鎖定");
       text("sumGateMeta", firing.allowed ? "可接受操作確認" : "安全條件未成立");
       $("sumGate").style.color = firing.allowed ? "var(--green)" : "var(--amber)";
+      $("sumFiredLabel").textContent = detectionOnly ? "已人工確認" : "已發射";
+      $("sumFiredMeta").textContent = detectionOnly ? "已確認孔位" : "已發射孔位";
+      $("firedHolesLabel").textContent = detectionOnly ? "已人工確認孔位" : "已發射孔位";
+      $("unfiredHolesLabel").textContent = detectionOnly ? "尚未確認孔位" : "未發射孔位";
 
       const planeMeta = vision.depth_plane_inliers == null ? "平面未採用" : `平面 ${vision.depth_plane_inliers}/${vision.depth_plane_samples} 點 / 誤差 ${fmt(vision.depth_plane_median_error_m, 3, " m")}`;
       text("visionMeta", `YOLO ${vision.raw_detections ?? "—"} / 靶面 ${vision.board_detections ?? "—"} / ${planeMeta}`);
@@ -706,19 +755,46 @@
       text("pitchAxisDistance", fmt(target.pitch_axis_distance_m, 2, " m"));
       text("reachable", firing.reachable ? "可達" : "不可達");
       $("reachable").style.color = firing.reachable ? "var(--green)" : "var(--red)";
+      text("muzzleYaw", fmt(target.muzzle_yaw_deg, 2, "°"));
+      text("muzzlePitch", fmt(target.muzzle_pitch_deg, 2, "°"));
       text("commandYaw", fmt(target.command_yaw_error_deg, 2, "°"));
       text("commandPitch", fmt(target.command_pitch_error_deg, 2, "°"));
       text("operatorConfirm", firing.operator_confirmation_pending ? "已確認" : "等待 F");
 
+      const manual = data.manual_control || {};
+      $("confirmNext").disabled = !manual.enabled || !manual.current_hole_id;
+      text("manualStatus", manual.current_hole_id
+        ? `目前 ${manual.current_hole_id}；按下按鈕只會切換唯讀辨識順序`
+        : "等待可確認的孔位");
+
       text("bonusHole", score.active_bonus_hole || "—");
       text("scoreTime", score.enabled ? fmt(score.remaining_s, 1, " s") : "未啟用");
 
-      renderBoard(plan.holes || []);
-      renderChips("firedHoles", plan.fired_holes || [], true);
-      renderChips("unfiredHoles", plan.unfired_holes || []);
+      renderBoard(plan.holes || [], detectionOnly);
+      renderChips("firedHoles", detectionOnly ? (plan.confirmed_holes || []) : (plan.fired_holes || []), true);
+      renderChips("unfiredHoles", detectionOnly ? (plan.pending_holes || []) : (plan.unfired_holes || []));
       renderChips("pendingHoles", plan.pending_holes || []);
-      renderQueue(plan);
+      renderQueue(plan, detectionOnly);
     }
+
+    async function manualPost(path) {
+      const confirmButton = $("confirmNext");
+      const resetButton = $("resetPlan");
+      confirmButton.disabled = true;
+      resetButton.disabled = true;
+      try {
+        const response = await fetch(path, { method: "POST" });
+        const result = await response.json();
+        text("manualStatus", result.message || (result.ok ? "完成" : "操作失敗"));
+      } catch (error) {
+        text("manualStatus", "操作失敗：無法連線到唯讀預覽服務");
+      } finally {
+        resetButton.disabled = false;
+      }
+    }
+
+    $("confirmNext").addEventListener("click", () => manualPost("/api/confirm"));
+    $("resetPlan").addEventListener("click", () => manualPost("/api/reset"));
 
     function setConnection(online, message) {
       $("connection").classList.toggle("online", online);

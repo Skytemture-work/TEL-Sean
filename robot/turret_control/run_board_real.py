@@ -15,6 +15,10 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Sequence
 
 import cv2
+import numpy as np
+
+if "bool" not in np.__dict__:
+    np.bool = bool  # type: ignore[attr-defined]
 
 from .board import (
     BoardTarget,
@@ -33,7 +37,11 @@ from .board_pose import (
     project_targets_from_pose,
     update_plan_geometry,
 )
-from .config import TurretConfig
+from .config import (
+    TurretConfig,
+    with_recorded_mechanism_geometry,
+    with_zed2_hd720_uvc_calibration,
+)
 from .competition_geometry import with_competition_geometry
 from .controller import TurretController
 from .dashboard import (
@@ -46,6 +54,10 @@ from .engagement import BoardEngagement, PartialPoseShotGate
 from .fixed_board import calibrate_layout, load_layout
 from .shared_motor_backend import SharedMotorBackend
 from .run_yolo_demo import DEFAULT_MODEL, _draw_board_plan, _inference_frame
+from .run_zed_tensorrt_test import (
+    PreviewBoardTracker,
+    _surface_from_estimated_quad,
+)
 from .scoring_light import ScoreRoundController
 from .scoring_strategy import (
     MATCH_PHASES,
@@ -98,6 +110,11 @@ def main(
         help="等待目前孔位成功發射的秒數；0 表示不自動略過",
     )
     parser.add_argument("--headless", action="store_true", help="不開 OpenCV 視窗")
+    parser.add_argument(
+        "--aim-only",
+        action="store_true",
+        help="實機驗證模式：允許安全範圍內追瞄，但完全停用發射與 F 操作",
+    )
     parser.add_argument(
         "--web-port",
         type=int,
@@ -159,6 +176,12 @@ def main(
 
     if args.zed_calibration is not None:
         print(f"已載入 ZED 2 HD720 左眼原廠標定：{args.zed_calibration}", flush=True)
+    elif args.zed_uvc:
+        config = with_zed2_hd720_uvc_calibration(config)
+        print(
+            "相機校正：ZED 2 SN 21947470 HD720 原始 UVC 左圖（含鏡頭畸變）。",
+            flush=True,
+        )
     if args.virtual_board:
         config = replace(
             config,
@@ -168,10 +191,26 @@ def main(
             require_distance_to_fire=False,
         )
         print("虛擬靶模式：只依畫面位置瞄準，已關閉距離／視差／重力補正。", flush=True)
+    if args.aim_only:
+        config = with_recorded_mechanism_geometry(config)
+        print(
+            "實機瞄準驗證模式：已套用量測機構幾何，只允許安全範圍內調整砲口，"
+            "不會發射。",
+            flush=True,
+        )
     if args.score_mode:
         print(
             f"特殊得分燈模式（{args.match_phase}）：比賽哨聲時按 G，"
             "程式會鎖定紅燈孔 60 秒。",
+            flush=True,
+        )
+    if not args.virtual_board and (
+        config.camera_principal_x_px is None
+        or config.camera_principal_y_px is None
+    ):
+        print(
+            "提醒：相機主點仍使用畫面中心暫值；正式自動瞄準前請填入相機標定的 "
+            "fx/fy/cx/cy 與畸變參數。",
             flush=True,
         )
     if not args.virtual_board and config.use_axis_geometry:
@@ -184,6 +223,11 @@ def main(
                 "提醒：相機到水平／垂直關節的實測偏移仍是 0；"
                 "目前可測試流程，但尚未套用機構視差校正。",
                 flush=True,
+            )
+        if not config.mechanism_geometry_verified:
+            raise SystemExit(
+                "安全停止：機構幾何尚未核准；不會建立實機瞄準流程或使能馬達。"
+                "請先填入帶正負號的相機／兩軸座標，並完成實機核對。"
             )
     model = YOLO(str(args.model))
     use_zed_sdk = not (args.zed_uvc or args.opencv_camera)
@@ -219,6 +263,7 @@ def main(
         ),
     )
     pose_tracker = BoardPoseTracker(config)
+    board_tracker = PreviewBoardTracker()
     plan = None
     board_plan = None
     score_round = ScoreRoundController(
@@ -250,7 +295,9 @@ def main(
 
     external_fire = fire_callback is not None
     driver.fire = fire_callback if external_fire else operator_fire
-    fire_label = "external fire callback" if external_fire else "F confirm"
+    fire_label = "AIM ONLY / no fire" if args.aim_only else (
+        "external fire callback" if external_fire else "F confirm"
+    )
     window = f"REAL BOARD AIM - {fire_label} / S skip / G score start / Q quit"
     if not args.headless:
         cv2.namedWindow(window, cv2.WINDOW_NORMAL)
@@ -306,19 +353,43 @@ def main(
                 min_area_fraction=config.board_min_area_fraction,
                 targets=raw_detected,
             )
+            estimated_quad, tracked_estimate = board_tracker.update(
+                raw_detected,
+                vision_frame.shape,
+                time.monotonic(),
+            )
+            estimated_surface = False
+            if estimated_quad is not None:
+                # Hole geometry is a stronger board reference than the
+                # largest dark contour.  The latter can be ceiling, floor,
+                # equipment or any other dark region in the room.
+                board_surface = _surface_from_estimated_quad(
+                    estimated_quad,
+                    vision_frame.shape,
+                )
+                estimated_surface = True
+            elif board_surface is not None and board_surface.quad is None:
+                board_surface = None
             detected = filter_targets_to_surface(raw_detected, board_surface)
+            trusted_quad = (
+                estimated_quad
+                if estimated_quad is not None
+                else board_surface.quad
+                if board_surface is not None
+                else None
+            )
             quad_plan = None
-            if board_surface is not None and board_surface.quad is not None:
+            if trusted_quad is not None:
                 quad_distance = estimate_board_distance_from_targets(
                     detected,
-                    board_surface.quad,
+                    trusted_quad,
                     config.focal_length_x_px,
                     config.small_hole_diameter_m,
                     config.large_hole_diameter_m,
                     config.board_position_tolerance_cm,
                 )
                 quad_plan = build_plan_from_board_quad(
-                    board_surface.quad,
+                    trusted_quad,
                     config.small_hole_diameter_m,
                     config.large_hole_diameter_m,
                     board_distance_m=quad_distance,
@@ -433,7 +504,7 @@ def main(
                 pose = pose_tracker.update(
                     detected,
                     pose_reference,
-                    board_surface.quad if board_surface is not None else None,
+                    trusted_quad,
                     now=now,
                 )
                 if pose is None and args.score_mode:
@@ -478,9 +549,17 @@ def main(
             # a lost visual pose and fire later without a fresh confirmation.
             if not pose_ready:
                 fire_requested = False
+                driver.set_aiming_enabled(False, pose_blocked_reason)
+            else:
+                driver.set_aiming_enabled(True)
 
             if not pose_ready:
                 driver.set_firing_enabled(False, pose_blocked_reason)
+            elif args.aim_only:
+                driver.set_firing_enabled(
+                    False,
+                    "實機驗證模式：只調整砲口，不發射",
+                )
             elif external_fire or fire_requested:
                 driver.set_firing_enabled(True)
             else:
@@ -517,7 +596,7 @@ def main(
                 score_state = score_round.update(
                     vision_frame,
                     reference_plan,
-                    board_surface.quad if board_surface is not None else None,
+                    trusted_quad,
                 )
                 if (
                     score_state.phase == "active"
@@ -616,10 +695,20 @@ def main(
                 if status.target is None:
                     print("瞄準流程完成或尚未建立計畫。", flush=True)
                 else:
+                    yaw_text = (
+                        f"{status.command.target_yaw_rad:+.3f} rad"
+                        if status.command.target_yaw_rad is not None
+                        else "—"
+                    )
+                    pitch_text = (
+                        f"{status.command.target_pitch_rad:+.3f} rad"
+                        if status.command.target_pitch_rad is not None
+                        else "—"
+                    )
                     print(
                         f"目前瞄準 {target_id}："
-                        f"yaw={status.command.target_yaw_rad:+.3f} rad，"
-                        f"pitch={status.command.target_pitch_rad:+.3f} rad，"
+                        f"yaw={yaw_text}，"
+                        f"pitch={pitch_text}，"
                         + (
                             f"水平軸距離={status.command.yaw_axis_distance_m:.2f} m，"
                             if status.command.yaw_axis_distance_m is not None
@@ -630,13 +719,31 @@ def main(
                     )
                 last_target_id = target_id
             display = result.plot()
-            if board_surface is not None:
+            if board_surface is not None and not estimated_surface:
                 cv2.drawContours(
                     display,
                     [board_surface.contour],
                     -1,
                     (0, 255, 255),
                     2,
+                )
+            if estimated_surface:
+                cv2.polylines(
+                    display,
+                    [board_surface.contour],
+                    True,
+                    (255, 255, 0),
+                    2,
+                )
+                cv2.putText(
+                    display,
+                    "ESTIMATED BOARD" if not tracked_estimate else "TRACKED BOARD - INFERRED",
+                    (12, 108 if args.score_mode else 82),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.52,
+                    (255, 255, 0),
+                    2,
+                    cv2.LINE_AA,
                 )
             display_plan = board_plan if args.score_mode and board_plan is not None else plan
             if display_plan is not None:
@@ -755,7 +862,10 @@ def main(
                 cv2.imshow(window, display)
                 key = cv2.waitKey(1) & 0xFF
             if key == ord("f"):
-                if external_fire:
+                if args.aim_only:
+                    fire_requested = False
+                    print("實機驗證模式已停用發射。", flush=True)
+                elif external_fire:
                     print(
                         "目前由外部 fire_callback 控制發射，F 不會另送一次命令。",
                         flush=True,

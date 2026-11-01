@@ -52,7 +52,14 @@ class TurretController:
             self.motors.hold()
             return command
 
-        if command.has_target:
+        # A blocked or unreachable target must hold the current pose.  The
+        # backend still has its final motor/workspace clamps, but those are a
+        # last line of defence and must not be used as normal aiming logic.
+        if (
+            command.has_target
+            and command.target_reachable
+            and command.blocked_reason is None
+        ):
             # The values are guaranteed non-None when has_target is true.
             send_targets = getattr(self.motors, "send_targets", None)
             if callable(send_targets):

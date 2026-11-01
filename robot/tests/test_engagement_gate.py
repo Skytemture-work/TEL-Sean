@@ -18,13 +18,18 @@ class _Clock:
 
 
 class _AlwaysReadyTurret:
+    def __init__(self):
+        self.targets = []
+
     def update(self, _target):
+        self.targets.append(_target)
+        has_target = _target is not None
         return AimCommand(
-            has_target=True,
-            target_yaw_rad=0.0,
-            target_pitch_rad=0.0,
+            has_target=has_target,
+            target_yaw_rad=0.0 if has_target else None,
+            target_pitch_rad=0.0 if has_target else None,
             stable=True,
-            fire_allowed=True,
+            fire_allowed=has_target,
         )
 
 
@@ -143,6 +148,44 @@ class EngagementSafetyGateTests(unittest.TestCase):
         engagement.update()
         self.assertEqual(attempts, ["H05", "H05"])
         self.assertEqual(plan.index, 0)
+
+    def test_vehicle_settling_holds_turret_and_pauses_target_timeout(self):
+        clock = _Clock()
+        fired = []
+        turret = _AlwaysReadyTurret()
+        target = BoardTarget(
+            640.0,
+            360.0,
+            40.0,
+            40.0,
+            hole_id="H05",
+            distance_m=5.0,
+        )
+        plan = EngagementPlan([target])
+        engagement = BoardEngagement(
+            TurretConfig(),
+            turret,
+            plan=plan,
+            fire=lambda item: fired.append(item.hole_id) or True,
+            target_timeout_s=1.0,
+            clock=clock,
+        )
+
+        engagement.set_aiming_enabled(False, "vehicle still moving")
+        clock.now = 10.0
+        status = engagement.update()
+
+        self.assertFalse(status.command.has_target)
+        self.assertFalse(status.command.fire_allowed)
+        self.assertEqual(status.command.blocked_reason, "vehicle still moving")
+        self.assertIsNone(turret.targets[-1])
+        self.assertEqual(plan.index, 0)
+        self.assertEqual(fired, [])
+
+        engagement.set_aiming_enabled(True)
+        ready = engagement.update()
+        self.assertTrue(ready.fired)
+        self.assertEqual(fired, ["H05"])
 
 
 if __name__ == "__main__":

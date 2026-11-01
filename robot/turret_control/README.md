@@ -14,6 +14,17 @@
 相機**固定在底座**（`camera_on_turret=False`）—— 砲塔轉動不會改變畫面，所以
 「是否瞄準完成」必須看馬達回饋，不能看像素誤差。
 
+## ZED 2 相機校正
+
+目前連接的是 ZED 2（序號 `21947470`），程式已填入 HD720 左相機校正值。SDK
+`VIEW.LEFT` 預設使用校正後影像：`fx/fy=527.3349`、`cx=651.10596`、
+`cy=371.00671`，畸變係數為 0。`run_zed_tensorrt_test` 走這條路徑。
+
+OpenCV 的 `--zed-uvc` 則會從左右並排的原始影像裁切左半邊；`run_board_real`
+和 `run_yolo_demo` 會自動切換成此相機原始 HD720 校正：`fx=529.09`、
+`fy=528.88`、`cx=646.775`、`cy=363.19`，並套用原廠畸變係數。兩組值不能
+互換。若換相機、影像尺寸或裁切方式，必須重新提供對應校正，不能沿用這組值。
+
 ## 靶板與接戰順序
 
 3 欄 × 4 列共 12 個孔。**上排 Ø20 cm（小）、下三排 Ø40 cm（大）。**
@@ -110,7 +121,10 @@ python3 -m turret_control.run_vertical_panel --cli
 # 垂直軸預設使用實機已驗證可移動的位置－速度模式；必要時才覆寫為 MIT
 python3 -m turret_control.run_vertical_panel --cli --control-mode mit
 
-# 水平設計上限由校正原點換算為 -34.5°～+34.5°。
+# 活動範圍描邊校正工具已移除；目前使用已保存的 mechanism_limits.json。
+# 實機前請確認限位依實際機構驗證，並保留足夠安全裕度。
+
+# 水平設計上限由校正原點換算為 -34.5°～+34.5°；不必依靠描邊取得左右極限。
 # 已記錄的雙軸工作區及較嚴格的限位仍生效，實際可達範圍可能較窄。
 # 0°～30° 水平 ±34.5°；30°～33° 依三角形收窄；33°～home 水平 ±10°。
 
@@ -132,10 +146,19 @@ python3 -m turret_control.run_yolo_demo --device cpu --zed-uvc
 python3 -m turret_control.run_yolo_demo --board --device cpu --zed-uvc
 # 預覽視窗按 p 可在終端列印目前完整計畫，按 q/Esc 離開
 
+# 唯讀網頁儀表板：預設使用 ZED SDK + ~/Desktop/best.engine，推估缺少的孔位
+python3 -m turret_control.camera_web_view --port 8080
+# 需要切換到 OpenCV 相機時才使用 --no-zed-sdk；需要指定模型時使用 --model
+
 # 實機自動瞄準 + 區網即時儀表板（會連接並使能真實馬達，先確認急停）
 python3 -m turret_control.run_board_real
 # 同一區網的電腦／平板開啟：http://<robot-ip>:8080
 # 儀表板預設啟用；--web-port 其他埠號 可更改，--web-port 0 可停用
+
+# 實機驗證（只調整砲口，不接受 F、不會發射）
+python3 -m turret_control.run_board_real --zed-uvc --aim-only --web-port 8080
+# 只有姿態穩定、距離有效且推算角度通過機構安全範圍時才會送追瞄命令；
+# 超出範圍或計算被阻擋時會持續保持目前位置。
 
 # 測試
 python3 -m unittest discover -s tests
@@ -173,6 +196,11 @@ CLI 的 `aim <水平角度> <垂直角度>` 與自動瞄準共用分階段避讓
 可能讓垂直軸下墜，輸入前仍需先支撐機構。一般的 `set`、`yaw`、`aim` 也都不需要確認。
 
 需要重新量測水平基準時，在 CLI 失能並支撐機構後，使用水平儀調整砲口仰角至 `0°`，輸入 `capture-level` 並確認。此操作保留已記錄的 home 馬達位置及比例；若日後需要更改 home 或工作區，應重新確認機構及更新相應設定，目前沒有自動錄製工具。舊校正檔會備份成 `startup_pose.json.bak`，馬達內部零點不變。
+若機械原點有偏差，可在垂直面板 CLI 輸入 `calibrate`，依提示確認兩軸失能、手動放到
+「水平 0°、垂直初始 45°」，再輸入 `capture-origin` 並二次確認。這只更新軟體原點，
+不改馬達內部零點；舊的 `startup_pose.json` 會備份成 `startup_pose.json.bak`。擷取後維持
+失能，必須等人員離開機構才可重新 `enable`。此流程不會重新描繪水平／垂直活動範圍；
+本專案目前沒有活動範圍自動擷取工具。
 
 `--board` 模式只開相機與 YOLO，不開 CAN、不建立馬達控制器；必須偵測到 12
 個孔且尺寸分類成功，畫面才會顯示 `BOARD READY`。這是接上真機構前的影像流程驗證。
@@ -210,7 +238,20 @@ CLI 的 `aim <水平角度> <垂直角度>` 與自動瞄準共用分階段避讓
 - 需要距離但沒有距離
 - 靶面 PnP 無效、已逾時，或車體／相機仍在移動
 
-## 實機瞄準校正
+## 實機瞄準校正與仍需實機確認的參數
+
+這些**必須在真機構上量過才能用**：
+
+| 參數 | 現值 | 要怎麼得到 |
+|---|---|---|
+| `yaw_zero_rad` / `pitch_zero_rad` | 由 `startup_pose.json` 載入 | 手動校正後於下次啟動自動套用 |
+| `yaw_sign` / `pitch_sign` | 1 / −1 | 垂直方向已確認為馬達角增加時砲口下降 |
+| `mechanism_limits.json` 的 yaw/pitch 工作區 | 目前是由舊校正推導的保守暫值 | 本專案目前沒有活動範圍描邊工具；限位須依實際量測驗證後再更新 |
+| `camera_to_yaw_yaw/pitch_rad` | 0.0 | 炮塔零點時，相機光軸相對水平軸的偏角 |
+| `yaw_axis_offset_x/y/z_m` | 0.0 | 量相機原點到水平關節原點，使用相機座標 |
+| `pitch_axis_offset_x/y/z_m` | 0.0 | 量水平關節到垂直關節，使用水平零點座標 |
+| `muzzle_offset_x/y/z_m` | 0.0 | 舊版彈道補償用：量相機到發射口的距離 |
+| `muzzle_speed_m_s` | 20.0 | 實際測球速 |
 
 `run_board_real` 載入 `competition_geometry.py` 的設計尺寸：固定相機仰角 `20°`、
 左眼相對旋轉軸向左 `60 mm`、相機中心在軸前方 `101.662 mm`、比水平基準面高

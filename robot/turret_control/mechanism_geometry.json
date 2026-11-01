@@ -1,18 +1,35 @@
 {
   "camera": {
+    "origin": "optical_center",
     "elevation_deg": 20.0,
     "elevation_rad": 0.34906585,
+    "azimuth_deg": 0.0,
     "distance_to_horizontal_motor_axis_mm": 101.662,
-    "distance_interpretation": "Raw drawing value; confirm whether this is a horizontal projection or a straight-line optical-center-to-axis distance before applying it to control coordinates."
+    "distance_interpretation": "User-confirmed optical-center to horizontal-rotation-axis distance, along camera -z.",
+    "horizontal_axis_offset_from_camera_mm": {
+      "x": 0.0,
+      "y": 0.0,
+      "z": -101.662
+    }
   },
   "motor_mounting": {
     "vertical_motor_center_to_horizontal_motor_top_mm": 72.1,
-    "distance_interpretation": "Raw drawing dimension; this is not assumed to be the distance between motor rotation centers."
+    "distance_interpretation": "User-confirmed horizontal-rotation-axis to vertical-rotation-axis offset; vertical axis is directly above horizontal axis.",
+    "vertical_axis_offset_from_horizontal_axis_mm": {
+      "x": 0.0,
+      "y": 72.1,
+      "z": 0.0
+    }
   },
   "coordinate_convention": {
     "camera_x": "right",
     "camera_y": "up",
     "camera_z": "forward"
   },
-  "note": "Mechanism geometry supplied by the user; not yet written into yaw_axis_offset or camera alignment control parameters."
+  "verification": {
+    "status": "user_confirmed_record_only",
+    "control_parameters_applied": false,
+    "motor_enable_allowed": false
+  },
+  "note": "User confirmed camera, horizontal axis, and vertical axis share x=0 symmetry line. This file records geometry only; it is not loaded by the real motor controller."
 }
