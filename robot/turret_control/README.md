@@ -146,7 +146,7 @@ python3 -m turret_control.run_yolo_demo --device cpu --zed-uvc
 python3 -m turret_control.run_yolo_demo --board --device cpu --zed-uvc
 # 預覽視窗按 p 可在終端列印目前完整計畫，按 q/Esc 離開
 
-# 唯讀網頁儀表板：預設使用 ZED SDK + ~/Desktop/best.engine，推估缺少的孔位
+# 唯讀網頁儀表板：預設使用 ZED SDK，推估缺少的孔位
 python3 -m turret_control.camera_web_view --port 8080
 # 需要切換到 OpenCV 相機時才使用 --no-zed-sdk；需要指定模型時使用 --model
 
@@ -159,6 +159,13 @@ python3 -m turret_control.run_board_real
 python3 -m turret_control.run_board_real --zed-uvc --aim-only --web-port 8080
 # 只有姿態穩定、距離有效且推算角度通過機構安全範圍時才會送追瞄命令；
 # 超出範圍或計算被阻擋時會持續保持目前位置。
+
+唯讀和實機入口共用 `board_vision.py`：同一流程執行孔洞偵測、靶面篩選、
+靶板與缺孔推算，以及靛青靶框／紫色網格繪製。預設優先使用
+`~/Desktop/best.engine`，不存在時才使用專案 PyTorch 模型；可用 `--model`
+明確指定模型，`--conf` 調整信心門檻（預設 0.25）。不同模型或 ZED SDK／UVC
+影像可能產生不同辨識結果。紫色網格是影像幾何推算，並不代表姿態穩定或允許移動、發射；
+實機入口仍須通過原有姿態、距離與安全範圍閘門。
 
 # 測試
 python3 -m unittest discover -s tests

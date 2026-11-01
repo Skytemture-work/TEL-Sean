@@ -92,7 +92,7 @@ class SharedMotorBackendTests(unittest.TestCase):
             yaw_sequence_phase="rotating",
         )
         controller = TurretController(config, self.backend)
-        target = TargetPixel(640., 360.)
+        target = TargetPixel(config.camera_center_x_px, config.camera_center_y_px)
         for _ in range(5):
             self.assertFalse(controller.update(target).fire_allowed)
         self.worker.state = replace(self.worker.state, yaw_sequence_phase=None)

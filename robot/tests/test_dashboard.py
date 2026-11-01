@@ -4,14 +4,20 @@ import math
 import re
 from types import SimpleNamespace
 import unittest
+import time
+from urllib.error import HTTPError
+from urllib.request import Request
 from urllib.request import urlopen
 
+from turret_control.board import BoardTarget, EngagementPlan
 from turret_control.dashboard import (
     DASHBOARD_HTML_PATH,
     DashboardState,
+    _plan_telemetry,
     build_dashboard_snapshot,
     start_dashboard_server,
 )
+from turret_control.run_board_real import _apply_manual_aim_action
 
 
 class _IdParser(HTMLParser):
@@ -38,6 +44,65 @@ def _target(hole_id, engaged=False, distance_m=5.0):
 
 
 class DashboardTelemetryTests(unittest.TestCase):
+    def test_aim_only_navigation_does_not_record_a_shot_or_repeat_a_stale_request(self):
+        plan = EngagementPlan([BoardTarget(100, 100, 20, 20, hole_id="H01"),
+                               BoardTarget(150, 100, 20, 20, hole_id="H02")])
+        confirmed = []
+        plan, applied = _apply_manual_aim_action(plan, ("confirm", 0, "H01"), confirmed)
+        self.assertTrue(applied)
+        self.assertEqual(plan.current().hole_id, "H02")
+        self.assertEqual(confirmed, ["H01"])
+        self.assertFalse(plan.targets[0].engaged)
+        telemetry = _plan_telemetry(plan, plan, aim_only=True, confirmed_holes=confirmed)
+        self.assertEqual(telemetry["confirmed_shots"], 1)
+        self.assertEqual(telemetry["fired_shots"], 0)
+        self.assertEqual(telemetry["sequence"][0]["state"], "confirmed")
+        plan, applied = _apply_manual_aim_action(plan, ("confirm", 0, "H01"), confirmed)
+        self.assertFalse(applied)
+        self.assertEqual(plan.current().hole_id, "H02")
+        plan, applied = _apply_manual_aim_action(plan, ("reset", 1, "H02"), confirmed)
+        self.assertTrue(applied)
+        self.assertEqual(plan.current().hole_id, "H01")
+        self.assertEqual(confirmed, [])
+
+    def test_manual_http_requests_are_mode_gated_and_queued_with_target_identity(self):
+        state = DashboardState()
+        state.update_telemetry({"generated_at_ms": int(time.time() * 1000),
+                                "manual_control": {"enabled": True, "plan_index": 0,
+                                                   "current_hole_id": "H01"}})
+        server = start_dashboard_server(state, 0, host="127.0.0.1")
+        url = f"http://127.0.0.1:{server.server_address[1]}/api/confirm"
+
+        def post(index, hole, origin=None):
+            headers = {"Content-Type": "application/json"}
+            if origin:
+                headers["Origin"] = origin
+            request = Request(url, data=json.dumps({"plan_index": index, "hole_id": hole}).encode(),
+                              headers=headers, method="POST")
+            return urlopen(request, timeout=2)
+
+        try:
+            with self.assertRaises(HTTPError) as blocked:
+                post(0, "H01")
+            self.assertEqual(blocked.exception.code, 409)
+            state.enable_manual_aim()
+            with self.assertRaises(HTTPError) as cross_origin:
+                post(0, "H01", origin="http://other.example")
+            self.assertEqual(cross_origin.exception.code, 403)
+            with self.assertRaises(HTTPError) as stale:
+                post(0, "H02")
+            self.assertEqual(stale.exception.code, 409)
+            with post(0, "H01") as response:
+                self.assertTrue(json.load(response)["ok"])
+            with self.assertRaises(HTTPError) as duplicate:
+                post(0, "H01")
+            self.assertEqual(duplicate.exception.code, 409)
+            self.assertEqual(state.take_manual_action(), ("confirm", 0, "H01"))
+        finally:
+            state.stop()
+            server.shutdown()
+            server.server_close()
+
     def test_snapshot_tracks_shots_and_physical_axis_delta(self):
         plan = SimpleNamespace(
             index=2,

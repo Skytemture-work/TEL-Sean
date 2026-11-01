@@ -20,16 +20,8 @@ import numpy as np
 if "bool" not in np.__dict__:
     np.bool = bool  # type: ignore[attr-defined]
 
-from .board import (
-    BoardTarget,
-    build_plan,
-    build_plan_from_board_quad,
-    build_virtual_plan,
-    build_virtual_plan_from_partial,
-    estimate_board_distance_from_targets,
-    EngagementPlan,
-)
-from .board_surface import detect_dark_board_surface, filter_targets_to_surface
+from .board import BoardTarget, EngagementPlan
+from .board_vision import BoardVision, DEFAULT_MODEL, DEFAULT_CONFIDENCE
 from .board_depth_plane import apply_board_depth_plane, fit_board_depth_plane
 from .board_pose import (
     BoardPoseTracker,
@@ -49,15 +41,10 @@ from .dashboard import (
     build_dashboard_snapshot,
     start_dashboard_server,
 )
-from .detection import boxes_to_board_targets
 from .engagement import BoardEngagement, PartialPoseShotGate
 from .fixed_board import calibrate_layout, load_layout
 from .shared_motor_backend import SharedMotorBackend
-from .run_yolo_demo import DEFAULT_MODEL, _draw_board_plan, _inference_frame
-from .run_zed_tensorrt_test import (
-    PreviewBoardTracker,
-    _surface_from_estimated_quad,
-)
+from .run_yolo_demo import _inference_frame
 from .scoring_light import ScoreRoundController
 from .scoring_strategy import (
     MATCH_PHASES,
@@ -69,6 +56,24 @@ from .zed_camera import ZedDepthCamera
 
 FireCallback = Callable[[BoardTarget], bool]
 TelemetryCallback = Callable[[Dict[str, Any]], None]
+
+
+def _apply_manual_aim_action(plan, action, confirmed_holes):
+    """Apply one validated navigation request on the control thread."""
+    if plan is None or action is None:
+        return plan, False
+    operation, expected_index, expected_hole = action
+    current = plan.current()
+    if plan.index != expected_index or getattr(current, "hole_id", None) != expected_hole:
+        return plan, False
+    if operation == "confirm" and current is not None:
+        confirmed_holes.append(current.hole_id)
+        plan.skip()
+        return plan, True
+    if operation == "reset":
+        confirmed_holes.clear()
+        return EngagementPlan(plan.targets), True
+    return plan, False
 
 
 def main(
@@ -92,7 +97,7 @@ def main(
     parser.add_argument("--camera", type=int, default=0, help="OpenCV / UVC 相機編號")
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
     parser.add_argument("--device", default="0")
-    parser.add_argument("--conf", type=float, default=0.40)
+    parser.add_argument("--conf", type=float, default=DEFAULT_CONFIDENCE)
     parser.add_argument("--imgsz", type=int, default=640)
     parser.add_argument("--port", default="/dev/ttyACM0")
     camera_mode = parser.add_mutually_exclusive_group()
@@ -136,11 +141,14 @@ def main(
         type=Path,
         help="第一次完整偵測到 12 孔時儲存固定版面 JSON",
     )
-    parser.add_argument(
-        "--score-mode",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="競賽計分模式（預設啟用）：按 G 鎖定亮燈孔並建立射擊計畫；--no-score-mode 切換一般模式",
+    score_mode = parser.add_mutually_exclusive_group()
+    score_mode.add_argument(
+        "--score-mode", dest="score_mode", action="store_true", default=True,
+        help="競賽計分模式（預設啟用）：按 G 鎖定亮燈孔並建立射擊計畫",
+    )
+    score_mode.add_argument(
+        "--no-score-mode", dest="score_mode", action="store_false",
+        help="切換一般模式",
     )
     parser.add_argument(
         "--match-phase",
@@ -229,7 +237,7 @@ def main(
                 "安全停止：機構幾何尚未核准；不會建立實機瞄準流程或使能馬達。"
                 "請先填入帶正負號的相機／兩軸座標，並完成實機核對。"
             )
-    model = YOLO(str(args.model))
+    model = YOLO(str(args.model), task="segment")
     use_zed_sdk = not (args.zed_uvc or args.opencv_camera)
     if use_zed_sdk:
         try:
@@ -263,7 +271,8 @@ def main(
         ),
     )
     pose_tracker = BoardPoseTracker(config)
-    board_tracker = PreviewBoardTracker()
+    vision = BoardVision(model, config, confidence=args.conf, imgsz=args.imgsz,
+                         device=args.device, virtual_board=args.virtual_board)
     plan = None
     board_plan = None
     score_round = ScoreRoundController(
@@ -302,6 +311,9 @@ def main(
     if not args.headless:
         cv2.namedWindow(window, cv2.WINDOW_NORMAL)
     dashboard = DashboardState() if args.web_port else None
+    manual_confirmed_holes = []
+    if dashboard is not None and args.aim_only and not args.score_mode:
+        dashboard.enable_manual_aim()
     web_server = None
     if dashboard is not None:
         web_server = start_dashboard_server(dashboard, args.web_port)
@@ -339,136 +351,14 @@ def main(
                 vision_frame.shape[1] == config.image_width_px
                 and vision_frame.shape[0] == config.image_height_px
             )
-            result = model.predict(
-                vision_frame,
-                imgsz=args.imgsz,
-                conf=args.conf,
-                device=args.device,
-                verbose=False,
-            )[0]
-            raw_detected = boxes_to_board_targets(result, args.conf, depth_data)
-            board_surface = detect_dark_board_surface(
-                vision_frame,
-                value_threshold=config.board_dark_value_threshold,
-                min_area_fraction=config.board_min_area_fraction,
-                targets=raw_detected,
-            )
-            estimated_quad, tracked_estimate = board_tracker.update(
-                raw_detected,
-                vision_frame.shape,
-                time.monotonic(),
-            )
-            estimated_surface = False
-            if estimated_quad is not None:
-                # Hole geometry is a stronger board reference than the
-                # largest dark contour.  The latter can be ceiling, floor,
-                # equipment or any other dark region in the room.
-                board_surface = _surface_from_estimated_quad(
-                    estimated_quad,
-                    vision_frame.shape,
-                )
-                estimated_surface = True
-            elif board_surface is not None and board_surface.quad is None:
-                board_surface = None
-            detected = filter_targets_to_surface(raw_detected, board_surface)
-            trusted_quad = (
-                estimated_quad
-                if estimated_quad is not None
-                else board_surface.quad
-                if board_surface is not None
-                else None
-            )
-            quad_plan = None
-            if trusted_quad is not None:
-                quad_distance = estimate_board_distance_from_targets(
-                    detected,
-                    trusted_quad,
-                    config.focal_length_x_px,
-                    config.small_hole_diameter_m,
-                    config.large_hole_diameter_m,
-                    config.board_position_tolerance_cm,
-                )
-                quad_plan = build_plan_from_board_quad(
-                    trusted_quad,
-                    config.small_hole_diameter_m,
-                    config.large_hole_diameter_m,
-                    board_distance_m=quad_distance,
-                    large_first=config.engage_large_first,
-                    left_to_right=config.engage_left_to_right,
-                    bottom_to_top=config.engage_bottom_to_top,
-                )
             now = time.monotonic()
-            candidate_plan = None
-            inferred_plan_used = False
-            # Build a fresh geometric reference every frame.  This reference
-            # follows the board when the robot moves; the active firing plan is
-            # deliberately kept as a separate object so its shot index and
-            # duplicate scoring shots are never reset.
-            if quad_plan is not None and len(quad_plan) == 12:
-                candidate_plan = quad_plan
-                inferred_plan_used = True
-            elif args.virtual_board:
-                if len(detected) == 12:
-                    candidate_plan = build_virtual_plan(
-                        detected,
-                        config.small_hole_diameter_m,
-                        config.large_hole_diameter_m,
-                        config.engage_large_first,
-                        config.engage_left_to_right,
-                        config.engage_bottom_to_top,
-                        config.board_position_tolerance_cm,
-                    )
-                elif len(detected) >= 4:
-                    candidate_plan = build_virtual_plan_from_partial(
-                        detected,
-                        config.small_hole_diameter_m,
-                        config.large_hole_diameter_m,
-                        config.engage_large_first,
-                        config.engage_left_to_right,
-                        config.engage_bottom_to_top,
-                        focal_px=config.focal_length_x_px,
-                        position_tolerance_cm=config.board_position_tolerance_cm,
-                    )
-                    inferred_plan_used = True
-            else:
-                if len(detected) == 12:
-                    candidate_plan = build_plan(
-                        detected,
-                        config.focal_length_x_px,
-                        config.small_hole_diameter_m,
-                        config.large_hole_diameter_m,
-                        config.engage_large_first,
-                        config.engage_left_to_right,
-                        config.engage_bottom_to_top,
-                        config.board_position_tolerance_cm,
-                    )
-                    if len(candidate_plan) != 12:
-                        candidate_plan = build_virtual_plan(
-                            detected,
-                            config.small_hole_diameter_m,
-                            config.large_hole_diameter_m,
-                            config.engage_large_first,
-                            config.engage_left_to_right,
-                            config.engage_bottom_to_top,
-                            config.board_position_tolerance_cm,
-                        )
-                # Lighting can hide one or more holes.  Four non-collinear
-                # centres are enough to recover the official metric layout.
-                if (
-                    (candidate_plan is None or len(candidate_plan) != 12)
-                    and len(detected) >= 4
-                ):
-                    candidate_plan = build_virtual_plan_from_partial(
-                        detected,
-                        config.small_hole_diameter_m,
-                        config.large_hole_diameter_m,
-                        config.engage_large_first,
-                        config.engage_left_to_right,
-                        config.engage_bottom_to_top,
-                        focal_px=config.focal_length_x_px,
-                        position_tolerance_cm=config.board_position_tolerance_cm,
-                    )
-                    inferred_plan_used = True
+            vision_result = vision.process(vision_frame, now=now, depth_data=depth_data)
+            raw_detected = vision_result.raw_targets
+            detected = vision_result.targets
+            board_surface = vision_result.surface
+            trusted_quad = vision_result.quad
+            candidate_plan = vision_result.plan
+            inferred_plan_used = vision_result.inferred
 
             if (
                 candidate_plan is not None
@@ -662,6 +552,12 @@ def main(
                         )
                     expiry_processed_round_id = score_round.round_id
 
+            if dashboard is not None and args.aim_only and not args.score_mode:
+                action = dashboard.take_manual_action()
+                plan, applied = _apply_manual_aim_action(plan, action, manual_confirmed_holes)
+                if applied:
+                    driver.set_plan(plan)
+                    print("僅瞄準模式：已更新人工確認順序，不發射。", flush=True)
             status = driver.update()
             partial_shot_gate.record(pose, status.fired)
             yaw_motor_state = motors.get_state(config.yaw_motor_id)
@@ -718,36 +614,7 @@ def main(
                         flush=True,
                     )
                 last_target_id = target_id
-            display = result.plot()
-            if board_surface is not None and not estimated_surface:
-                cv2.drawContours(
-                    display,
-                    [board_surface.contour],
-                    -1,
-                    (0, 255, 255),
-                    2,
-                )
-            if estimated_surface:
-                cv2.polylines(
-                    display,
-                    [board_surface.contour],
-                    True,
-                    (255, 255, 0),
-                    2,
-                )
-                cv2.putText(
-                    display,
-                    "ESTIMATED BOARD" if not tracked_estimate else "TRACKED BOARD - INFERRED",
-                    (12, 108 if args.score_mode else 82),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.52,
-                    (255, 255, 0),
-                    2,
-                    cv2.LINE_AA,
-                )
-            display_plan = board_plan if args.score_mode and board_plan is not None else plan
-            if display_plan is not None:
-                _draw_board_plan(display, display_plan)
+            display = vision_result.render(vision_frame)
             if args.score_mode and status.target is not None:
                 current_point = (
                     round(status.target.u_px),
@@ -838,6 +705,8 @@ def main(
                     score_state=score_state,
                     bonus_hole_id=last_bonus_hole_id,
                     operator_fire_pending=fire_requested,
+                    aim_only=args.aim_only,
+                    confirmed_holes=manual_confirmed_holes,
                     current_yaw_motor_rad=(
                         yaw_motor_state.position_rad
                         if yaw_motor_state is not None
@@ -849,6 +718,13 @@ def main(
                         else None
                     ),
                 )
+                if args.aim_only and not args.score_mode:
+                    telemetry["manual_control"] = {
+                        "enabled": plan is not None and len(plan) > 0,
+                        "mode": "aim_only",
+                        "current_hole_id": getattr(status.target, "hole_id", None),
+                        "plan_index": plan.index if plan is not None else None,
+                    }
                 if telemetry_callback is not None:
                     telemetry_callback(telemetry)
                 if dashboard is not None:

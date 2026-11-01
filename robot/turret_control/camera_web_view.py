@@ -23,95 +23,11 @@ from ultralytics import YOLO
 if "bool" not in np.__dict__:
     np.bool = bool  # type: ignore[attr-defined]
 
-from .board import (
-    build_plan,
-    build_plan_from_board_quad,
-    estimate_board_distance_from_targets,
-)
-from .board_surface import detect_dark_board_surface, filter_targets_to_surface
+from .board import EngagementPlan
+from .board_vision import BoardVision, DEFAULT_MODEL, DEFAULT_CONFIDENCE
 from .config import TurretConfig, with_zed2_hd720_uvc_calibration
-from .detection import boxes_to_board_targets
 from .dashboard import build_dashboard_snapshot
 from .geometry import aim_angles_from_target
-from .run_yolo_demo import _draw_board_plan
-from .run_zed_tensorrt_test import (
-    PreviewBoardTracker,
-    _draw_inferred_board,
-    _surface_from_estimated_quad,
-)
-
-DEFAULT_MODEL = Path.home() / "Desktop" / "best.engine"
-
-
-class _TemporalGeometryFilter:
-    """Stabilize preview geometry without changing the detector output."""
-
-    def __init__(
-        self,
-        quad_alpha: float = 0.22,
-        distance_alpha: float = 0.25,
-        distance_window: int = 5,
-        stale_after_s: float = 0.6,
-    ):
-        self.quad_alpha = quad_alpha
-        self.distance_alpha = distance_alpha
-        self.distance_window = distance_window
-        self.stale_after_s = stale_after_s
-        self.quad = None
-        self.distance_m = None
-        self.distance_samples = []
-        self.last_update_at = None
-
-    def reset(self) -> None:
-        self.quad = None
-        self.distance_m = None
-        self.distance_samples.clear()
-        self.last_update_at = None
-
-    def _expire_if_stale(self, now: float) -> None:
-        if (
-            self.last_update_at is not None
-            and now - self.last_update_at > self.stale_after_s
-        ):
-            self.reset()
-
-    def update_quad(self, quad, now: float):
-        self._expire_if_stale(now)
-        if quad is None:
-            return None
-        candidate = np.asarray(quad, dtype=np.float32).reshape(-1, 2)
-        if candidate.shape != (4, 2) or not np.all(np.isfinite(candidate)):
-            return None
-        if self.quad is None:
-            self.quad = candidate.copy()
-        else:
-            self.quad = (
-                (1.0 - self.quad_alpha) * self.quad
-                + self.quad_alpha * candidate
-            )
-        self.last_update_at = now
-        return self.quad.copy()
-
-    def update_distance(self, distance_m, now: float):
-        self._expire_if_stale(now)
-        if distance_m is None:
-            return self.distance_m
-        value = float(distance_m)
-        if not math.isfinite(value) or value <= 0.0:
-            return self.distance_m
-        self.distance_samples.append(value)
-        if len(self.distance_samples) > self.distance_window:
-            self.distance_samples.pop(0)
-        robust_value = float(np.median(self.distance_samples))
-        if self.distance_m is None:
-            self.distance_m = robust_value
-        else:
-            self.distance_m = (
-                (1.0 - self.distance_alpha) * self.distance_m
-                + self.distance_alpha * robust_value
-            )
-        self.last_update_at = now
-        return self.distance_m
 
 
 class CameraState:
@@ -154,8 +70,7 @@ class CameraState:
             if self.zed_uvc:
                 self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 2560)
                 self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-        model_kwargs = {"task": "segment"} if self.zed_sdk else {}
-        self.model = YOLO(str(model_path), **model_kwargs)
+        self.model = YOLO(str(model_path), task="segment")
         self.device = device
         self.conf = conf
         self.config = TurretConfig()
@@ -172,8 +87,7 @@ class CameraState:
             pitch_axis_offset_y_m=0.0721,
             pitch_axis_offset_z_m=0.0,
         )
-        self.board_tracker = PreviewBoardTracker()
-        self.geometry_filter = _TemporalGeometryFilter()
+        self.vision = BoardVision(self.model, self.config, confidence=self.conf, device=self.device)
         self.confirmed_holes = []
         self.current_hole_id = None
 
@@ -310,121 +224,14 @@ class CameraState:
                 if self.zed_uvc and not self.zed_sdk
                 else frame
             )
-            result = self.model.predict(
-                inference_frame,
-                imgsz=640,
-                conf=self.conf,
-                device=self.device,
-                verbose=False,
-            )[0]
-            raw_detected = boxes_to_board_targets(result, self.conf)
-            board_surface = detect_dark_board_surface(
-                inference_frame,
-                value_threshold=self.config.board_dark_value_threshold,
-                min_area_fraction=self.config.board_min_area_fraction,
-                targets=raw_detected,
-            )
-            estimated_quad, tracked_estimate = self.board_tracker.update(
-                raw_detected,
-                inference_frame.shape,
-                time.monotonic(),
-            )
-            estimated_surface = False
-            if estimated_quad is not None and (
-                board_surface is None or board_surface.quad is None
-            ):
-                board_surface = _surface_from_estimated_quad(
-                    estimated_quad,
-                    inference_frame.shape,
-                )
-                estimated_surface = True
-            elif board_surface is not None and board_surface.quad is None:
-                board_surface = None
-            detected = filter_targets_to_surface(raw_detected, board_surface)
-            observed_plan = build_plan(
-                detected,
-                self.config.focal_length_x_px,
-                self.config.small_hole_diameter_m,
-                self.config.large_hole_diameter_m,
-                self.config.engage_large_first,
-                self.config.engage_left_to_right,
-                self.config.engage_bottom_to_top,
-                self.config.board_position_tolerance_cm,
-            )
-            plan = observed_plan
-            inferred = False
-            using_estimated_quad = False
-            if board_surface is not None and board_surface.quad is not None:
-                raw_plan_quad = board_surface.quad
-            elif estimated_quad is not None:
-                raw_plan_quad = estimated_quad
-                using_estimated_quad = True
-            else:
-                raw_plan_quad = None
-
-            now = time.monotonic()
-            plan_quad = self.geometry_filter.update_quad(raw_plan_quad, now)
-            raw_board_distance = None
-            if plan_quad is not None:
-                raw_board_distance = estimate_board_distance_from_targets(
-                    detected,
-                    plan_quad,
-                    self.config.focal_length_x_px,
-                    self.config.small_hole_diameter_m,
-                    self.config.large_hole_diameter_m,
-                    self.config.board_position_tolerance_cm,
-                )
-            board_distance = self.geometry_filter.update_distance(
-                raw_board_distance,
-                now,
-            )
-            if plan_quad is not None and board_distance is not None:
-                quad_plan = build_plan_from_board_quad(
-                    plan_quad,
-                    self.config.small_hole_diameter_m,
-                    self.config.large_hole_diameter_m,
-                    board_distance_m=board_distance,
-                    large_first=self.config.engage_large_first,
-                    left_to_right=self.config.engage_left_to_right,
-                    bottom_to_top=self.config.engage_bottom_to_top,
-                )
-                if len(quad_plan.targets) == 12:
-                    plan = quad_plan
-                    inferred = (
-                        using_estimated_quad
-                        or len(observed_plan.targets) != 12
-                    )
+            vision_result = self.vision.process(inference_frame, now=time.monotonic())
+            raw_detected = vision_result.raw_targets
+            detected = vision_result.targets
+            board_surface = vision_result.surface
+            plan = vision_result.plan or EngagementPlan([])
+            inferred = vision_result.inferred
             self._apply_manual_progress(plan)
-            display = result.plot()
-            if board_surface is not None and not estimated_surface:
-                cv2.drawContours(
-                    display,
-                    [board_surface.contour],
-                    -1,
-                    (0, 255, 255),
-                    2,
-                )
-            if estimated_surface:
-                cv2.polylines(
-                    display,
-                    [board_surface.contour],
-                    True,
-                    (255, 255, 0),
-                    2,
-                )
-                cv2.putText(
-                    display,
-                    "ESTIMATED BOARD" if not tracked_estimate else "TRACKED BOARD - INFERRED",
-                    (12, 54),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.55,
-                    (255, 255, 0),
-                    2,
-                    cv2.LINE_AA,
-                )
-            _draw_board_plan(display, plan)
-            if inferred and len(plan.targets) == 12:
-                _draw_inferred_board(display, plan, inferred=True)
+            display = vision_result.render(inference_frame)
             known = sum(t.diameter_m is not None for t in plan.targets)
             self._update_readonly_status(
                 plan,
@@ -526,7 +333,7 @@ def main() -> None:
         help=f'TensorRT/YOLO model (default: {DEFAULT_MODEL})',
     )
     parser.add_argument('--device', default='0')
-    parser.add_argument('--conf', type=float, default=0.25)
+    parser.add_argument('--conf', type=float, default=DEFAULT_CONFIDENCE)
     parser.add_argument(
         '--zed-uvc',
         action='store_true',

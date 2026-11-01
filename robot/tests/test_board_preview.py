@@ -14,9 +14,44 @@ from turret_control.run_zed_tensorrt_test import (
     PreviewBoardTracker, _estimate_board_quad, _filter_preview_result, _grid_geometry_valid, _select_grid_plan,
     _surface_from_estimated_quad,
 )
+from turret_control.board_vision import BoardVision
 
 
 class BoardPreviewTests(unittest.TestCase):
+    def test_shared_pipeline_detects_board_and_draws_inferred_grid(self):
+        quad = np.asarray(((540, 280), (802, 281), (835, 600), (513, 601)), np.float32)
+        reference = build_plan_from_board_quad(quad, .2, .4)
+        frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+        visible = [t for t in reference.targets if t.hole_id != "H12"]
+        boxes = torch.tensor([[t.u_px - t.width_px / 2, t.v_px - t.height_px / 2,
+                               t.u_px + t.width_px / 2, t.v_px + t.height_px / 2, .9, 0]
+                              for t in visible])
+        detected = Results(frame, path="test", names={0: "hole"}, boxes=boxes)
+
+        class Detector:
+            def predict(self, image, **kwargs):
+                return [detected]
+
+        vision = BoardVision(Detector(), TurretConfig())
+        result = vision.process(frame, now=0.0)
+        self.assertEqual(len(result.targets), 11)
+        self.assertEqual(len(result.plan.targets), 12)
+        self.assertTrue(result.inferred)
+        self.assertIsNotNone(result.quad)
+        display = result.render(frame)
+        cells = {(t.column, t.row): t for t in result.plan.targets}
+        a, b = cells[0, 0], cells[1, 0]
+        y = round((a.v_px + b.v_px) / 2)
+        x = round((a.u_px + b.u_px) / 2)
+        self.assertGreater(display[y, x, 0], 0)
+        self.assertEqual(display[y, x, 1], 0)
+        self.assertEqual(display[y, x, 0], display[y, x, 2])
+
+        empty = Results(frame, path="test", names={0: "hole"}, boxes=torch.empty((0, 6)))
+        lost = vision.analyze(frame, empty, now=20.0)
+        self.assertIsNone(lost.plan)
+        self.assertFalse(np.any(lost.render(frame)))
+
     def test_estimates_outline_from_observed_grid_with_missing_hole(self):
         corners = np.asarray(((540, 280), (802, 281), (835, 600), (513, 601)), np.float32)
         matrix = cv2.getPerspectiveTransform(np.asarray(((0, 0), (1, 0), (1, 1), (0, 1)), np.float32), corners)

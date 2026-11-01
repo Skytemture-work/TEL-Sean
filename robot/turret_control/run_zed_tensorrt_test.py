@@ -298,7 +298,7 @@ def _select_grid_plan(board_ready, plan, quad_plan, inferred_plan,
     return None, False
 
 
-def _draw_inferred_board(display: np.ndarray, plan, inferred: bool = True) -> None:
+def _draw_inferred_board(display: np.ndarray, plan, inferred: bool = True, *, show_banner: bool = True) -> None:
     """Draw the magenta board grid, marking geometry-only predictions."""
     color = (255, 0, 255)
     by_column = {}
@@ -331,16 +331,17 @@ def _draw_inferred_board(display: np.ndarray, plan, inferred: bool = True) -> No
         for (_, start), (_, end) in zip(points, points[1:]):
             cv2.line(display, start, end, color, 1, cv2.LINE_AA)
 
-    cv2.putText(
-        display,
-        "INFERRED BOARD ONLY - NO FIRE" if inferred else "OBSERVED BOARD GRID",
-        (12, 54),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.55,
-        color,
-        2,
-        cv2.LINE_AA,
-    )
+    if show_banner:
+        cv2.putText(
+            display,
+            "INFERRED BOARD ONLY - NO FIRE" if inferred else "OBSERVED BOARD GRID",
+            (12, 54),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            color,
+            2,
+            cv2.LINE_AA,
+        )
 
 
 def main() -> None:

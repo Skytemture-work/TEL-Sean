@@ -27,6 +27,8 @@ class DashboardState:
         }
         self._running = True
         self._lock = threading.Lock()
+        self._manual_enabled = False
+        self._manual_action = None
 
     def update_frame(self, frame: bytes) -> None:
         with self._lock:
@@ -45,6 +47,36 @@ class DashboardState:
             # JSON round-tripping gives the HTTP thread a detached structure
             # without exposing mutable plan lists across threads.
             return json.loads(json.dumps(self._telemetry, ensure_ascii=False))
+
+    def enable_manual_aim(self) -> None:
+        """Allow queued plan navigation in explicitly selected aim-only mode."""
+        with self._lock:
+            self._manual_enabled = True
+
+    def request_manual_action(self, action: str, expected_index, expected_hole):
+        with self._lock:
+            if not self._manual_enabled or action not in ("confirm", "reset"):
+                return False, "目前模式不支援手動切換"
+            if self._manual_action is not None:
+                return False, "上一個操作尚未處理"
+            snapshot = self._telemetry
+            age_ms = time.time() * 1000 - snapshot.get("generated_at_ms", 0)
+            manual = snapshot.get("manual_control", {})
+            if not manual.get("enabled") or not 0 <= age_ms < 2000:
+                return False, "狀態已逾時或尚未建立計畫"
+            if (type(expected_index) is not int or expected_index != manual.get("plan_index")
+                    or expected_hole != manual.get("current_hole_id")):
+                return False, "目前孔位已改變，請重新確認"
+            if action == "confirm" and expected_hole is None:
+                return False, "目前沒有可確認的孔位"
+            self._manual_action = (action, expected_index, expected_hole)
+            return True, "操作已送出，等待控制迴圈處理"
+
+    def take_manual_action(self):
+        with self._lock:
+            action = self._manual_action
+            self._manual_action = None
+            return action
 
     @property
     def running(self) -> bool:
@@ -128,6 +160,7 @@ def _plan_telemetry(
     board_plan: Any,
     *,
     detection_only: bool = False,
+    aim_only: bool = False,
     confirmed_holes=(),
 ) -> Dict[str, Any]:
     targets = list(getattr(plan, "targets", ()) or ())
@@ -162,7 +195,7 @@ def _plan_telemetry(
     sequence = []
     for position, target in enumerate(targets):
         hole_id = getattr(target, "hole_id", None) or "H??"
-        if detection_only and position < plan_index and hole_id in confirmed_set:
+        if (detection_only or aim_only) and position < plan_index and hole_id in confirmed_set:
             state = "confirmed"
         else:
             state = _sequence_state(position, plan_index, target)
@@ -265,6 +298,7 @@ def build_dashboard_snapshot(
     current_pitch_motor_rad: Optional[float] = None,
     depth_plane: Any = None,
     detection_only: bool = False,
+    aim_only: bool = False,
     confirmed_holes=(),
 ) -> Dict[str, Any]:
     """Convert live controller objects into browser-safe telemetry."""
@@ -275,6 +309,7 @@ def build_dashboard_snapshot(
         plan,
         board_plan,
         detection_only=detection_only,
+        aim_only=aim_only,
         confirmed_holes=confirmed_holes,
     )
 
@@ -331,6 +366,7 @@ def build_dashboard_snapshot(
             "match_phase": match_phase,
             "frame_size_ok": bool(frame_size_ok),
             "detection_only": bool(detection_only),
+            "aim_only": bool(aim_only),
         },
         "vision": {
             "raw_detections": int(raw_detection_count),
@@ -493,6 +529,32 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 time.sleep(0.05)
         except (BrokenPipeError, ConnectionResetError):
             pass
+
+    def do_POST(self):  # noqa: N802
+        path = urlsplit(self.path).path
+        if path not in ("/api/confirm", "/api/reset"):
+            self.send_error(404)
+            return
+        origin = self.headers.get("Origin")
+        if origin and urlsplit(origin).netloc != self.headers.get("Host"):
+            self.send_error(403)
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if not 0 < length <= 1024 or self.headers.get_content_type() != "application/json":
+                raise ValueError("invalid request")
+            payload = json.loads(self.rfile.read(length))
+            if not isinstance(payload, dict):
+                raise ValueError("invalid request")
+        except (ValueError, UnicodeDecodeError):
+            self.send_error(400)
+            return
+        ok, message = self.state.request_manual_action(
+            "confirm" if path == "/api/confirm" else "reset",
+            payload.get("plan_index"), payload.get("hole_id"),
+        )
+        body = json.dumps({"ok": ok, "message": message}, ensure_ascii=False).encode("utf-8")
+        self._send_bytes(body, "application/json; charset=utf-8", status=200 if ok else 409)
 
     def log_message(self, *_args):
         pass

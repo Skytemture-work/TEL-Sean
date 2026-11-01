@@ -455,7 +455,7 @@
         <div class="brand-mark">TEL</div>
         <div>
           <h1>Vision Detection Preview</h1>
-          <div class="subtitle">純偵測／唯讀：下一孔位、位置、距離與角度</div>
+          <div class="subtitle" id="modeSubtitle">下一孔位、位置、距離與角度</div>
         </div>
       </div>
       <div class="connection" id="connection">
@@ -496,7 +496,7 @@
 
       <aside class="panel target-panel">
         <div class="panel-head">
-          <div class="panel-title">下一個孔位（唯讀計算）</div>
+          <div class="panel-title" id="targetTitle">下一個孔位</div>
           <div class="panel-meta" id="modeMeta">NORMAL / —</div>
         </div>
         <div class="target-hero">
@@ -512,7 +512,7 @@
 
         <div class="manual-controls">
           <button id="confirmNext" type="button">人工確認此孔 → 下一孔</button>
-          <button id="resetPlan" class="reset" type="button">重設順序</button>
+          <button id="resetPlan" class="reset" type="button" title="重設後切回第一孔；實機僅瞄準模式可能移動砲口">重設順序</button>
         </div>
         <div class="manual-status" id="manualStatus">等待可確認的孔位</div>
 
@@ -589,6 +589,8 @@
   <script>
     const boardOrder = ["H10", "H11", "H12", "H03", "H06", "H09", "H02", "H05", "H08", "H01", "H04", "H07"];
     const stateText = { current: "目前孔位", confirmed: "已人工確認", fired: "已發射", pending: "待確認", skipped: "已略過", unscheduled: "未排程" };
+    let manualState = {};
+    let manualPending = false;
     const $ = id => document.getElementById(id);
 
     function text(id, value) { $(id).textContent = value; }
@@ -706,24 +708,28 @@
       const plan = data.plan || {};
       const score = data.score || {};
       const detectionOnly = Boolean(system.detection_only);
+      const aimOnly = Boolean(system.aim_only);
+      const confirmationMode = detectionOnly || aimOnly;
+      text("modeSubtitle", detectionOnly ? "純偵測／唯讀：下一孔位、位置、距離與角度" : (aimOnly ? "實機僅瞄準：人工切換孔位，不發射" : "實機瞄準與射擊狀態"));
+      text("targetTitle", detectionOnly ? "下一個孔位（唯讀計算）" : (aimOnly ? "下一個孔位（僅瞄準）" : "下一個孔位"));
 
       text("sumNext", target.hole_id || "—");
-      text("sumShot", plan.total_shots ? `第 ${Math.min((plan.index || 0) + 1, plan.total_shots)} / ${plan.total_shots} 球` : "尚未建立計畫");
+      text("sumShot", plan.total_shots ? `第 ${Math.min((plan.index || 0) + 1, plan.total_shots)} / ${plan.total_shots} ${confirmationMode ? "孔" : "球"}` : "尚未建立計畫");
       text("sumDistance", target.distance_m === null || target.distance_m === undefined ? "—" : `${target.distance_m.toFixed(2)} m`);
-      text("sumFired", integer(detectionOnly ? (plan.confirmed_shots || 0) : (plan.fired_shots || 0)));
-      text("sumFiredMeta", detectionOnly ? "已確認孔位" : `${(plan.fired_holes || []).length} 個孔位`);
+      text("sumFired", integer(confirmationMode ? (plan.confirmed_shots || 0) : (plan.fired_shots || 0)));
+      text("sumFiredMeta", confirmationMode ? "已確認孔位" : `${(plan.fired_holes || []).length} 個孔位`);
       text("sumRemaining", integer(plan.remaining_shots || 0));
-      text("sumTotal", `共 ${plan.total_shots || 0} 球`);
+      text("sumTotal", `共 ${plan.total_shots || 0} ${confirmationMode ? "孔" : "球"}`);
       text("sumCapacity", system.ammo_capacity === null || system.ammo_capacity === undefined ? "—" : `${system.ammo_capacity}`);
       text("sumPose", pose.source === "partial" && pose.state === "ready" ? "單孔／少孔追蹤" : (({ ready: "穩定", settling: "收斂中", invalid: "無效", virtual: "虛擬" })[pose.state] || "—"));
       text("sumPoseMeta", pose.reprojection_error_px === null || pose.reprojection_error_px === undefined ? "等待 PnP" : `${pose.source === "partial" ? "平移殘差" : "重投影誤差"} ${pose.reprojection_error_px.toFixed(2)} px`);
       text("sumGate", firing.allowed ? "就緒" : "鎖定");
       text("sumGateMeta", firing.allowed ? "可接受操作確認" : "安全條件未成立");
       $("sumGate").style.color = firing.allowed ? "var(--green)" : "var(--amber)";
-      $("sumFiredLabel").textContent = detectionOnly ? "已人工確認" : "已發射";
-      $("sumFiredMeta").textContent = detectionOnly ? "已確認孔位" : "已發射孔位";
-      $("firedHolesLabel").textContent = detectionOnly ? "已人工確認孔位" : "已發射孔位";
-      $("unfiredHolesLabel").textContent = detectionOnly ? "尚未確認孔位" : "未發射孔位";
+      $("sumFiredLabel").textContent = confirmationMode ? "已人工確認" : "已發射";
+      $("sumFiredMeta").textContent = confirmationMode ? "已確認孔位" : "已發射孔位";
+      $("firedHolesLabel").textContent = confirmationMode ? "已人工確認孔位" : "已發射孔位";
+      $("unfiredHolesLabel").textContent = confirmationMode ? "尚未確認孔位" : "未發射孔位";
 
       const planeMeta = vision.depth_plane_inliers == null ? "平面未採用" : `平面 ${vision.depth_plane_inliers}/${vision.depth_plane_samples} 點 / 誤差 ${fmt(vision.depth_plane_median_error_m, 3, " m")}`;
       text("visionMeta", `YOLO ${vision.raw_detections ?? "—"} / 靶面 ${vision.board_detections ?? "—"} / ${planeMeta}`);
@@ -759,37 +765,42 @@
       text("muzzlePitch", fmt(target.muzzle_pitch_deg, 2, "°"));
       text("commandYaw", fmt(target.command_yaw_error_deg, 2, "°"));
       text("commandPitch", fmt(target.command_pitch_error_deg, 2, "°"));
-      text("operatorConfirm", firing.operator_confirmation_pending ? "已確認" : "等待 F");
+      text("operatorConfirm", aimOnly ? "不發射" : (firing.operator_confirmation_pending ? "已確認" : "等待 F"));
 
       const manual = data.manual_control || {};
-      $("confirmNext").disabled = !manual.enabled || !manual.current_hole_id;
+      manualState = manual;
+      $("confirmNext").disabled = manualPending || !manual.enabled || !manual.current_hole_id;
+      $("resetPlan").disabled = manualPending || !manual.enabled;
       text("manualStatus", manual.current_hole_id
-        ? `目前 ${manual.current_hole_id}；按下按鈕只會切換唯讀辨識順序`
+        ? (aimOnly ? `目前 ${manual.current_hole_id}；確認後切換目標，砲口可能移動，不發射` : `目前 ${manual.current_hole_id}；按下按鈕只會切換唯讀辨識順序`)
         : "等待可確認的孔位");
 
       text("bonusHole", score.active_bonus_hole || "—");
       text("scoreTime", score.enabled ? fmt(score.remaining_s, 1, " s") : "未啟用");
 
-      renderBoard(plan.holes || [], detectionOnly);
-      renderChips("firedHoles", detectionOnly ? (plan.confirmed_holes || []) : (plan.fired_holes || []), true);
-      renderChips("unfiredHoles", detectionOnly ? (plan.pending_holes || []) : (plan.unfired_holes || []));
+      renderBoard(plan.holes || [], confirmationMode);
+      renderChips("firedHoles", confirmationMode ? (plan.confirmed_holes || []) : (plan.fired_holes || []), true);
+      renderChips("unfiredHoles", confirmationMode ? (plan.pending_holes || []) : (plan.unfired_holes || []));
       renderChips("pendingHoles", plan.pending_holes || []);
-      renderQueue(plan, detectionOnly);
+      renderQueue(plan, confirmationMode);
     }
 
     async function manualPost(path) {
       const confirmButton = $("confirmNext");
       const resetButton = $("resetPlan");
+      if (manualPending || !manualState.enabled) return;
+      const requestState = { plan_index: manualState.plan_index, hole_id: manualState.current_hole_id ?? null };
+      manualPending = true;
       confirmButton.disabled = true;
       resetButton.disabled = true;
       try {
-        const response = await fetch(path, { method: "POST" });
+        const response = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(requestState) });
         const result = await response.json();
         text("manualStatus", result.message || (result.ok ? "完成" : "操作失敗"));
       } catch (error) {
-        text("manualStatus", "操作失敗：無法連線到唯讀預覽服務");
+        text("manualStatus", "操作失敗：無法連線到儀表板服務");
       } finally {
-        resetButton.disabled = false;
+        manualPending = false;
       }
     }
 
