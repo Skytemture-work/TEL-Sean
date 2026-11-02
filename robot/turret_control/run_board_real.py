@@ -45,7 +45,7 @@ from .engagement import BoardEngagement, PartialPoseShotGate
 from .fixed_board import calibrate_layout, load_layout
 from .shared_motor_backend import SharedMotorBackend
 from .run_yolo_demo import _inference_frame
-from .scoring_light import ScoreRoundController
+from .scoring_light import ScoreRoundController, draw_score_light_overlay
 from .scoring_strategy import (
     MATCH_PHASES,
     append_reallocated_grid_shots,
@@ -339,6 +339,8 @@ def main(
     try:
         motors.enable()
         while True:
+            loop_started_at = time.perf_counter()
+            capture_started_at = loop_started_at
             if use_zed_sdk:
                 ok, frame, depth_data = camera.read()
             else:
@@ -346,13 +348,16 @@ def main(
                 depth_data = None
             if not ok:
                 break
+            frame_ready_at = time.perf_counter()
             vision_frame = _inference_frame(frame, args.zed_uvc)
             frame_size_ok = (
                 vision_frame.shape[1] == config.image_width_px
                 and vision_frame.shape[0] == config.image_height_px
             )
             now = time.monotonic()
+            inference_started_at = time.perf_counter()
             vision_result = vision.process(vision_frame, now=now, depth_data=depth_data)
+            inference_finished_at = time.perf_counter()
             raw_detected = vision_result.raw_targets
             detected = vision_result.targets
             board_surface = vision_result.surface
@@ -480,14 +485,19 @@ def main(
                 )
                 last_report = now
 
-            score_state = None
+            reference_plan = board_plan or plan
+            score_probe_state = score_round.update(
+                vision_frame,
+                reference_plan,
+                trusted_quad,
+            )
+            score_light_scores = (
+                score_probe_state.scores
+                if reference_plan is not None or trusted_quad is not None
+                else None
+            )
+            score_state = score_probe_state if args.score_mode else None
             if args.score_mode:
-                reference_plan = board_plan or plan
-                score_state = score_round.update(
-                    vision_frame,
-                    reference_plan,
-                    trusted_quad,
-                )
                 if (
                     score_state.phase == "active"
                     and score_state.active_hole_id is not None
@@ -615,6 +625,19 @@ def main(
                     )
                 last_target_id = target_id
             display = vision_result.render(vision_frame)
+            if score_light_scores is not None:
+                draw_score_light_overlay(
+                    display,
+                    score_light_scores,
+                    reference_plan,
+                    trusted_quad,
+                    active_hole_id=(
+                        score_state.active_hole_id
+                        if score_state is not None
+                        else None
+                    ),
+                    min_score=config.score_light_min_score,
+                )
             if args.score_mode and status.target is not None:
                 current_point = (
                     round(status.target.u_px),
@@ -644,9 +667,9 @@ def main(
             else:
                 text = f"12-hole {'READY' if plan else 'WAIT'} | remaining={status.remaining}"
             cv2.putText(display, text, (12, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 220, 0), 2)
-            if args.score_mode and score_state is not None:
+            if score_light_scores is not None:
                 score_text = " ".join(
-                    f"{hole_id}:{score_state.scores.get(hole_id, 0.0):.2f}"
+                    f"{hole_id}:{score_light_scores.get(hole_id, 0.0):.2f}"
                     for hole_id in ("H10", "H11", "H12")
                 )
                 cv2.putText(
@@ -679,13 +702,29 @@ def main(
             cv2.putText(
                 display,
                 pose_text,
-                (12, 82 if args.score_mode else 56),
+                (12, 82 if args.score_mode or score_light_scores is not None else 56),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.52,
                 pose_color,
                 2,
                 cv2.LINE_AA,
             )
+            jpeg_encode_ms = None
+            if dashboard is not None:
+                encode_started_at = time.perf_counter()
+                ok_jpg, encoded = cv2.imencode(
+                    ".jpg", display, [cv2.IMWRITE_JPEG_QUALITY, 80]
+                )
+                jpeg_encode_ms = (time.perf_counter() - encode_started_at) * 1000.0
+                if ok_jpg:
+                    dashboard.update_frame(encoded.tobytes())
+            latency = {
+                "capture_ms": (frame_ready_at - capture_started_at) * 1000.0,
+                "inference_ms": (inference_finished_at - inference_started_at) * 1000.0,
+                "frame_age_ms": (time.perf_counter() - frame_ready_at) * 1000.0,
+                "loop_ms": (time.perf_counter() - loop_started_at) * 1000.0,
+                "jpeg_encode_ms": jpeg_encode_ms,
+            }
             if dashboard is not None or telemetry_callback is not None:
                 telemetry = build_dashboard_snapshot(
                     plan=plan,
@@ -703,6 +742,8 @@ def main(
                     score_mode=args.score_mode,
                     match_phase=args.match_phase,
                     score_state=score_state,
+                    score_light_scores=score_light_scores,
+                    latency=latency,
                     bonus_hole_id=last_bonus_hole_id,
                     operator_fire_pending=fire_requested,
                     aim_only=args.aim_only,
@@ -729,10 +770,6 @@ def main(
                     telemetry_callback(telemetry)
                 if dashboard is not None:
                     dashboard.update_telemetry(telemetry)
-            if dashboard is not None:
-                ok_jpg, encoded = cv2.imencode(".jpg", display, [cv2.IMWRITE_JPEG_QUALITY, 80])
-                if ok_jpg:
-                    dashboard.update_frame(encoded.tobytes())
             key = -1
             if not args.headless:
                 cv2.imshow(window, display)

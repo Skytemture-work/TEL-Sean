@@ -42,13 +42,26 @@ class BoardVisionResult:
     def render(self, frame: np.ndarray) -> np.ndarray:
         """Draw verified detections, board outline and the complete grid."""
         filtered = _filter_preview_result(self.result, self.raw_targets, self.surface, self.confidence)
-        display = filtered.plot() if filtered is not None else frame.copy()
+        # Ultralytics' default class/confidence labels are large and overlap
+        # on this dense 3x4 board.  Keep the thin masks/boxes and use the
+        # compact board labels drawn below instead.
+        display = (
+            filtered.plot(labels=False, line_width=1)
+            if filtered is not None
+            else frame.copy()
+        )
         if self.surface is not None:
             color = (255, 255, 0) if self.estimated_surface else (0, 255, 255)
             cv2.drawContours(display, [self.surface.contour], -1, color, 2)
         if _grid_geometry_valid(self.plan, frame.shape):
             _draw_board_plan(display, self.plan)
-            _draw_inferred_board(display, self.plan, inferred=self.inferred, show_banner=False)
+            _draw_inferred_board(
+                display,
+                self.plan,
+                inferred=self.inferred,
+                show_banner=False,
+                show_labels=not self.inferred,
+            )
         return display
 
 

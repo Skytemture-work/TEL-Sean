@@ -298,7 +298,14 @@ def _select_grid_plan(board_ready, plan, quad_plan, inferred_plan,
     return None, False
 
 
-def _draw_inferred_board(display: np.ndarray, plan, inferred: bool = True, *, show_banner: bool = True) -> None:
+def _draw_inferred_board(
+    display: np.ndarray,
+    plan,
+    inferred: bool = True,
+    *,
+    show_banner: bool = True,
+    show_labels: bool = True,
+) -> None:
     """Draw the magenta board grid, marking geometry-only predictions."""
     color = (255, 0, 255)
     by_column = {}
@@ -311,16 +318,17 @@ def _draw_inferred_board(display: np.ndarray, plan, inferred: bool = True, *, sh
         by_row.setdefault(target.row, []).append((target.column, point))
         cv2.drawMarker(display, point, color, cv2.MARKER_CROSS, 18, 2)
         cv2.circle(display, point, 12, color, 1, cv2.LINE_AA)
-        cv2.putText(
-            display,
-            f"{'INFER ' if inferred else ''}{target.hole_id or 'H??'}",
-            (point[0] + 8, point[1] + 5),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.35,
-            color,
-            1,
-            cv2.LINE_AA,
-        )
+        if show_labels:
+            cv2.putText(
+                display,
+                f"{'INFER ' if inferred else ''}{target.hole_id or 'H??'}",
+                (point[0] + 8, point[1] + 5),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.35,
+                color,
+                1,
+                cv2.LINE_AA,
+            )
 
     for points in by_column.values():
         points.sort()

@@ -204,6 +204,96 @@ def detect_score_light_scores(
     return scores
 
 
+def draw_score_light_overlay(
+    frame: np.ndarray,
+    scores: Dict[str, float],
+    plan: Optional[EngagementPlan] = None,
+    board_quad: Optional[np.ndarray] = None,
+    active_hole_id: Optional[str] = None,
+    min_score: float = 0.12,
+) -> np.ndarray:
+    """Annotate the three scoring-light regions without changing control state.
+
+    The detector measures red pixels in the LED annulus.  This overlay makes
+    that measurement visible in both score mode and aim-only diagnostics.  It
+    is deliberately presentation-only: it never selects a target or enables
+    firing.
+    """
+
+    if frame is None or frame.ndim != 3:
+        return frame
+
+    targets_by_id = {}
+    if plan is not None:
+        targets_by_id = {
+            target.hole_id: target
+            for target in plan.targets
+            if target.hole_id in SCORE_HOLE_IDS
+        }
+
+    projected_centers = {}
+    if board_quad is not None:
+        source = np.asarray(
+            [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)],
+            dtype=np.float32,
+        )
+        quad = np.asarray(board_quad, dtype=np.float32).reshape(4, 2)
+        try:
+            matrix = cv2.getPerspectiveTransform(source, quad)
+            points = np.asarray(
+                [hole_position_for_cell(column, 0) for column in range(3)],
+                dtype=np.float32,
+            ).reshape(-1, 1, 2)
+            projected = cv2.perspectiveTransform(points, matrix).reshape(-1, 2)
+            projected_centers = {
+                hole_id: tuple(float(value) for value in projected[column])
+                for column, hole_id in enumerate(SCORE_HOLE_IDS)
+            }
+        except (cv2.error, ValueError):
+            projected_centers = {}
+
+    for hole_id in SCORE_HOLE_IDS:
+        target = targets_by_id.get(hole_id)
+        if target is not None:
+            center = (int(round(target.u_px)), int(round(target.v_px)))
+            axes = (
+                max(14, int(round(target.width_px * 0.90))),
+                max(14, int(round(target.height_px * 0.90))),
+            )
+        elif hole_id in projected_centers:
+            center = tuple(int(round(value)) for value in projected_centers[hole_id])
+            axes = (24, 24)
+        else:
+            continue
+
+        score = float(scores.get(hole_id, 0.0))
+        if hole_id == active_hole_id:
+            color = (255, 0, 255)  # BGR magenta: locked scoring target.
+        elif score >= min_score:
+            color = (0, 0, 255)  # BGR red: detected red light.
+        else:
+            color = (130, 130, 130)
+
+        cv2.ellipse(frame, center, axes, 0.0, 0.0, 360.0, color, 2, cv2.LINE_AA)
+        cv2.circle(frame, center, 4, color, cv2.FILLED, cv2.LINE_AA)
+        label = f"RED {score:.2f}"
+        label_origin = (
+            center[0] - axes[0],
+            min(frame.shape[0] - 6, center[1] + axes[1] + 16),
+        )
+        cv2.putText(
+            frame,
+            label,
+            label_origin,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.38,
+            color,
+            1,
+            cv2.LINE_AA,
+        )
+    return frame
+
+
 class ScoreRoundController:
     """Lock one detected scoring hole for the complete 60-second round."""
 

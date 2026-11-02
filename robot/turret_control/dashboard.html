@@ -226,6 +226,16 @@
     .vision-stat:last-child { border-right: 0; }
     .vision-stat b { display: block; margin-top: 5px; font-size: 15px; font-variant-numeric: tabular-nums; }
 
+    .latency-strip {
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      border-top: 1px solid var(--line);
+      background: rgba(5, 10, 17, .42);
+    }
+    .latency-stat { min-width: 0; padding: 9px 12px 10px; border-right: 1px solid var(--line); }
+    .latency-stat:last-child { border-right: 0; }
+    .latency-stat b { display: block; margin-top: 4px; color: var(--cyan); font-size: 13px; font-variant-numeric: tabular-nums; }
+
     .target-panel { padding-bottom: 14px; }
 
     .target-hero {
@@ -417,6 +427,32 @@
     .score-box b { color: var(--red); }
     .score-time { color: var(--amber); font-weight: 800; font-variant-numeric: tabular-nums; }
 
+    .red-light-box {
+      margin: 12px 15px 0;
+      padding: 11px 12px;
+      border: 1px solid rgba(255, 72, 72, .28);
+      border-radius: 11px;
+      background: rgba(42, 8, 12, .22);
+    }
+    .red-light-head { display: flex; justify-content: space-between; gap: 10px; align-items: center; }
+    .red-light-mode { color: var(--muted); font-size: 10px; }
+    .red-light-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 7px; margin-top: 9px; }
+    .red-light-chip {
+      display: grid;
+      gap: 3px;
+      padding: 8px 7px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      color: var(--muted);
+      background: rgba(7, 12, 20, .58);
+      font-size: 10px;
+    }
+    .red-light-chip b { color: #c9d7e6; font-size: 12px; }
+    .red-light-chip.detected { border-color: rgba(255, 72, 72, .78); color: #ff9b9b; }
+    .red-light-chip.detected b { color: #ff5e5e; }
+    .red-light-chip.active { border-color: rgba(255, 79, 216, .86); color: #ffd4f6; box-shadow: inset 0 0 0 1px rgba(255, 79, 216, .22); }
+    .red-light-chip.active b { color: #ff4fd8; }
+
     @media (max-width: 1160px) {
       .summary-grid { grid-template-columns: repeat(3, 1fr); }
       .workspace { grid-template-columns: 1fr; }
@@ -492,6 +528,13 @@
           <div class="vision-stat"><span class="eyebrow">姿態對應點</span><b id="posePoints">—</b></div>
           <div class="vision-stat"><span class="eyebrow">位置殘差</span><b id="poseError">—</b></div>
         </div>
+        <div class="latency-strip">
+          <div class="latency-stat"><span class="eyebrow">取像</span><b id="latencyCapture">—</b></div>
+          <div class="latency-stat"><span class="eyebrow">畫面年齡</span><b id="latencyAge">—</b></div>
+          <div class="latency-stat"><span class="eyebrow">YOLO</span><b id="latencyInference">—</b></div>
+          <div class="latency-stat"><span class="eyebrow">控制迴圈</span><b id="latencyLoop">—</b></div>
+          <div class="latency-stat"><span class="eyebrow">JPEG</span><b id="latencyJpeg">—</b></div>
+        </div>
       </article>
 
       <aside class="panel target-panel">
@@ -551,6 +594,18 @@
         <div class="score-box">
           <div><span class="eyebrow">指定得分孔</span><br><b id="bonusHole">—</b></div>
           <div class="score-time" id="scoreTime">—</div>
+        </div>
+
+        <div class="red-light-box">
+          <div class="red-light-head">
+            <span class="eyebrow">紅燈辨識</span>
+            <span class="red-light-mode" id="redLightMode">未取得靶面</span>
+          </div>
+          <div class="red-light-grid">
+            <div class="red-light-chip" id="redH10"><b>H10</b><span>—</span></div>
+            <div class="red-light-chip" id="redH11"><b>H11</b><span>—</span></div>
+            <div class="red-light-chip" id="redH12"><b>H12</b><span>—</span></div>
+          </div>
         </div>
       </aside>
     </section>
@@ -699,6 +754,27 @@
         : `${plan.fired_shots || 0} 已射 / ${plan.pending_shots || 0} 待射 / ${plan.total_shots || 0} 總計`);
     }
 
+    function renderRedLights(redLights, score) {
+      const available = Boolean(redLights.available);
+      const threshold = Number(redLights.threshold ?? .12);
+      const activeHole = score.enabled ? (score.active_bonus_hole || null) : null;
+      text("redLightMode", !available
+        ? "未取得靶面"
+        : (activeHole ? `已鎖定 ${activeHole}` : (score.enabled ? "等待鎖定" : "監看中")));
+      ["H10", "H11", "H12"].forEach(holeId => {
+        const chip = document.getElementById("red" + holeId);
+        const value = redLights.scores ? redLights.scores[holeId] : null;
+        const scoreText = value === null || value === undefined ? "—" : Number(value).toFixed(2);
+        const detected = value !== null && value !== undefined && Number(value) >= threshold;
+        const active = activeHole === holeId;
+        chip.className = `red-light-chip${detected ? " detected" : ""}${active ? " active" : ""}`;
+        chip.querySelector("b").textContent = holeId;
+        chip.querySelector("span").textContent = !available
+          ? "未定位"
+          : `${detected ? "紅光候選" : "未達門檻"} ${scoreText}`;
+      });
+    }
+
     function render(data) {
       const system = data.system || {};
       const vision = data.vision || {};
@@ -707,6 +783,8 @@
       const target = data.target || {};
       const plan = data.plan || {};
       const score = data.score || {};
+      const redLights = data.red_lights || {};
+      const latency = data.latency || {};
       const detectionOnly = Boolean(system.detection_only);
       const aimOnly = Boolean(system.aim_only);
       const confirmationMode = detectionOnly || aimOnly;
@@ -737,6 +815,12 @@
       text("boardDetections", integer(vision.board_detections));
       text("posePoints", integer(pose.correspondences));
       text("poseError", fmt(pose.reprojection_error_px, 2, " px"));
+      const fmtMs = value => value === null || value === undefined ? "—" : `${Number(value).toFixed(1)} ms`;
+      text("latencyCapture", fmtMs(latency.capture_ms));
+      text("latencyAge", fmtMs(latency.frame_age_ms));
+      text("latencyInference", fmtMs(latency.inference_ms));
+      text("latencyLoop", fmtMs(latency.loop_ms));
+      text("latencyJpeg", fmtMs(latency.jpeg_encode_ms));
       text("videoTarget", `TARGET ${target.hole_id || "—"}`);
       text("videoPose", `POSE ${(pose.source || "—").toUpperCase()} ${(pose.state || "—").toUpperCase()}`);
 
@@ -777,6 +861,7 @@
 
       text("bonusHole", score.active_bonus_hole || "—");
       text("scoreTime", score.enabled ? fmt(score.remaining_s, 1, " s") : "未啟用");
+      renderRedLights(redLights, score);
 
       renderBoard(plan.holes || [], confirmationMode);
       renderChips("firedHoles", confirmationMode ? (plan.confirmed_holes || []) : (plan.fired_holes || []), true);

@@ -300,6 +300,8 @@ def build_dashboard_snapshot(
     detection_only: bool = False,
     aim_only: bool = False,
     confirmed_holes=(),
+    score_light_scores: Optional[Dict[str, float]] = None,
+    latency: Optional[Dict[str, float]] = None,
 ) -> Dict[str, Any]:
     """Convert live controller objects into browser-safe telemetry."""
 
@@ -357,6 +359,24 @@ def build_dashboard_snapshot(
             str(key): _json_number(value, 3)
             for key, value in getattr(score_state, "scores", {}).items()
         }
+
+    red_light_scores = {
+        str(key): _json_number(value, 3)
+        for key, value in (score_light_scores or {}).items()
+    }
+    red_light_best = None
+    if red_light_scores:
+        red_light_best = max(
+            red_light_scores,
+            key=lambda key: red_light_scores[key]
+            if red_light_scores[key] is not None
+            else float("-inf"),
+        )
+    red_light_threshold = float(getattr(config, "score_light_min_score", 0.12))
+    latency_data = {
+        str(key): _json_number(value, 1)
+        for key, value in (latency or {}).items()
+    }
 
     return {
         "generated_at_ms": int(time.time() * 1000),
@@ -458,6 +478,13 @@ def build_dashboard_snapshot(
             ),
             "scores": score_scores,
         },
+        "red_lights": {
+            "available": score_light_scores is not None,
+            "best_hole_id": red_light_best,
+            "threshold": _json_number(red_light_threshold, 3),
+            "scores": red_light_scores,
+        },
+        "latency": latency_data,
     }
 
 

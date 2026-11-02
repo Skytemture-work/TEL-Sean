@@ -52,7 +52,7 @@ def _inference_frame(frame, zed_uvc: bool):
 
 def _draw_board_plan(display, plan: EngagementPlan) -> None:
     """Draw the ordered board plan over the YOLO result image."""
-    for number, target in enumerate(plan.targets, 1):
+    for target in plan.targets:
         if target.diameter_m == 0.40:
             color = (0, 220, 0)       # large hole
         elif target.diameter_m == 0.20:
@@ -74,18 +74,19 @@ def _draw_board_plan(display, plan: EngagementPlan) -> None:
             2,
         )
 
-        diameter = "?" if target.diameter_m is None else f"{target.diameter_m * 100:.0f}cm"
         distance = "?" if target.distance_m is None else f"{target.distance_m:.2f}m"
         hole_id = target.hole_id or "H??"
-        label = f"#{number} {hole_id} Ø{diameter} {distance}"
+        # Keep labels short; the full distance/confidence details remain in
+        # the dashboard and the dense top row otherwise overlaps itself.
+        label = f"{hole_id} {distance}"
         cv2.putText(
             display,
             label,
             (left, max(18, top - 6)),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.48,
+            0.35,
             color,
-            2,
+            1,
             cv2.LINE_AA,
         )
 
