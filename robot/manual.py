@@ -5,16 +5,15 @@
 # E,MODE,VX,VY,WZ,YAW,PITCH,FIRE,SPEED
 #
 # 暫定硬體分配：
-#   can0：彈藥倉馬達，ID 1，每格 6666 pulses
-#   can1：MKS 射擊機構馬達，ID 1
+#   can0：共用 MKS CAN bus；彈藥倉 ID 2、射擊機構 ID 1
+#   彈藥倉每格移動 6666 pulses
 #   VESC_LEFT_PORT / VESC_RIGHT_PORT：射擊雙馬達轉速控制（UART）
 #
 # 注意：
 # 1. ESP32 的 yaw/pitch (0~100) 對應水平 -34.5~+34.5°、垂直 0° 至已記錄 home 的估算仰角。
-# 2. FIRE 每次由 0 變 1，觸發一個射擊循環。
-# 3. 每個射擊循環包含 1700 -> 3000 pulses -> 反向回零 -> 正向回零。
-# 4. 每格累積 3 次循環後，才允許彈藥倉轉動一格。
-# 5. VESC speed=0..100 線性映射至 0..VESC_MAX_RPM；speed=0 送出 0 ERPM。
+# 2. FIRE 每次由 0 變 1，觸發一次回零與轉格流程。
+# 3. FIRE 觸發後，can0 / ID1 正向回零；完成後 can0 / ID2 正轉 6666 pulses。
+# 5. 手動 VESC 目標轉速為 1000 + speed*10 RPM（speed 0..100）。
 # 6. 請先確認 DM 與兩個 VESC 使用不同的序列埠，並卸除彈藥進行低速測試。
 
 import time
@@ -25,10 +24,10 @@ from pathlib import Path
 
 import serial
 
-# 使用專案已驗證的 DM 雙軸控制器（包含加減速、回授及水平安全聯鎖）。
-from turret_control.run_vertical_panel import MotorWorker
+from turret_control.backends import DamiaoSerialBackend
 from turret_control.pitch import load_pitch_calibration, load_yaw_calibration
-from turret_control.limits import load_workspace_limit
+from turret_control.limits import load_motor_limits, load_workspace_limit
+from turret_control.trajectory import acceleration_limited_step
 
 import can
 from mks_servo_can import MksServo
@@ -43,25 +42,30 @@ from mks_servo_can.mks_enums import (
 
 # -------------------- 可調整設定 --------------------
 AMMO_CAN_INTERFACE = "can0"
-SHOOTING_CAN_INTERFACE = "can1"
+SHOOTING_CAN_INTERFACE = "can0"
 
 # DM USB-to-CAN 調試板（與 Xavier UART / MKS CAN 分開）
 DM_PORT = "/dev/ttyACM0"
 DM_STARTUP_POSE = Path(__file__).resolve().parent / "turret_control" / "startup_pose.json"
-DM_CONTROL_MODE = "posvel"
-DM_SPEED_RAD_S = 0.06
-DM_ACCELERATION_RAD_S2 = 0.05
+DM_SPEED_RAD_S = 0.30
+DM_ACCELERATION_RAD_S2 = 0.50
+DM_STATUS_PRINT_INTERVAL_S = 0.5
 DM_TORQUE_FF_NM = 0.0
-DM_TORQUE_RAMP_S = 1.5
-DM_KP = 50.0
-DM_KD = 1.5
-DM_MAX_TRACKING_ERROR_DEG = 10.0
-DM_STALL_TIMEOUT_S = 2.0
-DM_MIN_PITCH_DEG = 0.0
+DM_KP = 30.0
+DM_KD = 1.0
+DM_MIN_PITCH_DEG = 35.0
 DM_MAX_PITCH_DEG = 45.0
+DM_STARTUP_PITCH_DEG = 35.0
+DM_STARTUP_PITCH_TOLERANCE_DEG = 0.5
+DM_SHUTDOWN_YAW_TOLERANCE_DEG = 0.5
 DM_MIN_YAW_DEG = -34.5
 DM_MAX_YAW_DEG = 34.5
 DM_MAX_PITCH_FOR_YAW_DEG = 35.0
+# 搖桿以 50 為中點；偏離中點時按時間改變 DM 目標角度。
+DM_STICK_CENTER = 50
+DM_STICK_DEADZONE = 2
+DM_YAW_RATE_DEG_S = 10.0
+DM_PITCH_RATE_DEG_S = 8.0
 
 # 雙 VESC 射擊馬達：請依實際裝置名稱調整。
 # 注意：DM_PORT 使用 /dev/ttyACM0，因此 VESC 不可再使用同一個序列埠。
@@ -71,12 +75,13 @@ VESC_RIGHT_PORT = "/dev/ttyACM2"
 VESC_BAUDRATE = 921600
 VESC_LEFT_POLE_PAIRS = 7
 VESC_RIGHT_POLE_PAIRS = 7
-VESC_MAX_RPM = 3000.0          # speed=100 對應的目標 RPM
+VESC_MIN_RPM = 1000.0
+VESC_RPM_PER_SPEED_UNIT = 10.0  # speed=100 對應 2000 RPM
 VESC_LOOP_INTERVAL = 0.10
 VESC_TELEMETRY_TIMEOUT = 0.5
 VESC_MAX_MOTOR_CURRENT_A = 50.0
 VESC_MAX_INPUT_VOLTAGE_V = 30.0
-VESC_MIN_INPUT_VOLTAGE_V = 18.0
+VESC_MIN_INPUT_VOLTAGE_V = 10.5
 VESC_MAX_TRIM_ERPM = 100.0
 VESC_MAX_SYNC_CORRECTION_ERPM = 50.0
 VESC_SPEED_KP = 0.10
@@ -90,11 +95,11 @@ VESC_PACKET_SHORT = 2
 VESC_PACKET_LONG = 3
 VESC_PACKET_END = 3
 
-AMMO_MOTOR_CAN_ID = 1
+AMMO_MOTOR_CAN_ID = 2
 SHOOTING_MOTOR_CAN_ID = 1
 
-AMMO_SLOT_PULSES = 6666
-AMMO_SPEED_RPM = 10          # 初次整合先低速測試
+AMMO_SLOT_PULSES = 6670
+AMMO_SPEED_RPM = 1500
 SHOOTING_SPEED_RPM = 10      # 初次整合先低速測試
 ACCELERATION = 2
 
@@ -103,12 +108,11 @@ MOVE_DIRECTION = (
     Direction.CCW if HOME_DIRECTION == Direction.CW else Direction.CW
 )
 HOME_SPEED_RPM = 10
-HOME_CURRENT_MA = 200
+HOME_CURRENT_MA = 300
 REVERSE_ANGLE = 0x0400
 
 TARGET_POSITIONS = (1700, 3000)
 SLOTS_PER_MAGAZINE = 6
-SHOTS_PER_SLOT = 3
 
 MOVE_TIMEOUT = 30.0
 HOME_TIMEOUT = 30.0
@@ -118,6 +122,14 @@ SETTLE_TIME = 0.2
 # FIRE 指令若持續為 1，只在上升沿觸發一次，不會連續重複射擊。
 # 射擊循環在背景執行緒處理；主迴圈仍可更新 VESC speed 與接收遙控器封包。
 # ---------------------------------------------------
+
+
+def normalize_vrb_speed(vrb_value):
+    """Convert raw iBUS VRB (1000..2000) or ESP32 mapped speed (0..100) to 0..100."""
+    value = int(vrb_value)
+    if 1000 <= value <= 2000:
+        value = round((value - 1000) / 10.0)
+    return max(0, min(100, value))
 
 
 # ==================== VESC 雙馬達控制 ====================
@@ -247,13 +259,14 @@ def vesc_decode_values(payload):
 class VESCDualMotorController:
     """
     背景控制左右 VESC 馬達。
-    speed 0..100 線性映射為 0..VESC_MAX_RPM，0 代表送出 0 ERPM。
+    手動 speed 0..100 對應 1000..2000 RPM；None 代表安全停轉。
     保留使用者原始程式的 PI 調速與交叉同步修正。
     """
 
     def __init__(self):
         self._lock = threading.Lock()
-        self._speed_percent = 0
+        # VRB=0 對應最低目標 1000 RPM，啟動時先以最低轉速運作。
+        self._speed_value = 0
         self._stop_event = threading.Event()
         self._thread = None
         self._ser_left = None
@@ -261,19 +274,33 @@ class VESCDualMotorController:
         self.error = None
 
     def start(self):
+        print("[VESC] 啟動控制執行緒，初始 VRB=0，目標 1000 RPM。", flush=True)
         self._thread = threading.Thread(
             target=self._run, name="VESC-Dual-Motor", daemon=True
         )
         self._thread.start()
 
-    def set_speed(self, speed_percent):
-        speed_percent = max(0, min(100, int(speed_percent)))
+    def set_speed(self, speed_value):
+        if speed_value is not None:
+            speed_value = max(0, min(100, int(speed_value)))
         with self._lock:
-            self._speed_percent = speed_percent
+            previous = self._speed_value
+            self._speed_value = speed_value
+        if speed_value != previous:
+            target_rpm = (
+                "STOP" if speed_value is None
+                else int(VESC_MIN_RPM + speed_value * VESC_RPM_PER_SPEED_UNIT)
+            )
+            print(
+                "[VESC CMD] speed={} -> target={} RPM".format(
+                    "STOP" if speed_value is None else speed_value, target_rpm
+                ),
+                flush=True,
+            )
 
-    def _get_speed_percent(self):
+    def _get_speed_value(self):
         with self._lock:
-            return self._speed_percent
+            return self._speed_value
 
     @staticmethod
     def _clamp(value, low, high):
@@ -353,11 +380,14 @@ class VESCDualMotorController:
                 left = self._read_motor(reader_left)
                 right = self._read_motor(reader_right)
 
-                speed_percent = self._get_speed_percent()
-                target_rpm = VESC_MAX_RPM * speed_percent / 100.0
+                speed_value = self._get_speed_value()
+                target_rpm = (
+                    None if speed_value is None
+                    else VESC_MIN_RPM + speed_value * VESC_RPM_PER_SPEED_UNIT
+                )
 
-                if target_rpm <= 0:
-                    # speed=0 時清除積分並命令兩顆馬達停轉。
+                if target_rpm is None:
+                    # 自動模式或關閉時清除積分並命令兩顆馬達停轉。
                     pi_left_integral = 0.0
                     pi_right_integral = 0.0
                     target_left = target_right = 0
@@ -390,9 +420,19 @@ class VESCDualMotorController:
                 vesc_send_set_rpm(self._ser_left, target_left)
                 vesc_send_set_rpm(self._ser_right, target_right)
                 print(
-                    "[VESC] speed={}%, target={} RPM | L={} ERPM, R={} ERPM".format(
-                        speed_percent, int(target_rpm), left["erpm"], right["erpm"]
-                    )
+                    "[VESC] VRB={} -> target={} RPM | "
+                    "L cmd={} ERPM actual={} ERPM ({:.1f} RPM) | "
+                    "R cmd={} ERPM actual={} ERPM ({:.1f} RPM)".format(
+                        "STOP" if speed_value is None else speed_value,
+                        0 if target_rpm is None else int(target_rpm),
+                        target_left,
+                        left["erpm"],
+                        left["erpm"] / VESC_LEFT_POLE_PAIRS,
+                        target_right,
+                        right["erpm"],
+                        right["erpm"] / VESC_RIGHT_POLE_PAIRS,
+                    ),
+                    flush=True,
                 )
                 self._stop_event.wait(VESC_LOOP_INTERVAL)
 
@@ -410,7 +450,7 @@ class VESCDualMotorController:
             print("[VESC] 雙馬達控制執行緒已關閉。")
 
     def close(self, timeout=3.0):
-        self.set_speed(0)
+        self.set_speed(None)
         self._stop_event.set()
         if self._thread is not None:
             self._thread.join(timeout=timeout)
@@ -423,6 +463,380 @@ def enable_motor_compat(servo, enabled=True):
     commands = method_globals["MksCommands"]
     value = Enable.Enable.value if enabled else Enable.Disable.value
     return servo.set_generic_status(commands.ENABLE_MOTOR_COMMAND, [value])
+
+
+class ManualDMTurret:
+    """Manual joystick angle integration and local DAMIAO MIT control loop."""
+
+    def __init__(self):
+        self.yaw_calibration = load_yaw_calibration(DM_STARTUP_POSE)
+        self.pitch_calibration = load_pitch_calibration(DM_STARTUP_POSE)
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._shutdown_requested = False
+        self._shutdown_pose_reached = False
+        self._requested = False
+        self._target_yaw_deg = None
+        self._target_pitch_deg = None
+        self._ready = False
+        self._enabled = False
+        self._startup_complete = False
+        self._current_yaw_deg = None
+        self._current_pitch_deg = None
+        self._error = None
+        self._thread = threading.Thread(
+            target=self._run_dm_loop,
+            name="manual-dm-control",
+            daemon=True,
+        )
+        self._thread.start()
+        self.target_yaw_deg = None
+        self.target_pitch_deg = None
+        self.last_update = None
+        self.last_error = None
+
+    def snapshot(self):
+        with self._lock:
+            return {
+                "ready": self._ready,
+                "enabled": self._enabled,
+                "startup_complete": self._startup_complete,
+                "yaw_deg": self._current_yaw_deg,
+                "pitch_deg": self._current_pitch_deg,
+                "error": self._error,
+            }
+
+    def _publish(self, **values):
+        with self._lock:
+            for name, value in values.items():
+                setattr(self, "_" + name, value)
+
+    def _run_dm_loop(self):
+        motors = None
+        enabled = False
+        try:
+            workspace = load_workspace_limit()
+            motors = DamiaoSerialBackend(
+                motor_ids=[0x03, 0x01],
+                port=DM_PORT,
+                mode="mit",
+                kp=DM_KP,
+                kd=DM_KD,
+                enable_on_start=False,
+                position_limits=load_motor_limits(),
+                workspace=workspace,
+                yaw_calibration=self.yaw_calibration,
+                pitch_calibration=self.pitch_calibration,
+            )
+
+            # 先取得兩軸回授，沒有有效位置時不允許使能。
+            yaw_state = pitch_state = None
+            for _ in range(6):
+                motors.refresh()
+                yaw_state = motors.get_state(0x03)
+                pitch_state = motors.get_state(0x01)
+                if yaw_state is not None and pitch_state is not None:
+                    break
+                time.sleep(0.03)
+            if yaw_state is None or pitch_state is None:
+                raise RuntimeError("讀不到 DM 水平／垂直馬達回授")
+
+            command_yaw = yaw_state.position_rad
+            command_pitch = pitch_state.position_rad
+            yaw_velocity = pitch_velocity = 0.0
+            startup_yaw_deg = math.degrees(
+                self.yaw_calibration.muzzle_from_motor(command_yaw)
+            )
+            with self._lock:
+                self._target_yaw_deg = startup_yaw_deg
+                self._target_pitch_deg = DM_STARTUP_PITCH_DEG
+                self._requested = True
+            self._publish(
+                ready=True,
+                error=None,
+                current_yaw_deg=startup_yaw_deg,
+                current_pitch_deg=math.degrees(
+                    self.pitch_calibration.muzzle_from_motor(command_pitch)
+                ),
+            )
+            print(
+                "[Manual] DM 已連線：yaw=0x03 pitch=0x01，MIT "
+                "kp={} kd={} speed={} rad/s".format(
+                    DM_KP, DM_KD, DM_SPEED_RAD_S
+                ),
+                flush=True,
+            )
+
+            previous_tick = time.monotonic()
+            next_status_print = previous_tick
+            retry_at = 0.0
+            while not self._stop.is_set():
+                now = time.monotonic()
+                with self._lock:
+                    requested = self._requested
+                    target_yaw_deg = self._target_yaw_deg
+                    target_pitch_deg = self._target_pitch_deg
+                    shutdown_requested = self._shutdown_requested
+
+                if shutdown_requested:
+                    # 關閉前先回水平零位，並把垂直目標保持在 35°。
+                    target_yaw_deg = 0.0
+                    target_pitch_deg = DM_MIN_PITCH_DEG
+                    with self._lock:
+                        self._target_yaw_deg = target_yaw_deg
+                        self._target_pitch_deg = target_pitch_deg
+                        self._requested = True
+                    requested = True
+
+                if requested and not enabled and now >= retry_at:
+                    try:
+                        motors.enable()
+                        yaw_state = motors.get_state(0x03)
+                        pitch_state = motors.get_state(0x01)
+                        if yaw_state is None or pitch_state is None:
+                            motors.disable()
+                            raise RuntimeError("使能後讀不到 DM 馬達回授")
+                        command_yaw = yaw_state.position_rad
+                        command_pitch = pitch_state.position_rad
+                        yaw_velocity = pitch_velocity = 0.0
+                        previous_tick = time.monotonic()
+                        enabled = True
+                        self._publish(enabled=True, error=None)
+                        print("[Manual] DM 雙軸已使能。", flush=True)
+                    except Exception as exc:
+                        retry_at = time.monotonic() + 1.0
+                        self._publish(enabled=False, error=str(exc))
+                        print("[Manual] DM 使能失敗：{}".format(exc), flush=True)
+
+                request_home_return = False
+                if enabled and target_yaw_deg is not None and target_pitch_deg is not None:
+                    dt = min(0.03, max(0.001, now - previous_tick))
+                    previous_tick = now
+                    target_yaw = self.yaw_calibration.motor_from_muzzle(
+                        math.radians(target_yaw_deg)
+                    )
+                    target_pitch = self.pitch_calibration.motor_from_muzzle(
+                        math.radians(target_pitch_deg)
+                    )
+                    # 超過一般活動仰角時，只在目標水平角落於已校正
+                    # home corridor 的情況下，請求後端允許垂直到 home。
+                    corridor = (
+                        workspace.home_corridor
+                        if workspace is not None
+                        else None
+                    )
+                    if corridor is not None and target_pitch_deg > DM_MAX_PITCH_FOR_YAW_DEG:
+                        request_home_return = (
+                            abs(target_yaw - corridor.yaw_center_rad)
+                            <= corridor.yaw_tolerance_rad
+                        )
+                    motors.set_home_return(request_home_return)
+                    command_yaw, yaw_velocity = acceleration_limited_step(
+                        command_yaw,
+                        yaw_velocity,
+                        target_yaw,
+                        DM_SPEED_RAD_S,
+                        DM_ACCELERATION_RAD_S2,
+                        dt,
+                    )
+                    command_pitch, pitch_velocity = acceleration_limited_step(
+                        command_pitch,
+                        pitch_velocity,
+                        target_pitch,
+                        DM_SPEED_RAD_S,
+                        DM_ACCELERATION_RAD_S2,
+                        dt,
+                    )
+                    motors.send_targets(
+                        {
+                            0x03: (
+                                command_yaw,
+                                DM_SPEED_RAD_S,
+                                yaw_velocity,
+                                DM_TORQUE_FF_NM,
+                            ),
+                            0x01: (
+                                command_pitch,
+                                DM_SPEED_RAD_S,
+                                pitch_velocity,
+                                DM_TORQUE_FF_NM,
+                            ),
+                        }
+                    )
+
+                motors.refresh()
+                yaw_state = motors.get_state(0x03)
+                pitch_state = motors.get_state(0x01)
+                if yaw_state is not None and pitch_state is not None:
+                    current_yaw_deg = math.degrees(
+                        self.yaw_calibration.muzzle_from_motor(yaw_state.position_rad)
+                    )
+                    current_pitch_deg = math.degrees(
+                        self.pitch_calibration.muzzle_from_motor(pitch_state.position_rad)
+                    )
+                    self._publish(
+                        current_yaw_deg=current_yaw_deg,
+                        current_pitch_deg=current_pitch_deg,
+                    )
+                    if (
+                        not self.snapshot()["startup_complete"]
+                        and abs(current_pitch_deg - DM_STARTUP_PITCH_DEG)
+                        <= DM_STARTUP_PITCH_TOLERANCE_DEG
+                    ):
+                        self._publish(startup_complete=True)
+                        print(
+                            "[Manual] DM 啟動垂直角度已到 {:.1f}°，開始接受搖桿控制。".format(
+                                DM_STARTUP_PITCH_DEG
+                            ),
+                            flush=True,
+                        )
+                    if shutdown_requested and (
+                        abs(current_yaw_deg) <= DM_SHUTDOWN_YAW_TOLERANCE_DEG
+                        and current_pitch_deg >= DM_MIN_PITCH_DEG
+                        and abs(current_pitch_deg - DM_MIN_PITCH_DEG)
+                        <= DM_STARTUP_PITCH_TOLERANCE_DEG
+                    ):
+                        self._publish(shutdown_pose_reached=True)
+                        print(
+                            "[Manual] DM 已回到 yaw=0°、pitch={:.1f}°，現在失能。".format(
+                                current_pitch_deg
+                            ),
+                            flush=True,
+                        )
+                        break
+                    if now >= next_status_print:
+                        if target_yaw_deg is None or target_pitch_deg is None:
+                            target_text = "尚無搖桿目標"
+                        else:
+                            target_text = "目標 yaw={:+.2f}° pitch={:+.2f}°".format(
+                                target_yaw_deg, target_pitch_deg
+                            )
+                        command_yaw_deg = math.degrees(
+                            self.yaw_calibration.muzzle_from_motor(command_yaw)
+                        )
+                        command_pitch_deg = math.degrees(
+                            self.pitch_calibration.muzzle_from_motor(command_pitch)
+                        )
+                        print(
+                            "[Manual DM] {} | 軌跡命令(後端安全限幅前) yaw={:+.2f}°/{:+.5f}rad "
+                            "pitch={:+.2f}°/{:+.5f}rad | 回授 yaw={:+.2f}°/{:+.5f}rad "
+                            "pitch={:+.2f}°/{:+.5f}rad | 扭矩回授 yaw={:+.3f}Nm "
+                            "pitch={:+.3f}Nm | 扭矩前饋={:+.3f}Nm | "
+                            "速度回授 yaw={:+.4f} pitch={:+.4f}rad/s | "
+                            "ERR yaw={} pitch={} enabled={} home_return={} startup_complete={}".format(
+                                target_text,
+                                command_yaw_deg,
+                                command_yaw,
+                                command_pitch_deg,
+                                command_pitch,
+                                current_yaw_deg,
+                                yaw_state.position_rad,
+                                current_pitch_deg,
+                                pitch_state.position_rad,
+                                yaw_state.torque_nm,
+                                pitch_state.torque_nm,
+                                DM_TORQUE_FF_NM,
+                                yaw_state.velocity_rad_s,
+                                pitch_state.velocity_rad_s,
+                                yaw_state.err,
+                                pitch_state.err,
+                                enabled,
+                                request_home_return,
+                                self.snapshot()["startup_complete"],
+                            ),
+                            flush=True,
+                        )
+                        next_status_print = now + DM_STATUS_PRINT_INTERVAL_S
+                time.sleep(0.005)
+        except Exception as exc:
+            self._publish(ready=False, error=str(exc))
+            print("[Manual] DM 控制錯誤：{}".format(exc), flush=True)
+        finally:
+            disabled = motors is None
+            if motors is not None:
+                if not self._shutdown_requested or self._shutdown_pose_reached:
+                    try:
+                        motors.close()
+                        disabled = True
+                    except Exception as exc:
+                        print("[Manual] DM 關閉錯誤：{}".format(exc), flush=True)
+                else:
+                    print(
+                        "[Manual] 未到安全停止位置，略過失能；請確認 DM 回授與安全工作區。",
+                        flush=True,
+                    )
+            if disabled:
+                self._publish(enabled=False)
+
+    @staticmethod
+    def _stick_rate(value):
+        offset = int(value) - DM_STICK_CENTER
+        if abs(offset) <= DM_STICK_DEADZONE:
+            return 0.0
+        usable = abs(offset) - DM_STICK_DEADZONE
+        return math.copysign(usable / (50 - DM_STICK_DEADZONE), offset)
+
+    def update(self, yaw_value, pitch_value):
+        now = time.monotonic()
+        state = self.snapshot()
+        if not state["ready"]:
+            if state["error"] and state["error"] != self.last_error:
+                print("[Manual] DM 驅動尚未就緒：{}".format(state["error"]), flush=True)
+                self.last_error = state["error"]
+            return
+
+        if not state["startup_complete"]:
+            return
+
+        with self._lock:
+            if self._shutdown_requested:
+                return
+
+        if self.target_yaw_deg is None or self.target_pitch_deg is None:
+            self.target_yaw_deg = state["yaw_deg"]
+            self.target_pitch_deg = DM_STARTUP_PITCH_DEG
+            self.last_update = now
+
+        dt = min(0.1, max(0.0, now - self.last_update))
+        self.last_update = now
+        yaw_rate = self._stick_rate(yaw_value) * DM_YAW_RATE_DEG_S
+        pitch_rate = self._stick_rate(pitch_value) * DM_PITCH_RATE_DEG_S
+        self.target_pitch_deg += pitch_rate * dt
+
+        # 水平軸在高仰角時受安全工作區限制。先降到可水平移動的
+        # 仰角範圍，等回授確認已降低後再接受 yaw 目標。
+        if yaw_rate and state["pitch_deg"] > DM_MAX_PITCH_FOR_YAW_DEG:
+            self.target_pitch_deg = min(
+                self.target_pitch_deg, DM_MAX_PITCH_FOR_YAW_DEG
+            )
+        elif yaw_rate and self.target_pitch_deg > DM_MAX_PITCH_FOR_YAW_DEG:
+            self.target_pitch_deg = DM_MAX_PITCH_FOR_YAW_DEG
+        else:
+            self.target_yaw_deg += yaw_rate * dt
+
+        self.target_yaw_deg = max(
+            DM_MIN_YAW_DEG, min(DM_MAX_YAW_DEG, self.target_yaw_deg)
+        )
+        self.target_pitch_deg = max(
+            DM_MIN_PITCH_DEG, min(DM_MAX_PITCH_DEG, self.target_pitch_deg)
+        )
+        with self._lock:
+            self._target_yaw_deg = self.target_yaw_deg
+            self._target_pitch_deg = self.target_pitch_deg
+            self._requested = True
+
+    def close(self, timeout=3.0):
+        print(
+            "[Manual] 關閉前先回 yaw=0°、pitch=35°；到位後才失能。",
+            flush=True,
+        )
+        with self._lock:
+            self._shutdown_requested = True
+            self._requested = True
+            self._target_yaw_deg = 0.0
+            self._target_pitch_deg = DM_MIN_PITCH_DEG
+        # 依照需求等待控制執行緒完成回位後再返回；不在逾時時提前失能。
+        self._thread.join()
 
 
 class ManualController:
@@ -438,7 +852,6 @@ class ManualController:
         self.lock = threading.Lock()
         self.busy = False
         self.last_fire = 0
-        self.shots_in_slot = 0
         self.current_slot = 1
         self.current_mode = "M"
         self.last_yaw = 50
@@ -448,76 +861,23 @@ class ManualController:
         self.last_vx = 0
         self.last_vy = 0
         self.last_wz = 0
-        self._initialize_can()
-        self._initialize_dm_turret()
+        # 先啟動 VESC，再初始化其他控制器，避免 CAN/DM 初始化延後飛輪啟動。
         self.vesc_controller.start()
-        self._turret_enable_requested = False
-        self._last_turret_command = None
+        try:
+            self._initialize_can()
+            self._initialize_dm_turret()
+        except Exception:
+            self.vesc_controller.close()
+            raise
 
     def _initialize_dm_turret(self):
-        """啟動 DM 雙軸控制執行緒；啟動時不會立即使能馬達。"""
-        print("[Manual] 初始化 DM 水平/垂直砲台，USB-CAN：{}".format(DM_PORT))
-        pitch_calibration = load_pitch_calibration(DM_STARTUP_POSE)
-        yaw_calibration = load_yaw_calibration(DM_STARTUP_POSE)
-        workspace = load_workspace_limit()
-        if workspace is None or workspace.home_corridor is None:
-            raise RuntimeError("尚未記錄垂直 home 馬達位置")
-        self._dm_home_pitch_deg = min(
-            DM_MAX_PITCH_DEG,
-            math.degrees(pitch_calibration.muzzle_from_motor(workspace.home_corridor.home_pitch_rad)),
-        )
-        self.turret_worker = MotorWorker(
-            port=DM_PORT,
-            pitch_calibration=pitch_calibration,
-            speed_rad_s=DM_SPEED_RAD_S,
-            acceleration_rad_s2=DM_ACCELERATION_RAD_S2,
-            torque_ff_nm=DM_TORQUE_FF_NM,
-            torque_ramp_s=DM_TORQUE_RAMP_S,
-            kp=DM_KP,
-            kd=DM_KD,
-            max_tracking_error_deg=DM_MAX_TRACKING_ERROR_DEG,
-            stall_timeout_s=DM_STALL_TIMEOUT_S,
-            min_muzzle_deg=DM_MIN_PITCH_DEG,
-            max_muzzle_deg=DM_MAX_PITCH_DEG,
-            control_mode=DM_CONTROL_MODE,
-            yaw_calibration=yaw_calibration,
-            min_yaw_deg=DM_MIN_YAW_DEG,
-            max_yaw_deg=DM_MAX_YAW_DEG,
-            max_pitch_for_yaw_deg=DM_MAX_PITCH_FOR_YAW_DEG,
-        )
-        self.turret_worker.start()
-
-    @staticmethod
-    def _packet_axis_to_degrees(yaw_value, pitch_value, max_pitch_deg=DM_MAX_PITCH_DEG):
-        """ESP32 0..100 -> 水平角 -34.5..+34.5°、仰角 0..記錄的 home。"""
-        yaw_value = max(0, min(100, int(yaw_value)))
-        pitch_value = max(0, min(100, int(pitch_value)))
-        yaw_deg = DM_MIN_YAW_DEG + (DM_MAX_YAW_DEG - DM_MIN_YAW_DEG) * yaw_value / 100.0
-        pitch_deg = DM_MIN_PITCH_DEG + (max_pitch_deg - DM_MIN_PITCH_DEG) * pitch_value / 100.0
-        return yaw_deg, pitch_deg
+        """啟動 manual.py 內的 DM 雙軸 MIT 控制器。"""
+        print("[Manual] 初始化 DM 手動控制，USB-CAN：{}".format(DM_PORT))
+        self.dm_turret = ManualDMTurret()
 
     def _update_dm_turret(self, yaw_value, pitch_value):
-        """依 ESP32 回傳的手動搖桿值更新 DM 雙軸目標。"""
-        snapshot = self.turret_worker.snapshot()
-        if not snapshot.ready:
-            if snapshot.error:
-                print("[Manual] DM 控制器尚未就緒：{}".format(snapshot.error))
-            return
-
-        if not self._turret_enable_requested:
-            self.turret_worker.request_enable()
-            self._turret_enable_requested = True
-
-        yaw_deg, pitch_deg = self._packet_axis_to_degrees(yaw_value, pitch_value, self._dm_home_pitch_deg)
-        target = (round(yaw_deg, 2), round(pitch_deg, 2))
-        if target != self._last_turret_command:
-            self.turret_worker.request_aim(yaw_deg, pitch_deg)
-            self._last_turret_command = target
-            print(
-                "[Manual] DM 目標：Yaw={:+.2f}° Pitch={:.2f}° (raw yaw={}, pitch={})".format(
-                    yaw_deg, pitch_deg, yaw_value, pitch_value
-                )
-            )
+        """將 0..100 搖桿狀態交給持續執行的 DM MIT 控制迴圈。"""
+        self.dm_turret.update(yaw_value, pitch_value)
 
     def _initialize_can(self):
         print("[Manual] 初始化彈藥倉 CAN：{}".format(AMMO_CAN_INTERFACE))
@@ -529,11 +889,17 @@ class ManualController:
             self.ammo_bus, self.ammo_notifier, AMMO_MOTOR_CAN_ID
         )
 
+        if SHOOTING_CAN_INTERFACE == AMMO_CAN_INTERFACE:
+            # Share one receiver on a shared CAN channel so MKS replies cannot
+            # be consumed by a second notifier attached to the same interface.
+            self.shoot_bus = self.ammo_bus
+            self.shoot_notifier = self.ammo_notifier
+        else:
+            self.shoot_bus = can.Bus(
+                interface="socketcan", channel=SHOOTING_CAN_INTERFACE
+            )
+            self.shoot_notifier = can.Notifier(self.shoot_bus, [])
         print("[Manual] 初始化射擊機構 CAN：{}".format(SHOOTING_CAN_INTERFACE))
-        self.shoot_bus = can.Bus(
-            interface="socketcan", channel=SHOOTING_CAN_INTERFACE
-        )
-        self.shoot_notifier = can.Notifier(self.shoot_bus, [])
         self.shoot_servo = MksServo(
             self.shoot_bus, self.shoot_notifier, SHOOTING_MOTOR_CAN_ID
         )
@@ -554,36 +920,44 @@ class ManualController:
                 raise RuntimeError("{}馬達啟用失敗".format(label))
             time.sleep(0.2)
 
-    def on_mode_change(self, mode):
+    def on_mode_change(self, mode, fire=None):
         self.current_mode = mode
-        # 切換模式時清除按鈕狀態，避免回到手動時按住 FIRE 被當成新按下
-        self.last_fire = 0
+        # 記住切換當下的 FIRE 狀態，避免按住按鈕切入手動時誤觸發射擊。
+        self.last_fire = 1 if fire else 0
         if mode != "M":
             # 切到自動模式時停止手動射擊雙 VESC 馬達。
             self.last_speed = 0
             if getattr(self, "vesc_controller", None) is not None:
-                self.vesc_controller.set_speed(0)
+                self.vesc_controller.set_speed(None)
             # 自動模式不以手動封包更新 DM 目標；維持最後的目標姿態。
             self._send_turret_command(50, 50, 0, 0, mode="A")
-            self._last_turret_command = None
-        else:
-            # 回到手動模式時，下一筆封包會重新要求使能並更新目標。
-            self._turret_enable_requested = False
-            self._last_turret_command = None
 
     def handle_packet(self, packet):
         """處理一筆 ESP32 遙控器封包。"""
         self.last_yaw = self._clamp(packet.get("yaw", 50), 0, 100)
         self.last_pitch = self._clamp(packet.get("pitch", 50), 0, 100)
-        self.last_speed = self._clamp(packet.get("speed", 0), 0, 100)
+        raw_vrb = packet.get("speed", 0)
+        self.last_speed = normalize_vrb_speed(raw_vrb)
         self.vesc_controller.set_speed(self.last_speed)
+        print(
+            "[Manual RX] mode={} | yaw={} pitch={} fire={} VRB raw={} normalized={} -> VESC target={} RPM".format(
+                packet.get("mode", self.current_mode),
+                self.last_yaw,
+                self.last_pitch,
+                packet.get("fire", 0),
+                raw_vrb,
+                self.last_speed,
+                int(VESC_MIN_RPM + self.last_speed * VESC_RPM_PER_SPEED_UNIT),
+            ),
+            flush=True,
+        )
         self.last_vx = self._clamp(packet.get("vx", 0), -100, 100)
         self.last_vy = self._clamp(packet.get("vy", 0), -100, 100)
         self.last_wz = self._clamp(packet.get("wz", 0), -100, 100)
 
         packet_mode = packet.get("mode", self.current_mode)
         if packet_mode != self.current_mode:
-            self.on_mode_change(packet_mode)
+            self.on_mode_change(packet_mode, fire=packet.get("fire", 0))
 
         # 手動模式：Xavier 直接控制 DM 水平/垂直馬達。
         # 封包來自 ESP32：E,MODE,VX,VY,WZ,YAW,PITCH,FIRE,SPEED。
@@ -613,55 +987,45 @@ class ManualController:
 
     def _shot_worker(self):
         try:
-            print(
-                "\\n[Manual] 第 {} 格，準備射擊第 {} / {} 發".format(
-                    self.current_slot, self.shots_in_slot + 1, SHOTS_PER_SLOT
-                )
-            )
+            print("\n[Manual] 第 {} 格，準備射擊一顆球。".format(self.current_slot))
 
             self._run_one_shot_cycle()
-            self.shots_in_slot += 1
+
+            if self.current_mode != "M":
+                print("[Manual] 模式已切換，暫不轉動彈藥倉。")
+                return
             print(
-                "[Manual] 射擊循環完成：本格計數 {}/{}".format(
-                    self.shots_in_slot, SHOTS_PER_SLOT
+                "[Manual] ID1 正向回零流程結束，準備讓 {} / ID{} 轉動 {} pulses。".format(
+                    AMMO_CAN_INTERFACE, AMMO_MOTOR_CAN_ID, AMMO_SLOT_PULSES
                 )
             )
-
-            if self.shots_in_slot >= SHOTS_PER_SLOT:
-                if self.current_mode != "M":
-                    print("[Manual] 模式已切換，暫不轉動彈藥倉。")
-                    return
-                print("[Manual] 本格三次射擊循環完成，允許彈藥倉轉一格。")
-                self._rotate_ammo_one_slot()
-                self.shots_in_slot = 0
-                self.current_slot += 1
-                if self.current_slot > SLOTS_PER_MAGAZINE:
-                    self.current_slot = 1
-                print("[Manual] 彈藥倉目前格位：{}".format(self.current_slot))
+            self._rotate_ammo_one_slot()
+            self.current_slot += 1
+            if self.current_slot > SLOTS_PER_MAGAZINE:
+                self.current_slot = 1
+            print("[Manual] 回零與轉格流程完成，彈藥倉目前格位：{}".format(self.current_slot))
 
         except Exception as exc:
-            print("[Manual Error] 射擊/轉格流程失敗：{}".format(exc))
+            print("[Manual Error] 回零/轉格流程失敗：{}".format(exc))
             self._emergency_stop(self.shoot_servo, "射擊機構")
             self._emergency_stop(self.ammo_servo, "彈藥倉")
-            # 不增加射擊計數、不自動轉格
+            # 發生錯誤時不繼續轉格，也不更新目前格位。
         finally:
             with self.lock:
                 self.busy = False
 
     def _run_one_shot_cycle(self):
-        # 第一段：從當前原點移動 1700 pulses
+        # 保留原本射擊動作：移動至 1700，再由 1700 移動至 3000 pulses。
         self._move_relative(
             self.shoot_servo, 1700, MOVE_DIRECTION, SHOOTING_SPEED_RPM
         )
         time.sleep(SETTLE_TIME)
-
-        # 第二段：由 1700 到累積目標 3000，因此本段移動 1300 pulses
         self._move_relative(
             self.shoot_servo, 3000 - 1700, MOVE_DIRECTION, SHOOTING_SPEED_RPM
         )
         time.sleep(SETTLE_TIME)
 
-        # 沿用原本的兩向無限位回零流程
+        # 原本的反向回零與正向回零都保留；正向回零完成後才轉動彈藥倉。
         self._go_home(self.shoot_servo, MOVE_DIRECTION, "反向無限位回零")
         time.sleep(SETTLE_TIME)
         self._go_home(self.shoot_servo, HOME_DIRECTION, "正向無限位回零")
@@ -791,6 +1155,15 @@ class ManualController:
         print("[Manual] {}動作停止；請確認機構實際原點。".format(label))
 
     def _rotate_ammo_one_slot(self):
+        print(
+            "[Manual] 發送彈藥倉命令：CAN={} ID={} direction=CW speed={} RPM pulses={}".format(
+                AMMO_CAN_INTERFACE,
+                AMMO_MOTOR_CAN_ID,
+                AMMO_SPEED_RPM,
+                AMMO_SLOT_PULSES,
+            ),
+            flush=True,
+        )
         before = self.ammo_servo.read_encoder_value_addition()
         if before is None:
             raise RuntimeError("彈藥倉移動前 Encoder 讀取失敗")
@@ -801,6 +1174,7 @@ class ManualController:
         print("[Manual] 彈藥倉轉一格指令回傳：", result)
         if result is None:
             raise RuntimeError("彈藥倉移動指令沒有有效回覆")
+        print("[Manual] 彈藥倉驅動器回覆狀態：{}".format(result), flush=True)
 
         start = time.monotonic()
         seen_running = False
@@ -815,7 +1189,11 @@ class ManualController:
 
             running = self.ammo_servo.is_motor_running()
             now_encoder = self.ammo_servo.read_encoder_value_addition()
-            if now_encoder is not None and now_encoder != before:
+            if (
+                before not in (None, -1)
+                and now_encoder not in (None, -1)
+                and now_encoder != before
+            ):
                 movement_seen = True
 
             if running:
@@ -832,9 +1210,12 @@ class ManualController:
             time.sleep(POLL_INTERVAL)
 
         after = self.ammo_servo.read_encoder_value_addition()
-        if after is None:
-            raise RuntimeError("彈藥倉移動後 Encoder 讀取失敗")
-        print("[Manual] 彈藥倉 Encoder 位移：{}".format(after - before))
+        if before in (None, -1) or after in (None, -1):
+            print(
+                "[Manual] 彈藥倉 Encoder 回授無效；以馬達運轉狀態確認動作停止。"
+            )
+        else:
+            print("[Manual] 彈藥倉 Encoder 位移：{}".format(after - before))
 
     def _send_turret_command(self, yaw, pitch, fire, speed, mode="M"):
         # 保留遙控器方向值，由 ESP32 端依現有 UART 協定執行砲台方向控制。
@@ -874,21 +1255,16 @@ class ManualController:
         self._emergency_stop(self.shoot_servo, "射擊機構")
         self._emergency_stop(self.ammo_servo, "彈藥倉")
 
-        if self.shoot_notifier is not None:
-            self.shoot_notifier.stop()
-        if self.ammo_notifier is not None:
-            self.ammo_notifier.stop()
-        if self.shoot_bus is not None:
-            self.shoot_bus.shutdown()
-        if self.ammo_bus is not None:
-            self.ammo_bus.shutdown()
+        for notifier in {self.shoot_notifier, self.ammo_notifier}:
+            if notifier is not None:
+                notifier.stop()
+        for bus in {self.shoot_bus, self.ammo_bus}:
+            if bus is not None:
+                bus.shutdown()
 
-        # 關閉 DM worker 前會失能馬達；垂直軸可能下墜，請先支撐砲管。
-        if getattr(self, "turret_worker", None) is not None:
+        # 關閉 DM 控制器會失能馬達；垂直軸可能下墜，請先支撐砲管。
+        if getattr(self, "dm_turret", None) is not None:
             try:
-                self.turret_worker.request_disable()
-                time.sleep(0.2)
-                self.turret_worker.request_shutdown()
-                self.turret_worker.wait_closed(timeout=3.0)
+                self.dm_turret.close(timeout=3.0)
             except Exception as exc:
                 print("[Manual] DM 砲台關閉失敗：{}".format(exc))
