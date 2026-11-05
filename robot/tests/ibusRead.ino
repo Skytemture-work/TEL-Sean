@@ -26,30 +26,28 @@ HardwareSerial xavierSerial(2);
 
 // =====================
 // GB42 四輪腳位
+// ESP32-S3 DevKitC-1
 // =====================
+
 // Front Left
-#define FL_PWM 4
-#define FL_DIR 5
+#define FL_PWM    4
+#define FL_DIR    5
+#define FL_BRAKE  6
 
 // Front Right
-#define FR_PWM 6
-#define FR_DIR 7
+#define FR_PWM    7
+#define FR_DIR    15
+#define FR_BRAKE  16
 
 // Rear Left
-#define RL_PWM 15
-#define RL_DIR 16
+#define RL_PWM    17
+#define RL_DIR    18
+#define RL_BRAKE  8
 
 // Rear Right
-#define RR_PWM 17
-#define RR_DIR 18
-
-// =====================
-// GB42 四輪煞車腳位
-// =====================
-#define FL_BRAKE 9
-#define FR_BRAKE 10
-#define RL_BRAKE 11
-#define RR_BRAKE 12
+#define RR_PWM    9
+#define RR_DIR    10
+#define RR_BRAKE  11
 
 // 暫定 HIGH 啟動煞車、LOW 解除煞車
 // 請依馬達驅動器規格確認有效電位
@@ -62,7 +60,7 @@ HardwareSerial xavierSerial(2);
 // =====================
 // 系統狀態變數
 // =====================
-char currentMode = 'A';  // 'M' = Manual, 'A' = Auto
+char currentMode = 'M';  // 'M' = Manual, 'A' = Auto
 
 int manual_yaw = 50;
 int manual_pitch = 50;
@@ -352,7 +350,7 @@ void loop() {
   int swD = safeRead(9);
 
   // 模式切換
-  currentMode = (swA == 1) ? 'M' : 'A';
+  currentMode = (swA == 1) ? 'A' : 'M';
 
   // SW2：底盤 / 砲台控制
   bool isTurretControl = (swB > 1500);
@@ -451,10 +449,15 @@ void loop() {
   int send_pitch =
     (currentMode == 'M') ? manual_pitch : auto_pitch;
 
-  int send_fire =
-    (fire_allow == 1)
-      ? ((currentMode == 'M') ? 0 : auto_fire)
-      : 0;
+  int send_fire = 0;
+
+  if (fire_allow == 1) {
+      if (currentMode == 'M') {
+          send_fire = fire_allow;
+      } else {
+          send_fire = auto_fire;
+      }
+  }
 
   int send_speed =
     (currentMode == 'M') ? speed_val : auto_speed;
