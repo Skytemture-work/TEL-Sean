@@ -17,7 +17,8 @@ from turret_control.dashboard import (
     build_dashboard_snapshot,
     start_dashboard_server,
 )
-from turret_control.run_board_real import _apply_manual_aim_action
+from turret_control.run_board_real import (_all_holes_confirmed, _apply_manual_aim_action,
+                                           _restore_completed_aim_plan)
 
 
 class _IdParser(HTMLParser):
@@ -44,6 +45,22 @@ def _target(hole_id, engaged=False, distance_m=5.0):
 
 
 class DashboardTelemetryTests(unittest.TestCase):
+    def test_complete_twelve_holes_and_restore_without_a_fire(self):
+        plan = EngagementPlan([BoardTarget(100, 100, 20, 20, hole_id=f"H{n:02d}")
+                               for n in range(1, 13)])
+        confirmed = []
+        for index in range(12):
+            self.assertFalse(_all_holes_confirmed(plan, confirmed))
+            plan, applied = _apply_manual_aim_action(plan, ("confirm", index, f"H{index+1:02d}"), confirmed)
+            self.assertTrue(applied)
+        self.assertTrue(_all_holes_confirmed(plan, confirmed))
+        self.assertTrue(all(not target.engaged for target in plan.targets))
+        restored = EngagementPlan(plan.targets)
+        confirmed.clear()
+        self.assertTrue(_restore_completed_aim_plan(restored, confirmed))
+        self.assertTrue(_all_holes_confirmed(restored, confirmed))
+        self.assertFalse(_restore_completed_aim_plan(EngagementPlan(plan.targets[:-1]), []))
+
     def test_aim_only_navigation_does_not_record_a_shot_or_repeat_a_stale_request(self):
         plan = EngagementPlan([BoardTarget(100, 100, 20, 20, hole_id="H01"),
                                BoardTarget(150, 100, 20, 20, hole_id="H02")])

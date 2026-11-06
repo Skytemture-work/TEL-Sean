@@ -4,7 +4,7 @@ import config
 from comm_uart import UARTController
 from vision_target import VisionTracker
 from lidar_avoid import LidarAvoidance
-from manual import ManualController
+from manual import ManualController, normalize_vrb_speed
 
 
 def main():
@@ -19,19 +19,44 @@ def main():
     # 手動模式控制器：接收遙控器封包，管理砲台指令、射擊與彈藥倉格位
     manual = ManualController(uart=uart)
 
-    vision.start()
-    lidar.start()
-    time.sleep(1.0)
-
-    # 預設手動模式；收到 ESP32 封包後依封包中的 mode 切換
-    current_mode = "M"
-    print("[System] 已啟動，預設手動模式，等待 ESP32 遙控器封包...")
-
     try:
+        vision.start()
+        lidar.start()
+        time.sleep(1.0)
+
+        # 預設手動模式；收到 ESP32 封包後依封包中的 mode 切換
+        current_mode = "M"
+        print("[System] 已啟動，預設手動模式，等待 ESP32 遙控器封包...")
+
         while True:
+            manual.check_health()
             packet = uart.read_esp32_packet()
 
             if packet is not None:
+                packet_mode = packet.get("mode", "?")
+                packet_speed = normalize_vrb_speed(packet.get("speed", 0))
+                vesc_target = (
+                    "STOP"
+                    if packet_mode != "M"
+                    else "{} RPM".format(1000 + packet_speed * 10)
+                )
+                print(
+                    "[ESP32 RX] raw={!r} | mode={} vx={} vy={} wz={} "
+                    "yaw={} pitch={} fire={} VRB={} normalized_speed={} | VESC target={}".format(
+                        packet.get("raw", ""),
+                        packet_mode,
+                        packet.get("vx", 0),
+                        packet.get("vy", 0),
+                        packet.get("wz", 0),
+                        packet.get("yaw", 50),
+                        packet.get("pitch", 50),
+                        packet.get("fire", 0),
+                        packet.get("speed", 0),
+                        packet_speed,
+                        vesc_target,
+                    ),
+                    flush=True,
+                )
                 new_mode = packet.get("mode", current_mode)
                 if new_mode not in ("M", "A"):
                     new_mode = current_mode
@@ -48,7 +73,7 @@ def main():
                     lidar.set_active(is_auto)
 
                     # 切換模式時清除手動按鈕邊緣狀態，避免按住按鈕時誤觸發
-                    manual.on_mode_change(current_mode)
+                    manual.on_mode_change(current_mode, fire=packet.get("fire", 0))
 
                 if current_mode == "M":
                     # 手動模式：使用遙控器 yaw/pitch 控制砲台方向，
@@ -56,6 +81,9 @@ def main():
                     manual.handle_packet(packet)
                     time.sleep(0.02)
                     continue
+
+            else:
+                uart.report_if_silent()
 
             if current_mode == "A":
                 # 自動模式維持原有視覺追蹤 + LiDAR 避障流程

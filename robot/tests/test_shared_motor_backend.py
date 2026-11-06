@@ -24,6 +24,9 @@ class FakeWorker:
         if self.auto_ack:
             self.state = replace(self.state, aim_request_id=request_id)
 
+    def request_tagged_home(self, request_id):
+        self.requests.append(("home", request_id))
+
 
 class SharedMotorBackendTests(unittest.TestCase):
     def setUp(self):
@@ -47,6 +50,34 @@ class SharedMotorBackendTests(unittest.TestCase):
         self.backend.send_targets(self.targets)
         self.assertEqual(len(self.worker.requests), 1)
         self.assertTrue(self.backend.motion_ready(self.yaw, self.pitch))
+
+    def test_home_requires_acknowledged_goal_and_fresh_stopped_feedback(self):
+        self.backend.request_home()
+        self.assertEqual(self.worker.requests[0], ("home", 1))
+        self.assertEqual(self.backend.home_status()[0], "returning")
+        yaw_home, pitch_home = self.backend._home_target
+        self.worker.state = replace(
+            self.worker.state, aim_request_id=1,
+            yaw_target_rad=yaw_home, target_rad=pitch_home,
+            yaw_position_rad=yaw_home, position_rad=pitch_home,
+            yaw_sequence_phase="restoring",
+        )
+        self.assertEqual(self.backend.home_status()[0], "returning")
+        self.worker.state = replace(self.worker.state, yaw_sequence_phase=None)
+        self.assertEqual(self.backend.home_status()[0], "arrived")
+        self.worker.state = replace(self.worker.state, feedback_at=time.monotonic() - 1)
+        self.assertEqual(self.backend.home_status()[0], "returning")
+        self.worker.state = replace(self.worker.state, error="安全路徑被拒絕")
+        self.assertEqual(self.backend.home_status(), ("error", "安全路徑被拒絕"))
+
+    def test_home_is_rejected_without_fresh_feedback_or_recorded_corridor(self):
+        self.worker.state = replace(self.worker.state, feedback_at=time.monotonic() - 1)
+        with self.assertRaises(RuntimeError):
+            self.backend.request_home()
+        self.assertEqual(self.worker.requests, [])
+        self.backend._workspace = None
+        with self.assertRaises(ValueError):
+            self.backend.request_home()
 
     def test_sequence_feedback_and_faults_gate_firing(self):
         controller = TurretController(TurretConfig(), self.backend)

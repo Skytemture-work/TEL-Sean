@@ -76,6 +76,23 @@ def _apply_manual_aim_action(plan, action, confirmed_holes):
     return plan, False
 
 
+def _restore_completed_aim_plan(plan, confirmed_holes):
+    """Restore a known completed 12-hole validation after a restart."""
+    if plan is None or len(plan) != 12 or {t.hole_id for t in plan.targets} != {
+        f"H{number:02d}" for number in range(1, 13)
+    }:
+        return False
+    confirmed_holes[:] = [t.hole_id for t in plan.targets]
+    while not plan.finished:
+        plan.skip()
+    return True
+
+
+def _all_holes_confirmed(plan, confirmed_holes):
+    return (plan is not None and plan.finished and len(confirmed_holes) == 12
+            and set(confirmed_holes) == {f"H{n:02d}" for n in range(1, 13)})
+
+
 def main(
     argv: Optional[Sequence[str]] = None,
     *,
@@ -120,6 +137,7 @@ def main(
         action="store_true",
         help="實機驗證模式：允許安全範圍內追瞄，但完全停用發射與 F 操作",
     )
+    parser.add_argument("--restore-completed-aim", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
         "--web-port",
         type=int,
@@ -163,6 +181,8 @@ def main(
         parser.error("--target-timeout 不可小於 0")
     if args.zed_calibration is not None and not args.zed_uvc:
         parser.error("--zed-calibration 必須配合 --zed-uvc 使用")
+    if args.restore_completed_aim and (not args.aim_only or args.score_mode):
+        parser.error("--restore-completed-aim 需要 --aim-only --no-score-mode")
 
     config = with_competition_geometry(TurretConfig()) if not args.virtual_board else TurretConfig()
     if args.zed_calibration is not None:
@@ -312,6 +332,21 @@ def main(
         cv2.namedWindow(window, cv2.WINDOW_NORMAL)
     dashboard = DashboardState() if args.web_port else None
     manual_confirmed_holes = []
+    home_active = False
+    home_error = None
+    restore_completed = args.restore_completed_aim
+
+    def begin_home():
+        nonlocal home_active, home_error
+        home_active = True
+        try:
+            motors.request_home()
+            home_error = None
+            print("12 孔已確認，依記錄的安全路徑返回 home。", flush=True)
+        except (ValueError, RuntimeError) as exc:
+            home_error = str(exc)
+            print(f"回 home 未執行：{home_error}", flush=True)
+
     if dashboard is not None and args.aim_only and not args.score_mode:
         dashboard.enable_manual_aim()
     web_server = None
@@ -328,6 +363,10 @@ def main(
         board_plan = load_layout(args.layout)
         if not args.score_mode:
             plan = board_plan
+            if restore_completed:
+                if not _restore_completed_aim_plan(plan, manual_confirmed_holes):
+                    raise ValueError("無法還原已完成的 12 孔計畫")
+                restore_completed = False
             driver.set_plan(plan)
         print(f"已載入固定靶板版面：{args.layout}", flush=True)
     if args.score_mode:
@@ -338,6 +377,8 @@ def main(
 
     try:
         motors.enable()
+        if args.restore_completed_aim:
+            begin_home()
         while True:
             loop_started_at = time.perf_counter()
             capture_started_at = loop_started_at
@@ -373,6 +414,11 @@ def main(
                 board_plan = candidate_plan
                 if not args.score_mode and plan is None:
                     plan = candidate_plan
+                    if restore_completed:
+                        if not _restore_completed_aim_plan(plan, manual_confirmed_holes):
+                            plan = None
+                            continue
+                        restore_completed = False
                     driver.set_plan(plan)
                     plan_source = "推算" if inferred_plan_used else "實測"
                     print(
@@ -564,10 +610,18 @@ def main(
 
             if dashboard is not None and args.aim_only and not args.score_mode:
                 action = dashboard.take_manual_action()
+                home_state, _ = motors.home_status() if home_active and home_error is None else ("error" if home_error else "idle", home_error)
+                if home_active and home_state != "arrived":
+                    action = None
                 plan, applied = _apply_manual_aim_action(plan, action, manual_confirmed_holes)
                 if applied:
                     driver.set_plan(plan)
                     print("僅瞄準模式：已更新人工確認順序，不發射。", flush=True)
+                    if action[0] == "reset":
+                        home_active = False
+                        home_error = None
+                    elif _all_holes_confirmed(plan, manual_confirmed_holes):
+                        begin_home()
             status = driver.update()
             partial_shot_gate.record(pose, status.fired)
             yaw_motor_state = motors.get_state(config.yaw_motor_id)
@@ -760,8 +814,14 @@ def main(
                     ),
                 )
                 if args.aim_only and not args.score_mode:
+                    home_state, home_message = motors.home_status() if home_active and home_error is None else ("error" if home_error else "idle", home_error)
+                    worker_state = motors.worker.snapshot() if home_active else None
+                    telemetry["home"] = {"state": home_state, "message": home_message,
+                                         "phase": getattr(worker_state, "yaw_sequence_phase", None),
+                                         "motor_status": getattr(worker_state, "status", None)}
                     telemetry["manual_control"] = {
-                        "enabled": plan is not None and len(plan) > 0,
+                        "enabled": (plan is not None and len(plan) > 0
+                                    and (not home_active or home_state == "arrived")),
                         "mode": "aim_only",
                         "current_hole_id": getattr(status.target, "hole_id", None),
                         "plan_index": plan.index if plan is not None else None,

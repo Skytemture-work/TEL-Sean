@@ -785,6 +785,7 @@
       const score = data.score || {};
       const redLights = data.red_lights || {};
       const latency = data.latency || {};
+      const home = data.home || {};
       const detectionOnly = Boolean(system.detection_only);
       const aimOnly = Boolean(system.aim_only);
       const confirmationMode = detectionOnly || aimOnly;
@@ -835,7 +836,10 @@
         safety.textContent = firing.operator_confirmation_pending ? "發射條件成立，已收到 F 操作確認" : "瞄準條件成立；實際發射仍需操作確認與硬體安全迴路";
         safety.className = "safety ready";
       } else {
-        safety.textContent = firing.blocked_reason || "發射閘門鎖定";
+        safety.textContent = home.state === "returning" ? "已確認 12 孔，正在返回 home；不發射"
+          : home.state === "arrived" ? "已返回 home；不發射"
+          : home.state === "error" ? `回 home 未完成：${home.message || "請檢查馬達"}`
+          : firing.blocked_reason || "發射閘門鎖定";
         safety.className = "safety";
       }
 
@@ -855,9 +859,12 @@
       manualState = manual;
       $("confirmNext").disabled = manualPending || !manual.enabled || !manual.current_hole_id;
       $("resetPlan").disabled = manualPending || !manual.enabled;
-      text("manualStatus", manual.current_hole_id
-        ? (aimOnly ? `目前 ${manual.current_hole_id}；確認後切換目標，砲口可能移動，不發射` : `目前 ${manual.current_hole_id}；按下按鈕只會切換唯讀辨識順序`)
-        : "等待可確認的孔位");
+      text("manualStatus", home.state === "returning" ? "正在返回 home，完成前無法重設順序"
+        : home.state === "arrived" ? "已回到 home，可重設順序開始下一輪"
+        : home.state === "error" ? `回 home 未完成：${home.message || "請檢查馬達"}`
+        : manual.current_hole_id
+          ? (aimOnly ? `目前 ${manual.current_hole_id}；確認後切換目標，砲口可能移動，不發射` : `目前 ${manual.current_hole_id}；按下按鈕只會切換唯讀辨識順序`)
+          : "等待可確認的孔位");
 
       text("bonusHole", score.active_bonus_hole || "—");
       text("scoreTime", score.enabled ? fmt(score.remaining_s, 1, " s") : "未啟用");

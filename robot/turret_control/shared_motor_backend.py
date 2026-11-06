@@ -7,7 +7,8 @@ from .backends import MotorState
 from .limits import load_workspace_limit
 from .pitch import load_pitch_calibration, load_yaw_calibration
 from .run_vertical_panel import (
-    DEFAULT_STARTUP_POSE, FEEDBACK_TIMEOUT_S, MotorWorker, SEQUENCE_STOP_SPEED_RAD_S,
+    AUTO_HOME_INSET_DEG, DEFAULT_STARTUP_POSE, FEEDBACK_TIMEOUT_S, MotorWorker,
+    SEQUENCE_STOP_SPEED_RAD_S,
 )
 
 
@@ -28,6 +29,8 @@ class SharedMotorBackend:
         )
         self._last_requested = None
         self._request_id = 0
+        self._home_target = None
+        self._home_request_id = None
 
     def _wait_for(self, predicate, timeout_s=5.):
         deadline = time.monotonic() + timeout_s
@@ -119,6 +122,55 @@ class SharedMotorBackend:
             and self.get_state(0x03) is not None
             and self.get_state(0x01) is not None
         )
+
+    def request_home(self):
+        """Queue the recorded home through the worker's existing safe path."""
+        corridor = self._workspace.home_corridor if self._workspace is not None else None
+        if corridor is None:
+            raise ValueError("尚未記錄 home 與安全路徑")
+        if self.get_state(0x03) is None or self.get_state(0x01) is None:
+            raise RuntimeError("馬達回饋無效，不能回 home")
+        yaw_home = self.yaw_calibration.motor_from_muzzle(0.0)
+        if abs(yaw_home - corridor.yaw_center_rad) > math.radians(.05):
+            raise ValueError("水平原點與記錄的 home 不一致")
+        home_muzzle = self.pitch_calibration.muzzle_from_motor(corridor.home_pitch_rad)
+        inset_muzzle = home_muzzle - math.radians(AUTO_HOME_INSET_DEG)
+        if inset_muzzle <= 0:
+            raise ValueError("home 安全餘裕超出可用範圍")
+        self._home_target = (yaw_home, self.pitch_calibration.motor_from_muzzle(inset_muzzle))
+        self._last_requested = None
+        self._request_id += 1
+        self._home_request_id = self._request_id
+        self.worker.request_tagged_home(self._home_request_id)
+
+    def home_status(self):
+        """Report arrival only after fresh feedback and the tagged command agree."""
+        if self._home_target is None:
+            return "idle", None
+        snapshot = self.worker.snapshot()
+        if snapshot.closed or not snapshot.enabled or snapshot.error:
+            return "error", snapshot.error or "馬達未使能或控制執行緒已停止"
+        if snapshot.aim_request_id != self._home_request_id:
+            return "returning", None
+        yaw = self.get_state(0x03)
+        pitch = self.get_state(0x01)
+        if yaw is None or pitch is None:
+            return "returning", None
+        velocities = (snapshot.velocity_rad_s, snapshot.yaw_velocity_rad_s,
+                      snapshot.command_velocity_rad_s, snapshot.yaw_command_velocity_rad_s)
+        if (snapshot.yaw_sequence_phase is not None or any(
+                value is None or not math.isfinite(value) or abs(value) > SEQUENCE_STOP_SPEED_RAD_S
+                for value in velocities)):
+            return "returning", None
+        yaw_home, pitch_home = self._home_target
+        tolerance = math.radians(.1)
+        if (snapshot.yaw_target_rad is not None and snapshot.target_rad is not None
+                and abs(snapshot.yaw_target_rad - yaw_home) <= math.radians(.025)
+                and abs(snapshot.target_rad - pitch_home) <= math.radians(.025)
+                and abs(yaw.position_rad - yaw_home) <= tolerance
+                and abs(pitch.position_rad - pitch_home) <= tolerance):
+            return "arrived", None
+        return "returning", None
 
     def hold(self):
         # The worker continuously holds its current active target at 200 Hz.

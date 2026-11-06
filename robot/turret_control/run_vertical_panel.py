@@ -64,6 +64,9 @@ YAW_CLEARANCE_PITCH_DEG = MAX_PITCH_FOR_YAW_DEG - YAW_RELEASE_MARGIN_DEG
 HOME_CORRIDOR_YAW_TOLERANCE_DEG = 10.0
 YAW_MOVE_EPSILON_DEG = 0.000001
 SEQUENCE_ARRIVAL_TOLERANCE_DEG = 0.05
+# Automatic validation stops inside the recorded endpoint, leaving room for
+# encoder resolution and ordinary tracking error at the workspace boundary.
+AUTO_HOME_INSET_DEG = 0.2
 # Leave room for the DAMIAO feedback velocity's finite encoder resolution.
 SEQUENCE_STOP_SPEED_RAD_S = math.radians(0.5)
 FEEDBACK_TIMEOUT_S = 0.25
@@ -277,6 +280,9 @@ class MotorWorker:
     def request_home(self) -> None:
         self._commands.put(("home", None))
 
+    def request_tagged_home(self, request_id: int) -> None:
+        self._commands.put(("home_tagged", int(request_id)))
+
     def request_calibration_reload(
         self,
         pitch_calibration: PitchCalibration,
@@ -466,7 +472,7 @@ class MotorWorker:
     def _yaw_feedback_clear(self, feedback_pitch_rad: float) -> bool:
         limit = self.max_pitch_for_yaw_rad
         if self._yaw_sequence_phase == "rotating":
-            limit = min(limit, self.yaw_clearance_pitch_rad)
+            limit = min(limit, self.yaw_clearance_pitch_rad + self.sequence_arrival_tolerance_rad)
         return feedback_pitch_rad <= limit + 1e-10
 
     def _recorded_path_is_safe(self, start, end) -> bool:
@@ -596,7 +602,8 @@ class MotorWorker:
                 and self._command_velocity_rad_s * self.pitch_calibration.motor_sign <= SEQUENCE_STOP_SPEED_RAD_S
                 and self._feedback_velocity_rad_s * self.pitch_calibration.motor_sign <= SEQUENCE_STOP_SPEED_RAD_S
             )
-            if feedback_pitch <= self.yaw_release_pitch_rad and pitch_not_rising:
+            if (feedback_pitch <= self.yaw_release_pitch_rad + self.sequence_arrival_tolerance_rad
+                    and pitch_not_rising):
                 self._yaw_sequence_phase = "rotating"
                 self._publish(
                     yaw_sequence_phase="rotating",
@@ -632,7 +639,7 @@ class MotorWorker:
                     <= self.sequence_arrival_tolerance_rad
                 )
                 pitch_feedback_arrived = (
-                    feedback_pitch <= self.yaw_clearance_pitch_rad
+                    feedback_pitch <= self.yaw_clearance_pitch_rad + self.sequence_arrival_tolerance_rad
                 )
                 if not pitch_command_arrived or not pitch_feedback_arrived:
                     return
@@ -907,10 +914,14 @@ class MotorWorker:
                 self._publish(aim_request_id=int(request_id))
             except (TypeError, ValueError) as exc:
                 self._publish(status="雙軸目標未套用", error=str(exc))
-        elif action == "home":
+        elif action in ("home", "home_tagged"):
             try:
                 home_deg = math.degrees(self._recorded_home_muzzle_rad())
+                if action == "home_tagged":
+                    home_deg -= AUTO_HOME_INSET_DEG
                 self._set_aim_targets(0.0, home_deg, home_return=True)
+                if action == "home_tagged":
+                    self._publish(aim_request_id=int(value))
             except (ValueError, RuntimeError) as exc:
                 self._publish(status="home 目標未套用", error=str(exc))
         elif action == "calibration":

@@ -11,8 +11,8 @@ import serial
 # 1. User configuration
 # ============================================================
 
-PORT_LEFT = "/dev/ttyACM0"
-PORT_RIGHT = "/dev/ttyACM1"
+PORT_LEFT = "/dev/ttyACM1"
+PORT_RIGHT = "/dev/ttyACM2"
 BAUDRATE = 921600
 
 # Mechanical target speed
@@ -30,7 +30,7 @@ TELEMETRY_TIMEOUT = 0.5
 # Set these only after confirming hardware specifications.
 MAX_MOTOR_CURRENT_A = 50.0
 MAX_INPUT_VOLTAGE_V = 30.0
-MIN_INPUT_VOLTAGE_V = 18.0
+MIN_INPUT_VOLTAGE_V = 10.5
 
 # Speed trim limits, in ERPM.
 # The base target remains TARGET_RPM * pole_pairs.

@@ -159,6 +159,9 @@ python3 -m turret_control.run_board_real
 python3 -m turret_control.run_board_real --zed-uvc --aim-only --web-port 8080
 # 只有姿態穩定、距離有效且推算角度通過機構安全範圍時才會送追瞄命令；
 # 超出範圍或計算被阻擋時會持續保持目前位置。
+# 搭配 --no-score-mode 時，人工確認 12 孔後會循記錄的安全路徑回 home；
+# 自動回程停在記錄 home 前 0.2°，以保留工作區邊界餘裕。
+# 回程期間不接受重設，確認馬達回饋到位後才可重設開始下一輪。
 
 唯讀和實機入口共用 `board_vision.py`：同一流程執行孔洞偵測、靶面篩選、
 靶板與缺孔推算，以及靛青靶框／紫色網格繪製。預設優先使用

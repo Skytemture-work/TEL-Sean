@@ -27,8 +27,8 @@ HOME_DIRECTION = Direction.CW
 HOME_SPEED_RPM = 30
 
 # SERVO42D_CAN 歸位電流，mA
-# 200 mA 是低電流起始測試值，不保證足以推動負載
-HOME_CURRENT_MA = 200
+# 提高此值可降低阻力偵測敏感度；先小幅提高，避免回零推力增加過多
+HOME_CURRENT_MA = 300
 
 # 歸位碰到阻力後，反向退回的馬達角度
 # 0x0400 = 22.5 度；0x2000 = 180 度

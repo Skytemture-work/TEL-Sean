@@ -127,6 +127,10 @@ class PitchCalibrationTests(unittest.TestCase):
         self.assertAlmostEqual(worker.snapshot().target_rad, workspace.home_corridor.home_pitch_rad)
         self.assertAlmostEqual(math.degrees(worker.snapshot().target_muzzle_rad), 44.63186942390103)
 
+        worker._handle_command(("home_tagged", 9))
+        self.assertEqual(worker.snapshot().aim_request_id, 9)
+        self.assertAlmostEqual(math.degrees(worker.snapshot().target_muzzle_rad), 44.43186942390103)
+
     def test_global_pitch_limits_match_measured_mechanism_limits(self):
         config = TurretConfig()
         calibration = load_pitch_calibration(DEFAULT_STARTUP_POSE)
@@ -422,6 +426,23 @@ class PitchCalibrationTests(unittest.TestCase):
         self.assertEqual(worker.snapshot().yaw_sequence_phase, "rotating")
         self.assertTrue(worker._yaw_feedback_clear(math.radians(30.5)))
         self.assertFalse(worker._yaw_feedback_clear(math.radians(30.6)))
+
+    def test_clearance_accepts_small_feedback_error_inside_safety_margin(self):
+        pitch = PitchCalibration(motor_zero_rad=.2, motor_sign=-1)
+        yaw = PitchCalibration(motor_zero_rad=.5, motor_sign=-1)
+        worker = self.make_worker(pitch, yaw)
+        worker._yaw_feedback_position_rad = worker._yaw_last_command_rad = yaw.motor_from_muzzle(math.radians(13.486))
+        worker._feedback_position_rad = pitch.motor_from_muzzle(math.radians(25.0))
+        worker._set_aim_targets(0., 34.0)
+        clearance = worker.yaw_clearance_pitch_rad
+        worker._feedback_position_rad = pitch.motor_from_muzzle(clearance + math.radians(.021))
+        worker._feedback_velocity_rad_s = worker._command_velocity_rad_s = 0.
+        worker._update_yaw_clearance_sequence()
+        self.assertEqual(worker.snapshot().yaw_sequence_phase, "rotating")
+        self.assertTrue(worker._yaw_feedback_clear(clearance + math.radians(.021)))
+        self.assertFalse(worker._yaw_feedback_clear(clearance + math.radians(.06)))
+        self.assertLess(math.degrees(clearance + worker.sequence_arrival_tolerance_rad),
+                        worker._activity_pitch_limit_for_yaw(math.radians(13.486)))
 
     def test_planned_segments_cover_activity_and_home_corridor_grid(self):
         pitch = load_pitch_calibration(DEFAULT_STARTUP_POSE)

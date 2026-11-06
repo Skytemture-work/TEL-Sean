@@ -1,0 +1,5 @@
+# Let members of dialout open USB ACM serial devices, including ttyACM0/1.
+SUBSYSTEM=="tty", KERNEL=="ttyACM*", GROUP="dialout", MODE="0660"
+
+# Start can0-up.service whenever the CAN adapter creates can0.
+SUBSYSTEM=="net", KERNEL=="can0", TAG+="systemd", ENV{SYSTEMD_WANTS}+="can0-up.service"
