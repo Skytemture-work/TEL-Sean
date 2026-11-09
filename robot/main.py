@@ -4,7 +4,12 @@ import config
 from comm_uart import UARTController
 from vision_target import VisionTracker
 from lidar_avoid import LidarAvoidance
-from manual import ManualController, normalize_vrb_speed
+from manual import (
+    ManualController,
+    VESC_MIN_RPM,
+    VESC_RPM_PER_SPEED_UNIT,
+    normalize_vrb_speed,
+)
 
 
 def main():
@@ -37,8 +42,10 @@ def main():
                 packet_speed = normalize_vrb_speed(packet.get("speed", 0))
                 vesc_target = (
                     "STOP"
-                    if packet_mode != "M"
-                    else "{} RPM".format(1000 + packet_speed * 10)
+                    if packet_mode != "M" or packet_speed <= 0
+                    else "{} RPM".format(
+                        int(VESC_MIN_RPM + packet_speed * VESC_RPM_PER_SPEED_UNIT)
+                    )
                 )
                 print(
                     "[ESP32 RX] raw={!r} | mode={} vx={} vy={} wz={} "

@@ -212,6 +212,7 @@ class DamiaoSerialBackend:
         self.mode = mode
         self.kp = kp
         self.kd = kd
+        self._motor_gains: Dict[int, Tuple[float, float]] = {}
         self.startup_hold_s = startup_hold_s
         if position_limits is None:
             try:
@@ -517,10 +518,11 @@ class DamiaoSerialBackend:
         if self.mode == "posvel":
             self._mc.control_Pos_Vel(motor, position, speed, receive=False)
         else:
+            kp, kd = self.gains_for(motor_id)
             self._mc.controlMIT(
                 motor,
-                self.kp,
-                self.kd,
+                kp,
+                kd,
                 position,
                 velocity,
                 torque,
@@ -534,6 +536,24 @@ class DamiaoSerialBackend:
             velocity,
             torque,
         )
+
+    def set_motor_gains(self, gains: Mapping[int, Tuple[float, float]]) -> None:
+        """Set per-motor (Kp, Kd) overrides for MIT control."""
+        validated = {}
+        for motor_id, pair in gains.items():
+            motor_id = int(motor_id)
+            if len(pair) != 2:
+                raise ValueError("motor gains must be (kp, kd) pairs")
+            kp, kd = float(pair[0]), float(pair[1])
+            if not (math.isfinite(kp) and 0.0 <= kp <= 500.0):
+                raise ValueError(f"invalid Kp for motor 0x{motor_id:02X}: {kp}")
+            if not (math.isfinite(kd) and 0.0 < kd <= 5.0):
+                raise ValueError(f"invalid Kd for motor 0x{motor_id:02X}: {kd}")
+            validated[motor_id] = (kp, kd)
+        self._motor_gains.update(validated)
+
+    def gains_for(self, motor_id: int) -> Tuple[float, float]:
+        return self._motor_gains.get(int(motor_id), (self.kp, self.kd))
 
     def send_targets(
         self,

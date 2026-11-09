@@ -12,9 +12,10 @@ class ManualDMStartupTests(unittest.TestCase):
     def test_startup_returns_while_dm_holds_and_close_stops_worker(self):
         stopped = threading.Event()
 
-        def run(argv, *, confirm, stop_event, ready_event, on_shutdown):
+        def run(argv, *, confirm, stop_event, ready_event, on_shutdown, update_targets):
             self.assertFalse(confirm)
             self.assertIs(on_shutdown, manual.return_dm_before_shutdown)
+            self.assertTrue(callable(update_targets))
             self.assertEqual(argv[argv.index('--pitch') + 1], '20.0')
             ready_event.set()
             stop_event.wait(2)
@@ -67,6 +68,7 @@ class ManualDMStartupTests(unittest.TestCase):
         vesc.start.side_effect = lambda: order.append('vesc')
         with patch.object(manual, 'DMStartupController', return_value=dm), \
              patch.object(manual, 'VESCDualMotorController', return_value=vesc), \
+             patch.object(manual, 'validate_mks_can_interfaces'), \
              patch.object(manual.ManualController, '_initialize_can', side_effect=lambda: order.append('mks')):
             controller = manual.ManualController(Mock())
             self.assertEqual(order, ['dm', 'mks', 'vesc'])
@@ -78,6 +80,7 @@ class ManualDMStartupTests(unittest.TestCase):
         dm, vesc = Mock(), Mock()
         with patch.object(manual, 'DMStartupController', return_value=dm), \
              patch.object(manual, 'VESCDualMotorController', return_value=vesc), \
+             patch.object(manual, 'validate_mks_can_interfaces'), \
              patch.object(manual.ManualController, '_initialize_can', side_effect=RuntimeError('MKS failed')):
             with self.assertRaisesRegex(RuntimeError, 'MKS failed'):
                 manual.ManualController(Mock())
@@ -86,7 +89,11 @@ class ManualDMStartupTests(unittest.TestCase):
 
     def test_real_motion_entry_holds_support_then_disables_on_stop(self):
         stop, ready = threading.Event(), threading.Event()
-        motors = Mock(tmax=10.0, kp=manual.DM_STARTUP_TEST_MOVE_KP)
+        motors = Mock(tmax=10.0, kp=manual.DM_STARTUP_TEST_MOVE_KP, kd=manual.DM_STARTUP_TEST_KD)
+        motors.gains_for.side_effect = lambda i: (
+            manual.DM_STARTUP_TEST_YAW_KP if i == 3 else manual.DM_STARTUP_TEST_PITCH_KP,
+            manual.DM_STARTUP_TEST_KD,
+        )
         clock = [0.0]
 
         def now():
@@ -123,6 +130,10 @@ class ManualDMStartupTests(unittest.TestCase):
         self.assertLess(forces[0], 0.01)
         self.assertEqual(forces[-1], manual.DM_STARTUP_TEST_PITCH_TAU_FF)
         self.assertEqual(motors.kp, manual.DM_STARTUP_TEST_KP)
+        motors.set_motor_gains.assert_called_once_with({
+            3: (manual.DM_STARTUP_TEST_YAW_KP, manual.DM_STARTUP_TEST_KD),
+            1: (manual.DM_STARTUP_TEST_PITCH_KP, manual.DM_STARTUP_TEST_KD),
+        })
         motors.close.assert_called_once()
         shutdown.assert_called_once_with(motors)
 
@@ -146,7 +157,9 @@ class ManualDMStartupTests(unittest.TestCase):
         from turret_control.pitch import load_pitch_calibration, load_yaw_calibration
         expected = {
             3: load_yaw_calibration(move.DEFAULT_STARTUP_POSE).motor_from_muzzle(0.0),
-            1: load_pitch_calibration(move.DEFAULT_STARTUP_POSE).motor_from_muzzle(math.radians(35)),
+            1: load_pitch_calibration(move.DEFAULT_STARTUP_POSE).motor_from_muzzle(
+                math.radians(max(manual.DM_PITCH_MIN_DEG, min(manual.DM_PITCH_MAX_DEG, 35.0)))
+            ),
         }
         with patch.object(move, 'read_enabled_start', return_value=dict(positions)), \
              patch.object(manual, 'time', SimpleNamespace(monotonic=now, sleep=lambda s: None)), \

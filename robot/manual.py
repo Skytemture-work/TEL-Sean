@@ -19,6 +19,7 @@ import time
 import struct
 import threading
 import math
+import subprocess
 
 import serial
 
@@ -36,12 +37,16 @@ from mks_servo_can.mks_enums import (
 
 # -------------------- 可調整設定 --------------------
 DM_STARTUP_CLI_TEST_ONLY = False
-DM_STARTUP_TEST_PORT = "/dev/ttyACM0"
+# None lets dm_port select the USB-to-CAN board by VID/PID. ACM numbering is
+# not stable on this Jetson and ACM0 may belong to another USB device.
+DM_STARTUP_TEST_PORT = None
 DM_STARTUP_TEST_YAW_DEG = 0.0
 DM_STARTUP_TEST_PITCH_DEG = 20.0
 DM_STARTUP_TEST_MOVE_KP = 20.0
 DM_STARTUP_TEST_SPEED_RAD_S = 0.40
 DM_STARTUP_TEST_KP = 30.0  # 與 run_manual_move 預設保持增益一致。
+DM_STARTUP_TEST_YAW_KP = 400.0
+DM_STARTUP_TEST_PITCH_KP = 500.0  # 俯仰慢回正；先小幅提高保持剛性。
 DM_STARTUP_TEST_KD = 1.0
 DM_STARTUP_TEST_PITCH_TAU_FF = 3.0  # Nm，正向支撐；由 run_manual_move 漸增施加。
 DM_UART_CENTER = 50
@@ -56,15 +61,21 @@ SHOOTING_CAN_INTERFACE = "can0"
 
 # 雙 VESC 射擊馬達：請依實際裝置名稱調整。
 # 建議用 /dev/serial/by-id/ 確認每個 USB 裝置的固定名稱。
-VESC_LEFT_PORT = "/dev/ttyACM1"
-VESC_RIGHT_PORT = "/dev/ttyACM2"
+# Use the current host's stable USB topology paths. ttyACM2 is the DAMIAO
+# USB-to-CAN board (VID:PID 2e88:4603), not a VESC.
+VESC_LEFT_PORT = "/dev/serial/by-path/platform-3610000.xhci-usb-0:4.3:1.0"
+VESC_RIGHT_PORT = "/dev/serial/by-path/platform-3610000.xhci-usb-0:4.2:1.0"
 VESC_BAUDRATE = 921600
 VESC_LEFT_POLE_PAIRS = 7
 VESC_RIGHT_POLE_PAIRS = 7
-VESC_MIN_RPM = 1000.0
-VESC_RPM_PER_SPEED_UNIT = 10.0  # speed=100 對應 2000 RPM
+VESC_MIN_RPM = 2000.0
+VESC_RPM_PER_SPEED_UNIT = 10.0  # speed=100 對應 3000 RPM
 VESC_LOOP_INTERVAL = 0.10
 VESC_TELEMETRY_TIMEOUT = 0.5
+VESC_STARTUP_READ_ATTEMPTS = 5
+VESC_STARTUP_RETRY_DELAY = 0.4
+VESC_RUNTIME_READ_ATTEMPTS = 2
+VESC_RUNTIME_RETRY_DELAY = 0.1
 VESC_MAX_MOTOR_CURRENT_A = 50.0
 VESC_MAX_INPUT_VOLTAGE_V = 30.0
 VESC_MIN_INPUT_VOLTAGE_V = 10.5
@@ -234,41 +245,70 @@ def vesc_decode_values(payload):
         raise ValueError("VESC telemetry payload missing/too short")
     if payload[0] != VESC_COMM_GET_VALUES:
         raise ValueError("Unexpected VESC telemetry command ID")
+    mos_temp = struct.unpack_from(">h", payload, 1)[0] / 10.0
+    motor_temp_raw = struct.unpack_from(">h", payload, 3)[0] / 10.0
+    # A disconnected/unconfigured motor NTC can decode as a large negative
+    # temperature. Preserve the raw field, but do not present it as measured.
+    motor_temp = motor_temp_raw if -40.0 <= motor_temp_raw <= 200.0 else None
     return {
-        "motor_temp": struct.unpack_from(">h", payload, 3)[0] / 10.0,
+        "mos_temp": mos_temp,
+        "motor_temp": motor_temp,
+        "motor_temp_raw": motor_temp_raw,
         "motor_current": struct.unpack_from(">i", payload, 5)[0] / 100.0,
         "erpm": struct.unpack_from(">i", payload, 23)[0],
         "voltage": struct.unpack_from(">h", payload, 27)[0] / 10.0,
     }
 
 
+def format_vesc_motor_temp(values):
+    if values["motor_temp"] is None:
+        return "未提供（raw={:.1f}°C）".format(values["motor_temp_raw"])
+    return "{:.1f}°C".format(values["motor_temp"])
+
+
 class VESCDualMotorController:
     """
     背景控制左右 VESC 馬達。
-    手動 speed 0..100 對應 1000..2000 RPM；None 代表安全停轉。
+    手動 speed 0..100 對應 2000..3000 RPM；None 代表安全停轉。
     保留使用者原始程式的 PI 調速與交叉同步修正。
     """
 
     def __init__(self):
         self._lock = threading.Lock()
-        # VRB=0 對應最低目標 1000 RPM，啟動時先以最低轉速運作。
-        self._speed_value = 0
+        # 啟動時保持停轉；收到手動模式的速度封包後才依 VRB 設定轉速。
+        # 自動模式會透過 on_mode_change 將目標維持在 None（停轉）。
+        self._speed_value = None
         self._stop_event = threading.Event()
         self._thread = None
         self._ser_left = None
         self._ser_right = None
         self.error = None
+        self._ready_event = threading.Event()
 
     def start(self):
-        print("[VESC] 啟動控制執行緒，初始 VRB=0，目標 1000 RPM。", flush=True)
+        print("[VESC] 啟動控制執行緒，檢查雙馬達遙測；初始保持停轉。", flush=True)
         self._thread = threading.Thread(
             target=self._run, name="VESC-Dual-Motor", daemon=True
         )
         self._thread.start()
+        while not self._ready_event.wait(0.05):
+            pass
+        if self.error is not None:
+            raise RuntimeError("VESC 初始化失敗：{}".format(self.error))
+
+    def check_health(self):
+        if self.error is not None:
+            raise RuntimeError("VESC 控制失敗：{}".format(self.error))
+        if self._thread is not None and not self._thread.is_alive() and not self._stop_event.is_set():
+            raise RuntimeError("VESC 控制執行緒意外結束")
 
     def set_speed(self, speed_value):
         if speed_value is not None:
             speed_value = max(0, min(100, int(speed_value)))
+            # Zero throttle is a stop command. Mapping it to VESC_MIN_RPM made
+            # an idle/manual packet unexpectedly spin both flywheels.
+            if speed_value == 0:
+                speed_value = None
         with self._lock:
             previous = self._speed_value
             self._speed_value = speed_value
@@ -313,6 +353,45 @@ class VESCDualMotorController:
             )
         return values
 
+    def _read_runtime_motor(self, reader, label, ser):
+        last_error = None
+        for attempt in range(1, VESC_RUNTIME_READ_ATTEMPTS + 1):
+            try:
+                return self._read_motor(reader)
+            except Exception as exc:
+                last_error = exc
+                if attempt < VESC_RUNTIME_READ_ATTEMPTS:
+                    print(
+                        "[VESC] {} 遙測讀取失敗，先送停止命令後重試：{}".format(label, exc),
+                        flush=True,
+                    )
+                    self._stop_motors()
+                    time.sleep(VESC_RUNTIME_RETRY_DELAY)
+        raise RuntimeError(
+            "{} VESC 遙測連續失敗 ({})：{}".format(label, ser.port, last_error)
+        ) from last_error
+
+    def _read_startup_motor(self, reader, label):
+        """Allow USB CDC/VESC firmware time to settle after power-up."""
+        last_error = None
+        for attempt in range(1, VESC_STARTUP_READ_ATTEMPTS + 1):
+            try:
+                values = self._read_motor(reader)
+                if attempt > 1:
+                    print("[VESC] {} 啟動遙測第 {} 次讀取成功。".format(label, attempt), flush=True)
+                return values
+            except Exception as exc:
+                last_error = exc
+                print(
+                    "[VESC] {} 啟動遙測尚未就緒 ({}/{}): {}".format(
+                        label, attempt, VESC_STARTUP_READ_ATTEMPTS, exc
+                    ),
+                    flush=True,
+                )
+                if attempt < VESC_STARTUP_READ_ATTEMPTS:
+                    time.sleep(VESC_STARTUP_RETRY_DELAY)
+        raise RuntimeError("{} VESC 啟動遙測重試耗盡：{}".format(label, last_error))
+
     def _stop_motors(self):
         for ser in (self._ser_left, self._ser_right):
             if ser is not None and ser.is_open:
@@ -327,6 +406,15 @@ class VESCDualMotorController:
                     vesc_send_set_rpm(ser, 0)
                 except Exception:
                     pass
+
+    @staticmethod
+    def _write_rpm(label, ser, erpm):
+        try:
+            vesc_send_set_rpm(ser, erpm)
+        except Exception as exc:
+            raise RuntimeError(
+                "{} VESC {} RPM 命令寫入失敗：{}".format(label, ser.port, exc)
+            ) from exc
 
     def _run(self):
         pi_left_integral = 0.0
@@ -344,27 +432,36 @@ class VESCDualMotorController:
             self._ser_right = serial.Serial(
                 VESC_RIGHT_PORT, VESC_BAUDRATE, timeout=0.05, write_timeout=0.5
             )
-            time.sleep(0.2)
+            time.sleep(0.5)
             self._ser_left.reset_input_buffer()
             self._ser_right.reset_input_buffer()
             reader_left = VESCReader(self._ser_left)
             reader_right = VESCReader(self._ser_right)
 
-            left = self._read_motor(reader_left)
-            right = self._read_motor(reader_right)
+            left = self._read_startup_motor(reader_left, "LEFT")
+            right = self._read_startup_motor(reader_right, "RIGHT")
             print(
-                "[VESC] 初始回授 LEFT ERPM={} {:.1f}V, RIGHT ERPM={} {:.1f}V".format(
-                    left["erpm"], left["voltage"], right["erpm"], right["voltage"]
+                "[VESC] 初始回授 LEFT ERPM={} {:.1f}V MOS={:.1f}°C 馬達溫度={}, "
+                "RIGHT ERPM={} {:.1f}V MOS={:.1f}°C 馬達溫度={}".format(
+                    left["erpm"], left["voltage"], left["mos_temp"],
+                    format_vesc_motor_temp(left),
+                    right["erpm"], right["voltage"], right["mos_temp"],
+                    format_vesc_motor_temp(right),
                 )
             )
+            # Confirm both command paths can accept a safe stop before
+            # declaring the VESC subsystem initialized to the main loop.
+            self._write_rpm("LEFT", self._ser_left, 0)
+            self._write_rpm("RIGHT", self._ser_right, 0)
+            self._ready_event.set()
 
             while not self._stop_event.is_set():
                 now = time.monotonic()
                 dt = self._clamp(now - last_time, 0.01, 0.5)
                 last_time = now
 
-                left = self._read_motor(reader_left)
-                right = self._read_motor(reader_right)
+                left = self._read_runtime_motor(reader_left, "LEFT", self._ser_left)
+                right = self._read_runtime_motor(reader_right, "RIGHT", self._ser_right)
 
                 speed_value = self._get_speed_value()
                 target_rpm = (
@@ -403,8 +500,8 @@ class VESCDualMotorController:
                     target_left = int(base_left + trim_left - sync)
                     target_right = int(base_right + trim_right + sync)
 
-                vesc_send_set_rpm(self._ser_left, target_left)
-                vesc_send_set_rpm(self._ser_right, target_right)
+                self._write_rpm("LEFT", self._ser_left, target_left)
+                self._write_rpm("RIGHT", self._ser_right, target_right)
                 print(
                     "[VESC] VRB={} -> target={} RPM | "
                     "L cmd={} ERPM actual={} ERPM ({:.1f} RPM) | "
@@ -426,6 +523,7 @@ class VESCDualMotorController:
             self.error = str(exc)
             print("[VESC ERROR] 停止雙馬達控制：{}".format(exc))
         finally:
+            self._ready_event.set()
             self._stop_motors()
             for ser in (self._ser_left, self._ser_right):
                 if ser is not None and ser.is_open:
@@ -451,17 +549,40 @@ def enable_motor_compat(servo, enabled=True):
     return servo.set_generic_status(commands.ENABLE_MOTOR_COMMAND, [value])
 
 
+def validate_mks_can_interfaces():
+    """Fail before moving the turret if an MKS SocketCAN bus is not ready."""
+    for interface in sorted(set((AMMO_CAN_INTERFACE, SHOOTING_CAN_INTERFACE))):
+        result = subprocess.run(
+            ["ip", "-details", "link", "show", "dev", interface],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+        )
+        details = result.stdout
+        flags = details.split("<", 1)[1].split(">", 1)[0].split(",") if "<" in details and ">" in details else []
+        if result.returncode != 0 or "UP" not in flags or "bitrate 500000" not in details:
+            raise RuntimeError(
+                "MKS CAN 介面 {} 尚未就緒（需要 UP 且 bitrate 500000）。"
+                "請先執行 `sudo ./system/install-hardware-config.sh`，"
+                "再確認 `ip -details link show dev {}`。".format(interface, interface)
+            )
+
+
 def dm_startup_arguments():
-    return [
-        "--port", DM_STARTUP_TEST_PORT,
+    args = [
         "--yaw", str(DM_STARTUP_TEST_YAW_DEG),
         "--pitch", str(DM_STARTUP_TEST_PITCH_DEG),
         "--speed", str(DM_STARTUP_TEST_SPEED_RAD_S),
         "--move-kp", str(DM_STARTUP_TEST_MOVE_KP),
         "--kp", str(DM_STARTUP_TEST_KP),
+        "--yaw-kp", str(DM_STARTUP_TEST_YAW_KP),
+        "--pitch-kp", str(DM_STARTUP_TEST_PITCH_KP),
         "--kd", str(DM_STARTUP_TEST_KD),
         "--pitch-tau-ff", str(DM_STARTUP_TEST_PITCH_TAU_FF),
     ]
+    if DM_STARTUP_TEST_PORT is not None:
+        args.extend(["--port", DM_STARTUP_TEST_PORT])
+    return args
 
 
 def run_dm_startup_test():
@@ -470,23 +591,28 @@ def run_dm_startup_test():
 
 
 def return_dm_before_shutdown(motors):
-    """使用既有連線，回到校正後 yaw 0°、pitch 35° 再結束。"""
+    """使用既有連線，回到 yaw 0° 與設定範圍內的安全 pitch 再結束。"""
     from turret_control.run_manual_move import DEFAULT_STARTUP_POSE, read_enabled_start
     from turret_control.pitch import load_pitch_calibration, load_yaw_calibration
     from turret_control.trajectory import smoothstep_sample
 
     cal = {3: load_yaw_calibration(DEFAULT_STARTUP_POSE),
            1: load_pitch_calibration(DEFAULT_STARTUP_POSE)}
+    shutdown_pitch_deg = max(DM_PITCH_MIN_DEG, min(DM_PITCH_MAX_DEG, 35.0))
     destination = {3: cal[3].motor_from_muzzle(0.0),
-                   1: cal[1].motor_from_muzzle(math.radians(35.0))}
+                   1: cal[1].motor_from_muzzle(math.radians(shutdown_pitch_deg))}
     start = read_enabled_start(motors)
     speed = DM_STARTUP_TEST_SPEED_RAD_S
     duration = max(1.5 * max(abs(destination[i] - start[i]) for i in (3, 1)) / speed, 1.0)
     motors.kp = DM_STARTUP_TEST_KP
+    motors.set_motor_gains({
+        0x03: (DM_STARTUP_TEST_KP, DM_STARTUP_TEST_KD),
+        0x01: (DM_STARTUP_TEST_KP, DM_STARTUP_TEST_KD),
+    })
     began = time.monotonic()
     settled = None
     next_status = began
-    print(f"[Manual DM] 關閉前回位 yaw=0° pitch=35°，軌跡約 {duration:.1f}s。", flush=True)
+    print(f"[Manual DM] 關閉前回位 yaw=0° pitch={shutdown_pitch_deg:g}°，軌跡約 {duration:.1f}s。", flush=True)
     while True:
         now = time.monotonic()
         elapsed = now - began
@@ -919,6 +1045,7 @@ class ManualController:
         self.last_vy = 0
         self.last_wz = 0
         try:
+            validate_mks_can_interfaces()
             self.dm_controller.start()
             self._initialize_can()
             self.vesc_controller.start()
@@ -969,6 +1096,7 @@ class ManualController:
 
     def check_health(self):
         self.dm_controller.check_health()
+        self.vesc_controller.check_health()
 
     @property
     def dm_yaw_deg(self):
@@ -997,15 +1125,21 @@ class ManualController:
         raw_vrb = packet.get("speed", 0)
         self.last_speed = normalize_vrb_speed(raw_vrb)
         self.vesc_controller.set_speed(self.last_speed)
+        vesc_target = (
+            "STOP" if self.last_speed == 0
+            else "{} RPM".format(
+                int(VESC_MIN_RPM + self.last_speed * VESC_RPM_PER_SPEED_UNIT)
+            )
+        )
         print(
-            "[Manual RX] mode={} | yaw={} pitch={} fire={} VRB raw={} normalized={} -> VESC target={} RPM".format(
+            "[Manual RX] mode={} | yaw={} pitch={} fire={} VRB raw={} normalized={} -> VESC target={}".format(
                 packet.get("mode", self.current_mode),
                 self.last_yaw,
                 self.last_pitch,
                 packet.get("fire", 0),
                 raw_vrb,
                 self.last_speed,
-                int(VESC_MIN_RPM + self.last_speed * VESC_RPM_PER_SPEED_UNIT),
+                vesc_target,
             ),
             flush=True,
         )
