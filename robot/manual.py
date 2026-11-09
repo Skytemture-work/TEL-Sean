@@ -6,12 +6,14 @@
 #
 # 暫定硬體分配：
 #   can0：共用 MKS CAN bus；彈藥倉 ID 2、射擊機構 ID 1
-#   彈藥倉每格移動 6666 pulses
+#   彈藥倉每格移動 AMMO_SLOT_PULSES
 #   VESC_LEFT_PORT / VESC_RIGHT_PORT：射擊雙馬達轉速控制（UART）
 #
 # 注意：
+# 1. 每輪第一次 FIRE 先向 HOME_DIRECTION 回零並確認成功，再執行第一段推球。
 # 2. FIRE 每次由 0 變 1，只執行一階段：1700、再移動 1300、回零後 ID2 轉格。
-# 3. 第三階段保留 ID1 反向／正向回零；完成後 ID2 正轉 AMMO_SLOT_PULSES。
+# 3. 第三階段 ID1 反向／正向回零；收到成功回覆且確認停止、位置穩定後，
+#    才允許 ID2 正轉 AMMO_SLOT_PULSES。回零失敗或逾時會停止並禁止轉格。
 # 5. 手動 VESC 目標轉速為 1000 + speed*10 RPM（speed 0..100）。
 # 6. 請卸除彈藥進行低速測試。
 #
@@ -32,6 +34,8 @@ from mks_servo_can.mks_enums import (
     WorkMode,
     SuccessStatus,
     MksCommands,
+    GoHomeResult,
+    MotorStatus,
 )
 
 
@@ -115,6 +119,8 @@ MOVE_TIMEOUT = 30.0
 HOME_TIMEOUT = 30.0
 POLL_INTERVAL = 0.1
 SETTLE_TIME = 0.2
+# 回零後與轉格前的位置穩定容許值；單位為編碼器 counts，不是命令 pulses。
+SHOOT_HOME_TOLERANCE_COUNTS = 20
 
 # FIRE 指令若持續為 1，只在上升沿觸發一次，不會連續重複射擊。
 # 射擊循環在背景執行緒處理；主迴圈仍可更新 VESC speed 與接收遙控器封包。
@@ -1033,8 +1039,10 @@ class ManualController:
         self.busy = False
         self.last_fire = 0
         self.current_slot = 1
+        # 這只是下一筆 FIRE 的階段；實際原點必須在第 1 階段開始前完成回零。
         self.shot_stage = 0
         self.reload_pending = False
+        self._shoot_home_encoder = None
         self.shot_error = None
         self.current_mode = "M"
         self.last_yaw = 50
@@ -1195,7 +1203,7 @@ class ManualController:
             if self.current_mode != "M":
                 print("[Manual] ID1 已回零；ID2 待轉格，切回手動後重新按 FIRE。", flush=True)
                 return
-            print("[Manual] ID1 回零完成，開始 ID2 轉格。", flush=True)
+            print("[Manual] ID1 回零完成，準備檢查 ID2 轉格條件。", flush=True)
             self._rotate_ammo_one_slot()
             self.current_slot = self.current_slot % SLOTS_PER_MAGAZINE + 1
             self.reload_pending = False
@@ -1205,6 +1213,8 @@ class ManualController:
             ), flush=True)
         except Exception as exc:
             with self.lock:
+                self._shoot_home_encoder = None
+                self.reload_pending = False
                 self.shot_error = "第 {}/3 階段失敗：{}".format(self.shot_stage + 1, exc)
             print("[Manual Error] {}；已停止，不再重試。".format(self.shot_error), flush=True)
             self._emergency_stop(self.shoot_servo, "射擊機構")
@@ -1216,6 +1226,13 @@ class ManualController:
     def _run_one_shot_cycle(self):
         """一次只執行一個 ID1 階段；第三階段成功後由 worker 觸發 ID2。"""
         if self.shot_stage == 0:
+            self.reload_pending = False
+            self._shoot_home_encoder = None
+            print("[Manual] 本輪第一次推球：先退回原點，確認成功後才開始推球。", flush=True)
+            self._go_home(self.shoot_servo, HOME_DIRECTION, "推球前退回原點")
+            if self.current_mode != "M":
+                raise RuntimeError("回零期間已離開手動模式，停止推球並禁止轉格")
+            print("[Manual] 推球前回零確認完成，開始第 1 階段。", flush=True)
             self._move_relative(
                 self.shoot_servo, TARGET_POSITIONS[0], MOVE_DIRECTION, SHOOTING_SPEED_RPM
             )
@@ -1226,14 +1243,19 @@ class ManualController:
             )
         elif self.shot_stage == 2:
             if not self.reload_pending:
+                self._shoot_home_encoder = None
                 self._go_home(self.shoot_servo, MOVE_DIRECTION, "反向無限位回零")
                 time.sleep(SETTLE_TIME)
-                self._go_home(self.shoot_servo, HOME_DIRECTION, "正向無限位回零")
+                self._shoot_home_encoder = self._go_home(
+                    self.shoot_servo, HOME_DIRECTION, "正向無限位回零"
+                )
                 self.reload_pending = True
         else:
             raise RuntimeError("未知射擊階段：{}".format(self.shot_stage))
 
     def _move_relative(self, servo, pulses, direction, speed):
+        if servo is self.shoot_servo:
+            self._shoot_home_encoder = None
         before = servo.read_encoder_value_addition()
         if before is None:
             raise RuntimeError("移動前 Encoder 讀取失敗")
@@ -1280,6 +1302,7 @@ class ManualController:
         print("[Manual] Encoder 位移：{}".format(after - before))
 
     def _go_home(self, servo, direction, label):
+        self._shoot_home_encoder = None
         print("[Manual] 開始{}".format(label))
         home_data = [
             0,
@@ -1309,57 +1332,93 @@ class ManualController:
         if result != SuccessStatus.Success:
             raise RuntimeError("{}電流參數設定失敗".format(label))
 
-        response = servo.set_generic(
-            MksCommands.GO_HOME_COMMAND, servo.GENERIC_RESPONSE_LENGTH
-        )
-        if response is None or len(response) < 2:
-            raise RuntimeError("{}沒有收到有效回覆".format(label))
+        # 0x91 先回報開始，再非同步回報完成。只接收本次命令的終止回覆，
+        # 不使用函式庫快取的舊成功狀態，也不以「停止」代替回零成功。
+        finished = threading.Event()
+        outcome = [None]
 
-        status = int(response[1])
-        print("[Manual] {}初始狀態：{}".format(label, status))
-        if status == 0:
-            raise RuntimeError("驅動器拒絕{}".format(label))
-        if status == 2:
-            return
-        if status != 1:
-            raise RuntimeError("{}回覆未知狀態 {}".format(label, status))
+        def receive_home_result(message):
+            if (message.arbitration_id != servo.can_id
+                    or message.is_extended_id or message.is_remote_frame
+                    or message.is_error_frame
+                    or len(message.data) != servo.GENERIC_RESPONSE_LENGTH
+                    or message.data[0] != MksCommands.GO_HOME_COMMAND.value):
+                return
+            try:
+                servo.check_msg_crc(message)
+            except Exception:
+                return  # 毀損回覆不得放行；等待有效回覆或逾時。
+            if finished.is_set():
+                return
+            status = int(message.data[1])
+            if status == GoHomeResult.Start.value:
+                return
+            outcome[0] = status
+            finished.set()
 
-        start = time.monotonic()
-        seen_running = False
-        movement_seen = False
-        before = servo.read_encoder_value_addition()
-        stopped_at = None
+        servo.notifier.add_listener(receive_home_result)
+        try:
+            servo.bus.send(servo.create_can_msg([MksCommands.GO_HOME_COMMAND.value]))
+            deadline = time.monotonic() + HOME_TIMEOUT
+            while not finished.wait(POLL_INTERVAL):
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("{}未收到回零成功回覆，禁止轉格".format(label))
+            if outcome[0] != GoHomeResult.Success.value:
+                raise RuntimeError("{}失敗，回覆狀態 {}，禁止轉格".format(label, outcome[0]))
+        finally:
+            servo.notifier.remove_listener(receive_home_result)
 
-        while True:
-            elapsed = time.monotonic() - start
-            if elapsed > HOME_TIMEOUT:
-                self._emergency_stop(servo, "回零逾時")
-                raise TimeoutError("{}逾時".format(label))
+        encoder = self._wait_shooter_stopped(servo, label)
+        print("[Manual] {}成功，已停止且位置穩定，Encoder={}。".format(label, encoder), flush=True)
+        return encoder
 
-            running = servo.is_motor_running()
-            now_encoder = servo.read_encoder_value_addition()
-            if before is not None and now_encoder is not None and now_encoder != before:
-                movement_seen = True
-
-            if running:
-                seen_running = True
-                stopped_at = None
-            elif seen_running or movement_seen:
-                if stopped_at is None:
-                    stopped_at = time.monotonic()
-                elif time.monotonic() - stopped_at >= 1.0:
-                    break
-            elif elapsed > 2.0:
-                raise RuntimeError("{}未偵測到馬達移動".format(label))
-
+    def _wait_shooter_stopped(self, servo, label, expected_encoder=None):
+        deadline = time.monotonic() + HOME_TIMEOUT
+        stable_since = None
+        samples = []
+        while time.monotonic() < deadline:
+            status = servo.query_motor_status()
+            if status is None or status == MotorStatus.Fail:
+                raise RuntimeError("{}無法確認馬達停止，禁止轉格".format(label))
+            encoder = servo.read_encoder_value_addition()
+            if not isinstance(encoder, int) or isinstance(encoder, bool):
+                raise RuntimeError("{}編碼器讀取失敗，禁止轉格".format(label))
+            if (expected_encoder is not None
+                    and abs(encoder - expected_encoder) > SHOOT_HOME_TOLERANCE_COUNTS):
+                raise RuntimeError("{}已偏離回零位置，禁止轉格（Encoder={}，基準={}）".format(
+                    label, encoder, expected_encoder
+                ))
+            if status == MotorStatus.MotorStop:
+                samples.append(encoder)
+                if max(samples) - min(samples) > SHOOT_HOME_TOLERANCE_COUNTS:
+                    samples = [encoder]
+                    stable_since = None
+                if stable_since is None:
+                    stable_since = time.monotonic()
+                elif time.monotonic() - stable_since >= SETTLE_TIME:
+                    return encoder
+            else:
+                if expected_encoder is not None:
+                    raise RuntimeError("{}尚未停止，禁止轉格".format(label))
+                stable_since = None
+                samples = []
             time.sleep(POLL_INTERVAL)
+        raise TimeoutError("{}未能確認停止且位置穩定，禁止轉格".format(label))
 
-        # 驅動器停止不一定代表回零成功；此處只確認動作已結束。
-        print("[Manual] {}動作停止；請確認機構實際原點。".format(label))
+    def _verify_shooter_home_before_reload(self):
+        if not self.reload_pending or self._shoot_home_encoder is None:
+            raise RuntimeError("推球機構尚未確認回零成功，禁止轉格")
+        if self.current_mode != "M":
+            raise RuntimeError("目前不是手動模式，禁止轉格")
+        self._wait_shooter_stopped(
+            self.shoot_servo, "轉格前推球機構確認", self._shoot_home_encoder
+        )
+        if self.current_mode != "M":
+            raise RuntimeError("確認期間已離開手動模式，禁止轉格")
 
     def _rotate_ammo_one_slot(self):
         print(
-            "[Manual] 發送彈藥倉命令：CAN={} ID={} direction=CW speed={} RPM pulses={}".format(
+            "[Manual] 準備彈藥倉命令：CAN={} ID={} direction=CW speed={} RPM pulses={}".format(
                 AMMO_CAN_INTERFACE,
                 AMMO_MOTOR_CAN_ID,
                 AMMO_SPEED_RPM,
@@ -1371,6 +1430,10 @@ class ManualController:
         if before is None:
             raise RuntimeError("彈藥倉移動前 Encoder 讀取失敗")
 
+        self._verify_shooter_home_before_reload()
+        # 此次確認只能用於一筆轉格指令，失敗或完成後都不能重複使用。
+        self._shoot_home_encoder = None
+        print("[Manual] 推球機構已確認回零，允許儲存盤轉一格。", flush=True)
         result = self.ammo_servo.run_motor_relative_motion_by_pulses(
             Direction.CW, AMMO_SPEED_RPM, ACCELERATION, AMMO_SLOT_PULSES
         )
@@ -1449,6 +1512,8 @@ class ManualController:
 
     def close(self):
         self.current_mode = "A"
+        self._shoot_home_encoder = None
+        self.reload_pending = False
         # 先停止 VESC/MKS，再等待 DM 回位。
         if getattr(self, "vesc_controller", None) is not None:
             try:
