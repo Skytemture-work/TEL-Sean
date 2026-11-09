@@ -9,6 +9,7 @@ operator-confirmed ``f`` key.  An integrating process can instead pass a real
 from __future__ import annotations
 
 import argparse
+import math
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -43,7 +44,11 @@ from .dashboard import (
 )
 from .engagement import BoardEngagement, PartialPoseShotGate
 from .fixed_board import calibrate_layout, load_layout
-from .shared_motor_backend import SharedMotorBackend
+from .shared_motor_backend import (
+    DEFAULT_AIM_ACCELERATION_RAD_S2,
+    DEFAULT_AIM_SPEED_RAD_S,
+    SharedMotorBackend,
+)
 from .run_yolo_demo import _inference_frame
 from .scoring_light import ScoreRoundController, draw_score_light_overlay
 from .scoring_strategy import (
@@ -116,7 +121,15 @@ def main(
     parser.add_argument("--device", default="0")
     parser.add_argument("--conf", type=float, default=DEFAULT_CONFIDENCE)
     parser.add_argument("--imgsz", type=int, default=640)
-    parser.add_argument("--port", default="/dev/ttyACM0")
+    parser.add_argument("--port", default=None, help="DM USB-to-CAN 序列埠；預設依裝置識別碼自動偵測")
+    parser.add_argument(
+        "--aim-speed", type=float, default=DEFAULT_AIM_SPEED_RAD_S,
+        help="雙軸自動瞄準的平滑速度上限 rad/s（預設 0.09）",
+    )
+    parser.add_argument(
+        "--aim-acceleration", type=float, default=DEFAULT_AIM_ACCELERATION_RAD_S2,
+        help="雙軸自動瞄準的平滑加速度上限 rad/s²（預設 0.075）",
+    )
     camera_mode = parser.add_mutually_exclusive_group()
     camera_mode.add_argument("--zed-uvc", action="store_true", help="使用 ZED UVC 原始影像，不提供立體深度")
     camera_mode.add_argument("--opencv-camera", action="store_true", help="使用一般 OpenCV 相機，不提供立體深度")
@@ -175,6 +188,10 @@ def main(
         help="比賽半場；決定 27/18 球上限與最大得分射擊順序",
     )
     args = parser.parse_args(argv)
+    if not math.isfinite(args.aim_speed) or args.aim_speed <= 0:
+        parser.error("--aim-speed 必須是大於 0 的有限數值")
+    if not math.isfinite(args.aim_acceleration) or args.aim_acceleration <= 0:
+        parser.error("--aim-acceleration 必須是大於 0 的有限數值")
     if args.cooldown < 0:
         parser.error("--cooldown 不可小於 0")
     if args.target_timeout < 0:
@@ -277,7 +294,16 @@ def main(
             print("提醒：相機內參仍為暫值，正式瞄準前請完成標定。", flush=True)
 
     try:
-        motors = SharedMotorBackend(args.port)
+        motors = SharedMotorBackend(
+            args.port,
+            speed_rad_s=args.aim_speed,
+            acceleration_rad_s2=args.aim_acceleration,
+        )
+        print(
+            f"自動瞄準軌跡速度上限 {args.aim_speed:.3f} rad/s，"
+            f"加速度上限 {args.aim_acceleration:.3f} rad/s²。",
+            flush=True,
+        )
     except Exception:
         camera.release()
         raise

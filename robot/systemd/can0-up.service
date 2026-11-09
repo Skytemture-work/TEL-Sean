@@ -2,10 +2,12 @@
 Description=Configure and bring up the robot CAN bus (can0)
 BindsTo=sys-subsystem-net-devices-can0.device
 After=sys-subsystem-net-devices-can0.device
+JobTimeoutSec=30s
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+TimeoutStartSec=30s
 ExecStartPre=-/usr/sbin/ip link set dev can0 down
 ExecStart=/usr/sbin/ip link set dev can0 type can bitrate 500000
 ExecStart=/usr/sbin/ip link set dev can0 up
@@ -13,3 +15,4 @@ ExecStop=-/usr/sbin/ip link set dev can0 down
 
 [Install]
 WantedBy=multi-user.target
+Alias=can0.service

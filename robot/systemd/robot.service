@@ -1,0 +1,29 @@
+[Unit]
+Description=TEL-Sean robot main control
+Requires=can0-up.service
+BindsTo=can0-up.service
+After=can0-up.service network.target
+StartLimitIntervalSec=180
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=robot
+Group=robot
+SupplementaryGroups=dialout video render
+WorkingDirectory=/home/robot/robot/TEL-Sean/robot
+Environment=PYTHONUNBUFFERED=1
+ExecStartPre=/usr/bin/python3 /home/robot/robot/TEL-Sean/robot/system/wait_robot_hardware.py --timeout 30
+ExecStart=/usr/bin/python3 /home/robot/robot/TEL-Sean/robot/main.py
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=45
+# main.py handles SIGINT with its existing close/return/disable sequence.
+KillSignal=SIGINT
+KillMode=mixed
+TimeoutStopSec=60
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

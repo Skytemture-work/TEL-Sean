@@ -1,6 +1,7 @@
 import math
 import time
 import unittest
+from unittest.mock import patch
 from dataclasses import replace
 
 from turret_control.aiming import AimCommand, TargetPixel
@@ -50,6 +51,30 @@ class SharedMotorBackendTests(unittest.TestCase):
         self.backend.send_targets(self.targets)
         self.assertEqual(len(self.worker.requests), 1)
         self.assertTrue(self.backend.motion_ready(self.yaw, self.pitch))
+
+    @patch("turret_control.shared_motor_backend.MotorWorker")
+    def test_speed_and_acceleration_are_passed_to_motor_worker(self, worker_class):
+        SharedMotorBackend("unused", speed_rad_s=0.12, acceleration_rad_s2=0.08)
+        kwargs = worker_class.call_args.kwargs
+        self.assertEqual(kwargs["speed_rad_s"], 0.12)
+        self.assertEqual(kwargs["acceleration_rad_s2"], 0.08)
+
+    @patch("turret_control.shared_motor_backend.MotorWorker")
+    def test_default_aim_trajectory_limits(self, worker_class):
+        SharedMotorBackend("unused")
+        kwargs = worker_class.call_args.kwargs
+        self.assertEqual(kwargs["speed_rad_s"], 0.09)
+        self.assertEqual(kwargs["acceleration_rad_s2"], 0.075)
+
+    @patch("turret_control.shared_motor_backend.MotorWorker")
+    def test_invalid_trajectory_limits_are_rejected(self, worker_class):
+        for speed, acceleration in ((0, 0.05), (-1, 0.05), (float("nan"), 0.05),
+                                    (0.09, 0), (0.09, float("inf"))):
+            with self.subTest(speed=speed, acceleration=acceleration):
+                with self.assertRaises(ValueError):
+                    SharedMotorBackend("unused", speed_rad_s=speed,
+                                       acceleration_rad_s2=acceleration)
+        worker_class.assert_not_called()
 
     def test_home_requires_acknowledged_goal_and_fresh_stopped_feedback(self):
         self.backend.request_home()

@@ -11,18 +11,27 @@ from .run_vertical_panel import (
     SEQUENCE_STOP_SPEED_RAD_S,
 )
 
+DEFAULT_AIM_SPEED_RAD_S = 0.09
+DEFAULT_AIM_ACCELERATION_RAD_S2 = 0.075
+
 
 class SharedMotorBackend:
     """The worker owns the serial port and runs the same 200 Hz safe sequence."""
 
-    def __init__(self, port, *, worker=None):
+    def __init__(self, port, *, worker=None,
+                 speed_rad_s=DEFAULT_AIM_SPEED_RAD_S,
+                 acceleration_rad_s2=DEFAULT_AIM_ACCELERATION_RAD_S2):
+        if not math.isfinite(speed_rad_s) or speed_rad_s <= 0:
+            raise ValueError("自動瞄準速度必須是大於 0 的有限數值")
+        if not math.isfinite(acceleration_rad_s2) or acceleration_rad_s2 <= 0:
+            raise ValueError("自動瞄準加速度必須是大於 0 的有限數值")
         self.pitch_calibration = load_pitch_calibration(DEFAULT_STARTUP_POSE)
         self.yaw_calibration = load_yaw_calibration(DEFAULT_STARTUP_POSE)
         self._workspace = load_workspace_limit()
         self.worker = worker or MotorWorker(
             port=port, pitch_calibration=self.pitch_calibration,
             yaw_calibration=self.yaw_calibration,
-            speed_rad_s=.06, acceleration_rad_s2=.05,
+            speed_rad_s=speed_rad_s, acceleration_rad_s2=acceleration_rad_s2,
             torque_ff_nm=0., torque_ramp_s=1.5, kp=50., kd=1.5,
             max_tracking_error_deg=10., stall_timeout_s=2.,
             min_muzzle_deg=0., max_muzzle_deg=45., control_mode="posvel",
