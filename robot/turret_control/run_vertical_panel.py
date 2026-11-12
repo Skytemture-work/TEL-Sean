@@ -1223,7 +1223,7 @@ class MotorWorker:
                                 yaw_feedback_at=yaw_state.feedback_at,
                             )
         except Exception as exc:  # surfaced in the GUI
-            self._publish(status="控制器錯誤", error=str(exc), ready=False, enabled=False)
+            self._publish(status=("DM 保護停機" if self._motors is not None and self._motors.protection_tripped else "控制器錯誤"), error=str(exc), ready=False, enabled=False)
             self._enabled = False
         finally:
             if self._motors is not None:

@@ -45,6 +45,74 @@ def _target(hole_id, engaged=False, distance_m=5.0):
 
 
 class DashboardTelemetryTests(unittest.TestCase):
+    def test_panel_fire_http_requires_mode_ready_target_and_single_use_nonce(self):
+        state = DashboardState()
+
+        def snapshot(**overrides):
+            control = dict(enabled=True, ready=True, plan_index=0, plan_revision=1,
+                           hole_id='H01', nonce=state.fire_nonce)
+            control.update(overrides)
+            state.update_telemetry({
+                'generated_at_ms': int(time.time() * 1000),
+                'system': {'online': True}, 'firing': {'allowed': True},
+                'panel_control': control,
+            })
+
+        snapshot()
+        server = start_dashboard_server(state, 0, host='127.0.0.1')
+        url = f'http://127.0.0.1:{server.server_address[1]}/api/fire'
+
+        def post(index=0, hole='H01', nonce=0, origin=None, revision=1):
+            headers = {'Content-Type': 'application/json'}
+            if origin is not None:
+                headers['Origin'] = origin
+            request = Request(url, data=json.dumps(dict(plan_index=index, plan_revision=revision,
+                                                       hole_id=hole, nonce=nonce)).encode(),
+                              headers=headers, method='POST')
+            return urlopen(request, timeout=2)
+
+        try:
+            state.enable_manual_aim()
+            with self.assertRaises(HTTPError) as blocked:
+                post()
+            self.assertEqual(blocked.exception.code, 409)
+            state.enable_panel_fire()
+            with self.assertRaises(HTTPError) as cross_origin:
+                post(origin='http://other.example')
+            self.assertEqual(cross_origin.exception.code, 403)
+            for kwargs in ({'hole': 'H02'}, {'index': 1}, {'nonce': True}, {'nonce': 1}, {'revision': 0}):
+                with self.subTest(kwargs=kwargs), self.assertRaises(HTTPError) as rejected:
+                    post(**kwargs)
+                self.assertEqual(rejected.exception.code, 409)
+            with post() as response:
+                self.assertTrue(json.load(response)['ok'])
+            with self.assertRaises(HTTPError):
+                post()
+            action = state.take_panel_fire()
+            self.assertEqual(action[:3], (1, 0, 'H01'))
+            self.assertLess(abs(time.monotonic() - action[3]), 1)
+            self.assertIsNone(state.take_panel_fire())
+            snapshot()
+            with self.assertRaises(HTTPError):
+                post()  # Consumed request cannot be replayed after queue consumption.
+            snapshot(ready=False)
+            with self.assertRaises(HTTPError):
+                post(nonce=1)
+            snapshot()
+            stale = state.telemetry_snapshot()
+            stale['generated_at_ms'] -= 2000
+            state.update_telemetry(stale)
+            with self.assertRaises(HTTPError):
+                post(nonce=1)
+            snapshot()
+            state.stop()
+            with self.assertRaises(HTTPError):
+                post(nonce=1)
+        finally:
+            state.stop()
+            server.shutdown()
+            server.server_close()
+
     def test_complete_twelve_holes_and_restore_without_a_fire(self):
         plan = EngagementPlan([BoardTarget(100, 100, 20, 20, hole_id=f"H{n:02d}")
                                for n in range(1, 13)])

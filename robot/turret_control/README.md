@@ -103,6 +103,55 @@ from __future__ import annotations
 
 ## 執行
 
+電腦輸入絕對角度並發射泡棉球，使用新的完整入口：
+
+```bash
+python3 -m turret_control.run_precision_fire
+# 也可直接指定啟動後的目標角度；仍需輸入 speed、fire 才會旋轉飛輪及發射
+python3 -m turret_control.run_precision_fire --yaw 10 --pitch 20
+```
+
+啟動時與 `main.py` 共用 DM 初始姿態、MKS 及雙 VESC 初始化。等待提示字元後輸入：
+
+```text
+aim 10 20
+speed 50
+fire
+fire
+fire
+stop
+quit
+```
+
+`aim 10 20` 為校正後的實體**絕對**水平角 10°、仰角 20°，不是增量角度。
+超出校正限位、設定範圍或聯合工作空間時直接拒絕，不會偷偷換成另一個目標。
+水平設定範圍為 ±34.5°；`config.py` 的仰角上下限直接引用 `limits.py`，
+一般活動範圍統一為 0°～35°，仍與實測機構限位取交集。
+仰角超過 30°時，依 `max_activity_pitch_for_yaw_deg()` 隨水平角收窄；
+例如水平 10°時仰角上限 33°，仰角 35°時水平必須為 0°。
+程式會等待有效回授到位，再接受發射；到位門檻沿用 `main.py` 的 ±2.5° 與低速判定，
+顯示小數角度不代表已達到該小數位的實機精度。`status` 可查看目標、回授及階段。
+待命時不再定期印出 DM／VESC 遙測，以保持 `precision>` 提示字元可讀；
+背景控制與故障檢查仍持續執行，啟動、指令結果及錯誤訊息仍會顯示。
+
+`speed` 使用與 VRB 相同的 0..100 尺度；0 停轉，其餘對應
+`VESC_MIN_RPM + speed * VESC_RPM_PER_SPEED_UNIT`（目前 speed=50 為 3000 RPM）。
+飛輪初始停轉；設定速度後持續旋轉，直到 `stop`、`speed 0` 或關閉程式。
+每次 `fire` 只執行原本的一個 FIRE 階段，完成後才回到提示字元：
+第一階段回零後推至 1700 pulses，第二階段再推 1300 pulses，
+第三階段沿用原本的回零確認與轉一格流程。回零或轉格失敗即停止，不會自動重試。
+三次 `fire` 的機構順序完全沿用 `main.py`，不會額外新增推球行程。
+
+此入口不需要遙控器、不開啟 ESP32 UART，也不送出車輛移動指令。
+請先結束 `main.py`／其他馬達控制程式，避免同時占用相同裝置。
+`quit`、Ctrl+C、輸入結束或控制器故障時會執行共用關閉流程，停止 VESC／MKS 並讓 DM 回位失能。
+
+`run_manual_move` 在輸入角度並按 Enter 確認後，會共用 `main.py` 的
+`VESCDualMotorController` 啟動雙 VESC 串列連線、遙測及背景控制，初始保持停轉。
+序列埠與保護設定沿用 `manual.py`；此入口沒有接收遙控器 VRB 速度封包。
+VESC 初始化失敗會取消調角；移動或保持期間偵測到 VESC 故障也會停止控制。
+按 Ctrl+C 會失能調角馬達並關閉雙 VESC。`main.py` 仍由原本的控制器管理 VESC。
+
 ```bash
 # 連續平滑移動（MIT：位置 + 速度前饋，實機前確認急停可用）
 python3 -m turret_control.run_manual_move --yaw 10 --pitch 15 --speed 0.30
@@ -156,6 +205,15 @@ python3 -m turret_control.run_board_real
 python3 -m turret_control.run_board_real --aim-only --aim-speed 0.09 --aim-acceleration 0.075
 # 同一區網的電腦／平板開啟：http://<robot-ip>:8080
 # 儀表板預設啟用；--web-port 其他埠號 可更改，--web-port 0 可停用
+
+# 自動瞄準 + 真實雙 VESC／MKS 發射；只有面板「射擊」按鈕才可觸發 FIRE
+python3 -m turret_control.run_board_real --panel-fire --no-score-mode --headless --web-port 8080
+# 原本使用 --zed-uvc、--model 或 --camera 時，繼續保留相同相機／模型參數。
+# VESC 預設 speed=100，目標轉速由 manual.py 現有公式決定（目前 6000 RPM）。
+# 點擊一次執行一個已驗證的 FIRE 階段；完成後換下一孔，第三階段回零後轉一格。
+# 瞄準到位本身不會發射，鍵盤 F 在此模式也不會發射；等待按鈕時不自動略過孔位。
+# 發射期間雙軸保持目標；姿態失效或控制器故障時停止並關閉，退出也會停止飛輪。
+# 此模式與 --aim-only 互斥，並沿用同一套機構幾何、限位與共用雙軸執行緒。
 
 # 實機驗證（只調整砲口，不接受 F、不會發射）
 python3 -m turret_control.run_board_real --zed-uvc --aim-only --web-port 8080

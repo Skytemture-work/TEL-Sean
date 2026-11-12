@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 import socket
+import math
 import struct
 import threading
 import time
@@ -16,6 +17,7 @@ HOST_IP = "0.0.0.0"
 POINT_PORT = 56301       
 IMU_PORT = 56401         
 CMD_PORT = 56100         
+FRONT_FAN_HALF_ANGLE_DEG = 45.0
 LIDAR_IP = "192.168.1.163"
 
 HEARTBEAT_INTERVAL_S = 1.0   
@@ -192,13 +194,22 @@ class LidarAvoidance(threading.Thread):
                 pass
         sock.close()
 
+    @staticmethod
+    def _front_fan_mask(points):
+        """Keep only points within the vehicle-front +/-45 degree fan."""
+        half_angle_tan = math.tan(math.radians(FRONT_FAN_HALF_ANGLE_DEG))
+        return (points[:, 0] > 0.0) & (
+            np.abs(points[:, 1]) <= points[:, 0] * half_angle_tan + 1e-9
+        )
+
     def _extract_dynamic_obstacle(self, pts):
         if len(pts) < 10:
             return self._smoothed_obstacle(None)
 
         z_mask = (pts[:, 2] > -0.2) & (pts[:, 2] < 0.8)
         dist_xy = np.hypot(pts[:, 0], pts[:, 1])
-        valid_pts = pts[z_mask & (dist_xy <= self.search_radius_m)]
+        front_fan = self._front_fan_mask(pts)
+        valid_pts = pts[z_mask & front_fan & (dist_xy <= self.search_radius_m)]
 
         if len(valid_pts) < 5:
             return self._smoothed_obstacle(None)

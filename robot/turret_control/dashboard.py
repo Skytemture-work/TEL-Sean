@@ -29,6 +29,9 @@ class DashboardState:
         self._lock = threading.Lock()
         self._manual_enabled = False
         self._manual_action = None
+        self._panel_fire_enabled = False
+        self._fire_action = None
+        self._fire_nonce = 0
 
     def update_frame(self, frame: bytes) -> None:
         with self._lock:
@@ -78,6 +81,46 @@ class DashboardState:
             self._manual_action = None
             return action
 
+    def enable_panel_fire(self):
+        with self._lock:
+            self._panel_fire_enabled = True
+
+    @property
+    def fire_nonce(self):
+        with self._lock:
+            return self._fire_nonce
+
+    def request_panel_fire(self, expected_index, expected_hole, nonce, plan_revision):
+        with self._lock:
+            snapshot = self._telemetry
+            control = snapshot.get("panel_control", {})
+            age_ms = time.time() * 1000 - snapshot.get("generated_at_ms", 0)
+            if not self._running or not self._panel_fire_enabled:
+                return False, "目前模式未啟用面板射擊"
+            if (not snapshot.get("system", {}).get("online") or not 0 <= age_ms < 1000
+                    or not control.get("enabled") or not control.get("ready")
+                    or not snapshot.get("firing", {}).get("allowed")):
+                return False, "尚未就緒或狀態已逾時，射擊未執行"
+            if (type(expected_index) is not int or expected_index != control.get("plan_index")
+                    or not expected_hole or expected_hole != control.get("hole_id")
+                    or type(plan_revision) is not int or plan_revision != control.get("plan_revision")
+                    or type(nonce) is not int or nonce != self._fire_nonce
+                    or nonce != control.get("nonce")):
+                return False, "孔位或射擊狀態已改變，請重新確認"
+            if self._fire_action is not None:
+                return False, "上一個射擊請求尚未處理"
+            self._fire_action = (plan_revision, expected_index, expected_hole, time.monotonic())
+            # Consume immediately, even if the next camera frame rejects it.
+            # Replaying an old HTTP request must never authorize another shot.
+            self._fire_nonce += 1
+            return True, "射擊請求已送出，等待本幀瞄準條件確認"
+
+    def take_panel_fire(self):
+        with self._lock:
+            action = self._fire_action
+            self._fire_action = None
+            return action
+
     @property
     def running(self) -> bool:
         with self._lock:
@@ -86,6 +129,9 @@ class DashboardState:
     def stop(self) -> None:
         with self._lock:
             self._running = False
+            self._fire_action = None
+            self._telemetry = {**self._telemetry, "system": {
+                **self._telemetry.get("system", {}), "online": False}}
 
 
 def _json_number(value: Optional[float], digits: int = 4) -> Optional[float]:
@@ -559,7 +605,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):  # noqa: N802
         path = urlsplit(self.path).path
-        if path not in ("/api/confirm", "/api/reset"):
+        if path not in ("/api/confirm", "/api/reset", "/api/fire"):
             self.send_error(404)
             return
         origin = self.headers.get("Origin")
@@ -576,10 +622,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
         except (ValueError, UnicodeDecodeError):
             self.send_error(400)
             return
-        ok, message = self.state.request_manual_action(
-            "confirm" if path == "/api/confirm" else "reset",
-            payload.get("plan_index"), payload.get("hole_id"),
-        )
+        if path == "/api/fire":
+            ok, message = self.state.request_panel_fire(
+                payload.get("plan_index"), payload.get("hole_id"), payload.get("nonce"),
+                payload.get("plan_revision"))
+        else:
+            ok, message = self.state.request_manual_action(
+                "confirm" if path == "/api/confirm" else "reset",
+                payload.get("plan_index"), payload.get("hole_id"),
+            )
         body = json.dumps({"ok": ok, "message": message}, ensure_ascii=False).encode("utf-8")
         self._send_bytes(body, "application/json; charset=utf-8", status=200 if ok else 409)
 

@@ -71,13 +71,16 @@ class BoardEngagement:
         target_timeout_s: Optional[float] = DEFAULT_TARGET_TIMEOUT_S,
         clock: Callable[[], float] = time.monotonic,
         event_log_path: Optional[Union[str, Path]] = None,
+        fire_ready: Optional[Callable[[], bool]] = None,
     ):
         if shot_cooldown_s < 0:
             raise ValueError("shot_cooldown_s must not be negative")
         self.config = config
         self.turret = turret
         self.plan = plan
+        self.plan_revision = 0
         self.fire = fire
+        self.fire_ready = fire_ready
         self.shot_cooldown_s = shot_cooldown_s
         self.target_timeout_s = target_timeout_s
         self._clock = clock
@@ -101,6 +104,7 @@ class BoardEngagement:
 
     def set_plan(self, plan: EngagementPlan) -> None:
         self.plan = plan
+        self.plan_revision += 1
         self._target_started_at = self._clock()
 
     def set_firing_enabled(
@@ -196,7 +200,8 @@ class BoardEngagement:
             remaining=self.plan.remaining,
         )
 
-        if command.fire_allowed and self._cooldown_expired(now):
+        if (command.fire_allowed and self._cooldown_expired(now)
+                and (self.fire_ready is None or self.fire_ready())):
             self._last_fire_attempt_at = now
             fired = True if self.fire is None else bool(self.fire(target))
             if fired:
@@ -234,6 +239,10 @@ class BoardEngagement:
         if self._last_fire_attempt_at is None:
             return True
         return now - self._last_fire_attempt_at >= self.shot_cooldown_s
+
+    @property
+    def fire_cooldown_ready(self) -> bool:
+        return self._cooldown_expired(self._clock())
 
     def _timed_out(self, now: float) -> bool:
         if self.target_timeout_s is None or self._target_started_at is None:

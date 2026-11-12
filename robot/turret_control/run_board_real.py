@@ -1,8 +1,10 @@
 """Real-camera, real-motor target-board aiming run.
 
 This controls the two DAMIAO motors and can build the upper/lower-half
-maximum-score plans from the 2026-09-03 rules.  The CLI defaults to an
-operator-confirmed ``f`` key.  An integrating process can instead pass a real
+maximum-score plans from the 2026-09-03 rules. ``--panel-fire`` starts the dual
+VESC flywheels at speed 100 and requires a fresh panel click for every MKS
+stage. The legacy CLI defaults to an operator-confirmed ``f`` key.
+An integrating process can instead pass a real
 ``fire_callback`` and receive structured state through ``telemetry_callback``.
 """
 
@@ -11,6 +13,7 @@ from __future__ import annotations
 import argparse
 import math
 import time
+from contextlib import ExitStack
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Sequence
@@ -98,6 +101,23 @@ def _all_holes_confirmed(plan, confirmed_holes):
             and set(confirmed_holes) == {f"H{n:02d}" for n in range(1, 13)})
 
 
+def _update_panel_engagement(driver, launcher, dashboard, plan, pose_ready, blocked_reason):
+    """Validate a click on this frame; never retain an unexecuted authorization."""
+    launcher.check_health()
+    if launcher.busy and not pose_ready:
+        raise RuntimeError("發射期間靶板姿態失效，停止發射控制")
+    driver.set_aiming_enabled(
+        pose_ready and not launcher.busy,
+        "發射階段執行中，砲口保持位置" if launcher.busy else blocked_reason,
+    )
+    driver.set_firing_enabled(pose_ready, blocked_reason)
+    launcher.arm(dashboard.take_panel_fire(), plan, driver.plan_revision)
+    try:
+        return driver.update()
+    finally:
+        launcher.finish_tick()
+
+
 def main(
     argv: Optional[Sequence[str]] = None,
     *,
@@ -142,13 +162,18 @@ def main(
         "--target-timeout",
         type=float,
         default=6.0,
-        help="等待目前孔位成功發射的秒數；0 表示不自動略過",
+        help="等待目前孔位成功發射的秒數；0 表示不自動略過；面板射擊模式固定不自動略過",
     )
     parser.add_argument("--headless", action="store_true", help="不開 OpenCV 視窗")
-    parser.add_argument(
+    launcher_mode = parser.add_mutually_exclusive_group()
+    launcher_mode.add_argument(
         "--aim-only",
         action="store_true",
         help="實機驗證模式：允許安全範圍內追瞄，但完全停用發射與 F 操作",
+    )
+    launcher_mode.add_argument(
+        "--panel-fire", action="store_true",
+        help="雙 VESC 預設 speed 100，自動瞄準；每次實際發射僅接受網頁射擊按鈕",
     )
     parser.add_argument("--restore-completed-aim", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
@@ -200,6 +225,8 @@ def main(
         parser.error("--zed-calibration 必須配合 --zed-uvc 使用")
     if args.restore_completed_aim and (not args.aim_only or args.score_mode):
         parser.error("--restore-completed-aim 需要 --aim-only --no-score-mode")
+    if args.panel_fire and (not args.web_port or fire_callback is not None or args.virtual_board):
+        parser.error("--panel-fire 需要網頁面板，不能搭配 fire_callback 或 --virtual-board")
 
     config = with_competition_geometry(TurretConfig()) if not args.virtual_board else TurretConfig()
     if args.zed_calibration is not None:
@@ -236,8 +263,9 @@ def main(
             require_distance_to_fire=False,
         )
         print("虛擬靶模式：只依畫面位置瞄準，已關閉距離／視差／重力補正。", flush=True)
-    if args.aim_only:
+    if args.aim_only or args.panel_fire:
         config = with_recorded_mechanism_geometry(config)
+    if args.aim_only:
         print(
             "實機瞄準驗證模式：已套用量測機構幾何，只允許安全範圍內調整砲口，"
             "不會發射。",
@@ -313,7 +341,7 @@ def main(
         turret,
         shot_cooldown_s=args.cooldown,
         target_timeout_s=(
-            None if args.target_timeout == 0 else args.target_timeout
+            None if args.panel_fire or args.target_timeout == 0 else args.target_timeout
         ),
     )
     pose_tracker = BoardPoseTracker(config)
@@ -350,13 +378,14 @@ def main(
 
     external_fire = fire_callback is not None
     driver.fire = fire_callback if external_fire else operator_fire
-    fire_label = "AIM ONLY / no fire" if args.aim_only else (
+    fire_label = "PANEL button only" if args.panel_fire else "AIM ONLY / no fire" if args.aim_only else (
         "external fire callback" if external_fire else "F confirm"
     )
     window = f"REAL BOARD AIM - {fire_label} / S skip / G score start / Q quit"
     if not args.headless:
         cv2.namedWindow(window, cv2.WINDOW_NORMAL)
     dashboard = DashboardState() if args.web_port else None
+    launcher = None
     manual_confirmed_holes = []
     home_active = False
     home_error = None
@@ -373,8 +402,49 @@ def main(
             home_error = str(exc)
             print(f"回 home 未執行：{home_error}", flush=True)
 
+
+    def shutdown_to_home():
+        """Stop launching, return through the recorded safe home path, then close."""
+        if launcher is not None:
+            try:
+                launcher.close()
+                print("已停止飛輪與發射機構，準備回 home。", flush=True)
+            except Exception as exc:
+                print(f"停止發射器時發生錯誤：{exc}", flush=True)
+        try:
+            snapshot = motors.worker.snapshot()
+            if snapshot.closed or not snapshot.enabled:
+                print("馬達控制器已關閉或未使能，不執行回 home。", flush=True)
+                return
+            try:
+                motors.request_home()
+            except (ValueError, RuntimeError) as exc:
+                print(f"Ctrl+C 回 home 未執行：{exc}", flush=True)
+                return
+            print("Ctrl+C：雙軸沿安全路徑返回 home，等待到位。", flush=True)
+            deadline = time.monotonic() + 20.0
+            while time.monotonic() < deadline:
+                state, message = motors.home_status()
+                if state == "arrived":
+                    print("Ctrl+C：已回 home，準備失能。", flush=True)
+                    return
+                if state == "error":
+                    print(f"Ctrl+C 回 home 失敗：{message}", flush=True)
+                    return
+                time.sleep(0.02)
+            print("Ctrl+C 回 home 逾時，現在停止並失能。", flush=True)
+        except Exception as exc:
+            print(f"Ctrl+C 回 home 流程發生錯誤：{exc}", flush=True)
+        finally:
+            try:
+                turret.close()
+            except Exception as exc:
+                print(f"關閉雙軸馬達時發生錯誤：{exc}", flush=True)
+
     if dashboard is not None and args.aim_only and not args.score_mode:
         dashboard.enable_manual_aim()
+    if dashboard is not None and args.panel_fire:
+        dashboard.enable_panel_fire()
     web_server = None
     if dashboard is not None:
         web_server = start_dashboard_server(dashboard, args.web_port)
@@ -403,9 +473,19 @@ def main(
 
     try:
         motors.enable()
+        if args.panel_fire:
+            from .panel_launcher import PanelLauncher
+
+            launcher = PanelLauncher(motors)
+            driver.fire = launcher.fire
+            driver.fire_ready = launcher.fire_ready
+            print(f"面板射擊模式：雙 VESC speed=100，目標 {launcher.target_rpm:g} RPM；"
+                  "僅點擊面板「射擊」才會執行 FIRE。", flush=True)
         if args.restore_completed_aim:
             begin_home()
         while True:
+            if launcher is not None:
+                launcher.check_health()
             loop_started_at = time.perf_counter()
             capture_started_at = loop_started_at
             if use_zed_sdk:
@@ -527,7 +607,7 @@ def main(
                     False,
                     "實機驗證模式：只調整砲口，不發射",
                 )
-            elif external_fire or fire_requested:
+            elif args.panel_fire or external_fire or fire_requested:
                 driver.set_firing_enabled(True)
             else:
                 # In CLI/manual mode, waiting for F is not a failed launcher
@@ -575,6 +655,7 @@ def main(
                     and score_state.active_hole_id is not None
                     and strategy_round_id != score_round.round_id
                     and reference_plan is not None
+                    and not (launcher is not None and launcher.pending)
                 ):
                     try:
                         strategy = build_max_score_strategy(
@@ -601,6 +682,7 @@ def main(
                 if (
                     score_state.phase == "expired"
                     and expiry_processed_round_id != score_round.round_id
+                    and not (launcher is not None and launcher.pending)
                 ):
                     skipped_bonus = 0
                     while (
@@ -648,7 +730,11 @@ def main(
                         home_error = None
                     elif _all_holes_confirmed(plan, manual_confirmed_holes):
                         begin_home()
-            status = driver.update()
+            if launcher is not None:
+                status = _update_panel_engagement(
+                    driver, launcher, dashboard, plan, pose_ready, pose_blocked_reason)
+            else:
+                status = driver.update()
             partial_shot_gate.record(pose, status.fired)
             yaw_motor_state = motors.get_state(config.yaw_motor_id)
             pitch_motor_state = motors.get_state(config.pitch_motor_id)
@@ -825,7 +911,7 @@ def main(
                     score_light_scores=score_light_scores,
                     latency=latency,
                     bonus_hole_id=last_bonus_hole_id,
-                    operator_fire_pending=fire_requested,
+                    operator_fire_pending=(launcher.pending if launcher is not None else fire_requested),
                     aim_only=args.aim_only,
                     confirmed_holes=manual_confirmed_holes,
                     current_yaw_motor_rad=(
@@ -839,6 +925,20 @@ def main(
                         else None
                     ),
                 )
+                if launcher is not None:
+                    current = plan.current() if plan is not None else None
+                    telemetry["system"]["panel_fire"] = True
+                    telemetry["launcher"] = launcher.snapshot()
+                    telemetry["panel_control"] = {
+                        "enabled": True,
+                        "ready": bool(current is not None and pose_ready and not launcher.pending
+                                      and not status.fired and status.command.fire_allowed
+                                      and driver.fire_cooldown_ready),
+                        "plan_index": plan.index if plan is not None else None,
+                        "plan_revision": driver.plan_revision,
+                        "hole_id": getattr(current, "hole_id", None),
+                        "nonce": dashboard.fire_nonce,
+                    }
                 if args.aim_only and not args.score_mode:
                     home_state, home_message = motors.home_status() if home_active and home_error is None else ("error" if home_error else "idle", home_error)
                     worker_state = motors.worker.snapshot() if home_active else None
@@ -860,8 +960,13 @@ def main(
             if not args.headless:
                 cv2.imshow(window, display)
                 key = cv2.waitKey(1) & 0xFF
+            if launcher is not None and launcher.pending and key in (ord("g"), ord("s")):
+                print("發射階段尚未完成，忽略切換孔位／計畫操作。", flush=True)
+                key = -1
             if key == ord("f"):
-                if args.aim_only:
+                if args.panel_fire:
+                    print("此模式僅接受面板「射擊」按鈕，F 不會發射。", flush=True)
+                elif args.aim_only:
                     fire_requested = False
                     print("實機驗證模式已停用發射。", flush=True)
                 elif external_fire:
@@ -888,16 +993,19 @@ def main(
             elif key in (ord("q"), 27):
                 break
     finally:
-        driver.close()
-        turret.close()
-        camera.release()
-        if not args.headless:
-            cv2.destroyAllWindows()
-        if dashboard is not None:
-            dashboard.stop()
-        if web_server is not None:
-            web_server.shutdown()
-            web_server.server_close()
+        # Run every cleanup even if one device fails to close. Stop new panel
+        # requests and unwind the launcher before disabling the aiming worker.
+        with ExitStack() as cleanup:
+            if web_server is not None:
+                cleanup.callback(web_server.server_close)
+                cleanup.callback(web_server.shutdown)
+            if not args.headless:
+                cleanup.callback(cv2.destroyAllWindows)
+            cleanup.callback(camera.release)
+            cleanup.callback(driver.close)
+            cleanup.callback(shutdown_to_home)
+            if dashboard is not None:
+                cleanup.callback(dashboard.stop)
 
 
 if __name__ == "__main__":

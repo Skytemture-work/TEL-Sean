@@ -33,6 +33,12 @@ from .limits import (
 from .pitch import load_pitch_calibration, load_yaw_calibration
 
 DEFAULT_BAUD = 921600
+DM_TORQUE_WARN_NM = 18.0
+DM_TORQUE_TRIP_NM = 24.0
+DM_TEMP_WARN_C = 85.0
+DM_TEMP_TRIP_C = 95.0
+DM_PROTECTION_TRIP_HOLD_S = 1.5
+DM_PROTECTION_WARNING_INTERVAL_S = 1.0
 
 # Where DM_CAN.py / dm_port.py live if they are not already importable.
 DEFAULT_DM_PATH = Path(__file__).resolve().parent.parent / "dm_motor_test"
@@ -58,6 +64,8 @@ class MotorState:
     # DAMIAO feedback ERR nibble: 0=disabled, 1=enabled, 8..E=fault.
     err: Optional[int] = None
     feedback_at: Optional[float] = None
+    mos_temp_c: Optional[float] = None
+    rotor_temp_c: Optional[float] = None
 
 
 class MotorBackend(Protocol):
@@ -253,6 +261,10 @@ class DamiaoSerialBackend:
                     "do not control either axis without the other feedback"
                 )
         self._last_workspace_notice: Optional[Tuple[float, float, float]] = None
+        self._protection_high_since: Dict[int, float] = {}
+        self._last_protection_warning: Dict[int, float] = {}
+        self._protection_tripped = False
+        self._protection_reason: Optional[str] = None
 
         motor_type = getattr(DM_CAN.DM_Motor_Type, motor_type_name)
         self._motor_type = motor_type
@@ -364,6 +376,96 @@ class DamiaoSerialBackend:
 
     # ------------------------------------------------------------ lifecycle
 
+    @property
+    def protection_tripped(self) -> bool:
+        return self._protection_tripped
+
+    @property
+    def protection_reason(self) -> Optional[str]:
+        return self._protection_reason
+
+    def _trip_protection(self, message: str) -> None:
+        if self._protection_tripped:
+            return
+        self._protection_tripped = True
+        self._protection_reason = message
+        print(f"[DM PROTECTION TRIP] {message}", flush=True)
+        try:
+            self.disable()
+        except Exception as exc:
+            print(f"[DM PROTECTION] 失能失敗: {exc}", flush=True)
+
+    def _evaluate_protection(self) -> None:
+        if self._protection_tripped:
+            return
+        now = time.monotonic()
+        for motor_id in self._motors:
+            state = self.get_state(motor_id)
+            if state is None:
+                continue
+            if state.err is not None and (
+                state.err >= 8 or (self._enabled and state.err not in (0, 1))
+            ):
+                message = (
+                    f"ID=0x{motor_id:02X} DAMIAO ERR=0x{state.err:X}，立即停機"
+                )
+                self._trip_protection(message)
+                raise RuntimeError(message)
+
+            warning_parts = []
+            hard_parts = []
+            torque = abs(state.torque_nm)
+            if math.isfinite(torque):
+                if torque >= DM_TORQUE_WARN_NM:
+                    warning_parts.append(
+                        f"扭矩={torque:.2f}Nm（警告{DM_TORQUE_WARN_NM:g}）"
+                    )
+                if torque >= DM_TORQUE_TRIP_NM:
+                    hard_parts.append(
+                        f"扭矩={torque:.2f}Nm（停機{DM_TORQUE_TRIP_NM:g}）"
+                    )
+
+            for label, value in (
+                ("MOS", state.mos_temp_c),
+                ("線圈", state.rotor_temp_c),
+            ):
+                if value is None or not math.isfinite(value):
+                    continue
+                if value >= DM_TEMP_WARN_C:
+                    warning_parts.append(
+                        f"{label}={value:.1f}°C（警告{DM_TEMP_WARN_C:g}）"
+                    )
+                if value >= DM_TEMP_TRIP_C:
+                    hard_parts.append(
+                        f"{label}={value:.1f}°C（停機{DM_TEMP_TRIP_C:g}）"
+                    )
+
+            if warning_parts:
+                last_warning = self._last_protection_warning.get(motor_id)
+                if (
+                    last_warning is None
+                    or now - last_warning >= DM_PROTECTION_WARNING_INTERVAL_S
+                ):
+                    print(
+                        f"[DM PROTECTION WARN] ID=0x{motor_id:02X} "
+                        + "; ".join(warning_parts),
+                        flush=True,
+                    )
+                    self._last_protection_warning[motor_id] = now
+
+            if hard_parts:
+                since = self._protection_high_since.setdefault(motor_id, now)
+                if now - since >= DM_PROTECTION_TRIP_HOLD_S:
+                    message = (
+                        f"ID=0x{motor_id:02X} 持續超標 "
+                        f"{DM_PROTECTION_TRIP_HOLD_S:.2f}s："
+                        + "; ".join(hard_parts)
+                    )
+                    self._trip_protection(message)
+                    raise RuntimeError(message)
+            else:
+                self._protection_high_since.pop(motor_id, None)
+
     def set_yaw_calibration(self, calibration) -> None:
         """Update the design boundary without loosening recorded limits."""
         if getattr(self, "_enabled", False):
@@ -392,6 +494,8 @@ class DamiaoSerialBackend:
         self._home_return_requested = bool(enabled)
 
     def enable(self) -> None:
+        if self._protection_tripped:
+            raise RuntimeError(self._protection_reason or "DM 保護已觸發，請重新建立控制連線")
         # Capture the actual pose before enabling.  Sending the first control
         # frame only after enable can otherwise create a sudden torque/position
         # error from a stale feedback sample.  Pre-loading the current pose and
@@ -772,6 +876,7 @@ class DamiaoSerialBackend:
         for motor in self._motors.values():
             self._mc.refresh_motor_status(motor, receive=False)
         self._mc.recv()
+        self._evaluate_protection()
 
     def get_state(self, motor_id: int) -> Optional[MotorState]:
         motor = self._motors.get(motor_id)
@@ -784,6 +889,8 @@ class DamiaoSerialBackend:
             torque_nm=motor.getTorque(),
             err=motor.getError(),
             feedback_at=getattr(motor, "last_feedback_at", None),
+            mos_temp_c=motor.getMosTemperature(),
+            rotor_temp_c=motor.getRotorTemperature(),
         )
 
     # ---------------------------------------------------------------- close
@@ -801,7 +908,7 @@ class DamiaoSerialBackend:
         """
         try:
             self.refresh()
-            if send_hold:
+            if send_hold and not self._protection_tripped:
                 targets = {}
                 for motor_id, motor in self._motors.items():
                     state = self.get_state(motor_id)

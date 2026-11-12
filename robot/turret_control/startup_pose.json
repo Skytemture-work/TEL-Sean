@@ -1,6 +1,6 @@
 {
-  "captured_at": "2026-10-30T23:35:44+08:00",
-  "source": "manual mechanism origin alignment with DAMIAO feedback",
+  "captured_at": "2026-11-12T20:51:51+08:00",
+  "source": "manual mechanism origin alignment after horizontal DM motor replacement",
   "serial_port": "/dev/ttyACM0",
   "units": {
     "angle": "rad",
@@ -10,11 +10,12 @@
     "axis": "yaw",
     "esc_id": "0x03",
     "mst_id": "0x13",
-    "angle_rad": 0.5170900821685791,
-    "angle_deg": 29.627079336332528,
+    "angle_rad": 2.003318787,
+    "angle_deg": 114.78171151436753,
     "turret_yaw_deg_at_angle": 0.0,
     "motor_rad_per_yaw_rad": 1.0,
-    "motor_sign": -1
+    "motor_sign": -1,
+    "calibrated_at": "2026-11-12T20:51:51+08:00"
   },
   "vertical": {
     "axis": "pitch",
@@ -29,5 +30,5 @@
     "level_reference_captured_at": "2026-10-30T23:42:06+08:00",
     "ratio_source": "operator confirmed 1:1 after measurement"
   },
-  "note": "Pitch zero is the separately measured level reference. Home retains its recorded motor position; its 44.63 degree elevation uses the operator-confirmed 1:1 ratio. Motor encoder zeros unchanged."
+  "note": "Pitch zero is the separately measured level reference. Home retains its recorded motor position; its 44.63 degree elevation uses the operator-confirmed 1:1 ratio. Motor encoder zeros unchanged. Horizontal 0° was recaptured at motor position 2.003318787 rad after motor replacement."
 }

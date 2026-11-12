@@ -49,7 +49,7 @@ def main():
                 )
                 print(
                     "[ESP32 RX] raw={!r} | mode={} vx={} vy={} wz={} "
-                    "yaw={} pitch={} fire={} VRB={} normalized_speed={} | VESC target={}".format(
+                    "yaw={} pitch={} fire={} speed={} reload={} normalized_speed={} | VESC target={}".format(
                         packet.get("raw", ""),
                         packet_mode,
                         packet.get("vx", 0),
@@ -59,6 +59,7 @@ def main():
                         packet.get("pitch", 50),
                         packet.get("fire", 0),
                         packet.get("speed", 0),
+                        packet["reload"],
                         packet_speed,
                         vesc_target,
                     ),
@@ -80,7 +81,9 @@ def main():
                     lidar.set_active(is_auto)
 
                     # 切換模式時清除手動按鈕邊緣狀態，避免按住按鈕時誤觸發
-                    manual.on_mode_change(current_mode, fire=packet.get("fire", 0))
+                    manual.on_mode_change(
+                        current_mode, fire=packet.get("fire", 0), reload=packet["reload"]
+                    )
 
                 if current_mode == "M":
                     # 手動模式：使用遙控器 yaw/pitch 控制砲台方向，

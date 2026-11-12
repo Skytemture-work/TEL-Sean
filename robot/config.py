@@ -68,5 +68,8 @@ FIELD_WIDTH_M = 3.0            # 場地寬度顯示範圍 (公尺)
 # manual.py 仍會與校正後的機構限位、工作空間取交集。
 DM_YAW_MIN_DEG = -34.5
 DM_YAW_MAX_DEG = 34.5
-DM_PITCH_MIN_DEG = 10.0
-DM_PITCH_MAX_DEG = 30.0
+# 仰角活動範圍統一由 limits.py 定義；30°以上的水平角限制由 manual.py 套用。
+from turret_control.limits import (
+    PITCH_MIN_DEG as DM_PITCH_MIN_DEG,
+    PITCH_MAX_DEG as DM_PITCH_MAX_DEG,
+)

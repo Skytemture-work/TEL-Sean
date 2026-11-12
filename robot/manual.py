@@ -14,7 +14,7 @@
 # 2. FIRE 每次由 0 變 1，只執行一階段：1700、再移動 1300、回零後 ID2 轉格。
 # 3. 第三階段 ID1 反向／正向回零；收到成功回覆且確認停止、位置穩定後，
 #    才允許 ID2 正轉 AMMO_SLOT_PULSES。回零失敗或逾時會停止並禁止轉格。
-# 5. 手動 VESC 目標轉速為 1000 + speed*10 RPM（speed 0..100）。
+# 5. 手動 VESC 目標轉速為 2000 + speed*20 RPM（speed 0..100；speed=0 會停止）。
 # 6. 請卸除彈藥進行低速測試。
 #
 import time
@@ -54,7 +54,7 @@ DM_STARTUP_TEST_PITCH_KP = 500.0  # 俯仰慢回正；先小幅提高保持剛�
 DM_STARTUP_TEST_KD = 1.0
 DM_STARTUP_TEST_PITCH_TAU_FF = 3.0  # Nm，正向支撐；由 run_manual_move 漸增施加。
 DM_UART_CENTER = 50
-DM_UART_DEG_PER_UNIT = 1.0
+DM_UART_DEG_PER_UNIT = 0.1
 DM_UART_YAW_SIGN = 1.0  # 遙控器左右方向反轉。
 DM_UART_PITCH_SIGN = 1.0  # 遙控器上下方向反轉。
 DM_POSITION_TOLERANCE_DEG = 2.5  # 實際角度到位容許誤差；負載下約有 1.14° 穩態誤差。
@@ -63,22 +63,20 @@ DM_FEEDBACK_RECOVERY_TIMEOUT_S = 1.0
 AMMO_CAN_INTERFACE = "can0"
 SHOOTING_CAN_INTERFACE = "can0"
 
-# 雙 VESC 射擊馬達：請依實際裝置名稱調整。
-# 建議用 /dev/serial/by-id/ 確認每個 USB 裝置的固定名稱。
-# Use the current host's stable USB topology paths. ttyACM2 is the DAMIAO
-# USB-to-CAN board (VID:PID 2e88:4603), not a VESC.
-VESC_LEFT_PORT = "/dev/serial/by-path/platform-3610000.xhci-usb-0:4.3:1.0"
-VESC_RIGHT_PORT = "/dev/serial/by-path/platform-3610000.xhci-usb-0:4.2:1.0"
+# 雙 VESC 依 Jetson 的 USB 插孔路徑區分，避免 ACM 編號變動後開錯。
+# 換 USB 插孔後，請用 ls -l /dev/serial/by-path/ 核對左右對應。
+VESC_LEFT_PORT = "/dev/serial/by-path/platform-3610000.xhci-usb-0:4.4:1.0"
+VESC_RIGHT_PORT = "/dev/serial/by-path/platform-3610000.xhci-usb-0:4.3:1.0"
 VESC_BAUDRATE = 921600
 VESC_LEFT_POLE_PAIRS = 7
 VESC_RIGHT_POLE_PAIRS = 7
 VESC_MIN_RPM = 2000.0
-VESC_RPM_PER_SPEED_UNIT = 10.0  # speed=100 對應 3000 RPM
+VESC_RPM_PER_SPEED_UNIT = 20.0  # speed=100 對應 4000 RPM
 VESC_LOOP_INTERVAL = 0.10
 VESC_TELEMETRY_TIMEOUT = 0.5
 VESC_STARTUP_READ_ATTEMPTS = 5
 VESC_STARTUP_RETRY_DELAY = 0.4
-VESC_RUNTIME_READ_ATTEMPTS = 2
+VESC_RUNTIME_READ_ATTEMPTS = 3
 VESC_RUNTIME_RETRY_DELAY = 0.1
 VESC_MAX_MOTOR_CURRENT_A = 50.0
 VESC_MAX_INPUT_VOLTAGE_V = 30.0
@@ -100,16 +98,18 @@ AMMO_MOTOR_CAN_ID = 2
 SHOOTING_MOTOR_CAN_ID = 1
 
 AMMO_SLOT_PULSES = 6670
-AMMO_SPEED_RPM = 1500
-SHOOTING_SPEED_RPM = 10      # 初次整合先低速測試
+RELOAD_SLOTS = 3
+RELOAD_PULSES = 6670 * RELOAD_SLOTS
+AMMO_SPEED_RPM = 2000
+SHOOTING_SPEED_RPM = 100      # 初次整合先低速測試
 ACCELERATION = 2
 
 HOME_DIRECTION = Direction.CW
 MOVE_DIRECTION = (
     Direction.CCW if HOME_DIRECTION == Direction.CW else Direction.CW
 )
-HOME_SPEED_RPM = 10
-HOME_CURRENT_MA = 300
+HOME_SPEED_RPM = 40
+HOME_CURRENT_MA = 400
 REVERSE_ANGLE = 0x0400
 
 TARGET_POSITIONS = (1700, 3000)
@@ -275,7 +275,7 @@ def format_vesc_motor_temp(values):
 class VESCDualMotorController:
     """
     背景控制左右 VESC 馬達。
-    手動 speed 0..100 對應 2000..3000 RPM；None 代表安全停轉。
+    手動 speed 0..100 對應 2000..4000 RPM；None 代表安全停轉。
     保留使用者原始程式的 PI 調速與交叉同步修正。
     """
 
@@ -313,8 +313,6 @@ class VESCDualMotorController:
             speed_value = max(0, min(100, int(speed_value)))
             # Zero throttle is a stop command. Mapping it to VESC_MIN_RPM made
             # an idle/manual packet unexpectedly spin both flywheels.
-            if speed_value == 0:
-                speed_value = None
         with self._lock:
             previous = self._speed_value
             self._speed_value = speed_value
@@ -341,7 +339,7 @@ class VESCDualMotorController:
     def _read_motor(self, reader):
         payload = reader.get_values()
         if payload is None:
-            raise RuntimeError("VESC telemetry timeout")
+            raise TimeoutError("VESC telemetry timeout")
         values = vesc_decode_values(payload)
         if not (-100000 <= values["erpm"] <= 100000):
             raise RuntimeError("Implausible VESC ERPM")
@@ -364,7 +362,7 @@ class VESCDualMotorController:
         for attempt in range(1, VESC_RUNTIME_READ_ATTEMPTS + 1):
             try:
                 return self._read_motor(reader)
-            except Exception as exc:
+            except TimeoutError as exc:
                 last_error = exc
                 if attempt < VESC_RUNTIME_READ_ATTEMPTS:
                     print(
@@ -373,6 +371,10 @@ class VESCDualMotorController:
                     )
                     self._stop_motors()
                     time.sleep(VESC_RUNTIME_RETRY_DELAY)
+            except Exception as exc:
+                raise RuntimeError(
+                    "{} VESC 遙測查詢失敗 ({})：{}".format(label, ser.port, exc)
+                ) from exc
         raise RuntimeError(
             "{} VESC 遙測連續失敗 ({})：{}".format(label, ser.port, last_error)
         ) from last_error
@@ -660,10 +662,11 @@ def return_dm_before_shutdown(motors):
 class DMStartupController:
     """DM 連線只由背景執行緒操作；UART 只提交一筆不可覆寫的目標。"""
 
-    def __init__(self):
+    def __init__(self, *, log_status=True):
         self.stop_event = threading.Event()
         self.ready_event = threading.Event()
         self.error = None
+        self.log_status = log_status
         self.target_lock = threading.Lock()
         self.yaw_min_deg, self.yaw_max_deg = DM_YAW_MIN_DEG, DM_YAW_MAX_DEG
         self.pitch_min_deg, self.pitch_max_deg = DM_PITCH_MIN_DEG, DM_PITCH_MAX_DEG
@@ -994,7 +997,8 @@ class DMStartupController:
             main_keep_enabled(
                 dm_startup_arguments(), confirm=False,
                 stop_event=self.stop_event, ready_event=self.ready_event,
-                on_shutdown=return_dm_before_shutdown, update_targets=self._update_targets)
+                on_shutdown=return_dm_before_shutdown, update_targets=self._update_targets,
+                log_status=self.log_status)
         except BaseException as exc:
             self.error = exc
         finally:
@@ -1022,12 +1026,16 @@ class DMStartupController:
 
 
 class ManualController:
-    def __init__(self, uart):
-        if DM_STARTUP_CLI_TEST_ONLY:
+    def __init__(self, uart, *, log_status=True, dm_controller=None):
+        if DM_STARTUP_CLI_TEST_ONLY and dm_controller is None:
             run_dm_startup_test()
             raise SystemExit(0)
         self.uart = uart
-        self.dm_controller = DMStartupController()
+        self._owns_dm_controller = dm_controller is None
+        self.dm_controller = (
+            DMStartupController(log_status=log_status)
+            if dm_controller is None else dm_controller
+        )
         self.ammo_bus = None
         self.ammo_notifier = None
         self.shoot_bus = None
@@ -1038,6 +1046,10 @@ class ManualController:
         self.lock = threading.Lock()
         self.busy = False
         self.last_fire = 0
+        self.last_reload = None
+        self.reload_thread = None
+        self._shot_thread = None
+        self._shot_cancel = threading.Event()
         self.current_slot = 1
         # 這只是下一筆 FIRE 的階段；實際原點必須在第 1 階段開始前完成回零。
         self.shot_stage = 0
@@ -1054,7 +1066,8 @@ class ManualController:
         self.last_wz = 0
         try:
             validate_mks_can_interfaces()
-            self.dm_controller.start()
+            if self._owns_dm_controller:
+                self.dm_controller.start()
             self._initialize_can()
             self.vesc_controller.start()
         except BaseException:
@@ -1114,10 +1127,11 @@ class ManualController:
     def dm_pitch_deg(self):
         return self.dm_controller.pitch_deg
 
-    def on_mode_change(self, mode, fire=None):
+    def on_mode_change(self, mode, fire=None, reload=None):
         self.current_mode = mode
-        # 記住切換當下的 FIRE 狀態，避免按住按鈕切入手動時誤觸發射擊。
+        # 記住切換當下的按鈕狀態，避免切入手動時誤觸發。
         self.last_fire = 1 if fire else 0
+        self.last_reload = reload
         if mode != "M":
             # 切到自動模式時停止手動射擊雙 VESC 馬達。
             self.last_speed = 0
@@ -1157,7 +1171,9 @@ class ManualController:
 
         packet_mode = packet.get("mode", self.current_mode)
         if packet_mode != self.current_mode:
-            self.on_mode_change(packet_mode, fire=packet.get("fire", 0))
+            self.on_mode_change(
+                packet_mode, fire=packet.get("fire", 0), reload=packet.get("reload")
+            )
 
         if self.current_mode == "M":
             self.dm_controller.update_from_uart(self.last_yaw, self.last_pitch)
@@ -1165,6 +1181,12 @@ class ManualController:
         fire_now = 1 if packet.get("fire", 0) else 0
         fire_rising_edge = fire_now == 1 and self.last_fire == 0
         self.last_fire = fire_now
+
+        reload_now = packet.get("reload")
+        reload_rising_edge = self.last_reload == 0 and reload_now == 1
+        self.last_reload = reload_now
+        if reload_rising_edge:
+            self.request_reload()
 
         if fire_rising_edge:
             self.request_shot()
@@ -1174,25 +1196,85 @@ class ManualController:
         with self.lock:
             if self.shot_error is not None:
                 print("[Manual Error] 動作已因錯誤停止，不再重試：{}".format(self.shot_error), flush=True)
-                return
+                return False
             if self.busy:
                 print("[Manual] 馬達正在運動，忽略此次射擊要求。")
-                return
+                return False
             if self.current_mode != "M":
                 print("[Manual] 目前不是手動模式，拒絕射擊。")
-                return
+                return False
             self.busy = True
+            self._shot_cancel.clear()
 
         worker = threading.Thread(target=self._shot_worker, daemon=True)
-        worker.start()
+        with self.lock:
+            self._shot_thread = worker
+        try:
+            worker.start()
+        except RuntimeError:
+            with self.lock:
+                self.busy = False
+                self._shot_thread = None
+            raise
+        return True
+
+    def request_reload(self):
+        """啟動一次補彈，與 FIRE 共用馬達的忙碌狀態。"""
+        with self.lock:
+            if self.current_mode != "M":
+                return
+            if self.busy or self.shot_error is not None:
+                print("[Reload] 射擊機構忙碌或故障，略過此次補彈。", flush=True)
+                return
+            self.reload_thread = threading.Thread(target=self._reload_worker, name="manual-reload")
+            self.busy = True
+            try:
+                self.reload_thread.start()
+            except RuntimeError:
+                self.busy = False
+                self.reload_thread = None
+                raise
+
+    def _reload_worker(self):
+        try:
+            if self.current_mode != "M":
+                return
+            self.reload_pending = False
+            self._shoot_home_encoder = self._go_home(
+                self.shoot_servo, HOME_DIRECTION, "補彈前 ID1 正向無限位回零"
+            )
+            if self.current_mode != "M":
+                return
+
+            self.reload_pending = True
+            self._rotate_ammo_slots(RELOAD_PULSES)
+            self.current_slot = (
+                (self.current_slot - 1 + RELOAD_SLOTS) % SLOTS_PER_MAGAZINE + 1
+            )
+            self.shot_stage = 0
+            print(f"[Reload] ID2 補彈完成，目前格位 {self.current_slot}。", flush=True)
+        except Exception as exc:
+            self.shot_error = f"補彈失敗：{exc}"
+            print(f"[Reload Error] {self.shot_error}", flush=True)
+            self._emergency_stop(self.shoot_servo, "射擊機構")
+            self._emergency_stop(self.ammo_servo, "彈藥倉")
+        finally:
+            with self.lock:
+                self._shoot_home_encoder = None
+                self.reload_pending = False
+                self.busy = False
 
     def _shot_worker(self):
         try:
+            if self._shot_cancel.is_set():
+                return
             stage = self.shot_stage
             print("[Manual] FIRE：執行第 {}/3 階段，彈藥格位 {}。".format(
                 stage + 1, self.current_slot
             ), flush=True)
             self._run_one_shot_cycle()
+            if self._shot_cancel.is_set():
+                return
             if stage < 2:
                 self.shot_stage = stage + 1
                 print("[Manual] 本階段完成，放開 FIRE 後再按一次執行第 {}/3 階段。".format(
@@ -1417,12 +1499,15 @@ class ManualController:
             raise RuntimeError("確認期間已離開手動模式，禁止轉格")
 
     def _rotate_ammo_one_slot(self):
+        self._rotate_ammo_slots(AMMO_SLOT_PULSES)
+
+    def _rotate_ammo_slots(self, pulses):
         print(
             "[Manual] 準備彈藥倉命令：CAN={} ID={} direction=CW speed={} RPM pulses={}".format(
                 AMMO_CAN_INTERFACE,
                 AMMO_MOTOR_CAN_ID,
                 AMMO_SPEED_RPM,
-                AMMO_SLOT_PULSES,
+                pulses,
             ),
             flush=True,
         )
@@ -1433,11 +1518,11 @@ class ManualController:
         self._verify_shooter_home_before_reload()
         # 此次確認只能用於一筆轉格指令，失敗或完成後都不能重複使用。
         self._shoot_home_encoder = None
-        print("[Manual] 推球機構已確認回零，允許儲存盤轉一格。", flush=True)
+        print("[Manual] 推球機構已確認回零，允許儲存盤移動。", flush=True)
         result = self.ammo_servo.run_motor_relative_motion_by_pulses(
-            Direction.CW, AMMO_SPEED_RPM, ACCELERATION, AMMO_SLOT_PULSES
+            Direction.CW, AMMO_SPEED_RPM, ACCELERATION, pulses
         )
-        print("[Manual] 彈藥倉轉一格指令回傳：", result)
+        print("[Manual] 彈藥倉移動指令回傳：", result)
         if result is None:
             raise RuntimeError("彈藥倉移動指令沒有有效回覆")
         print("[Manual] 彈藥倉驅動器回覆狀態：{}".format(result), flush=True)
@@ -1511,7 +1596,12 @@ class ManualController:
             print("[Manual] {}緊急停止失敗：{}".format(label, exc))
 
     def close(self):
-        self.current_mode = "A"
+        with self.lock:
+            self.current_mode = "A"
+            self._shot_cancel.set()
+            shot_thread = self._shot_thread
+            shot_was_active = shot_thread is not None and shot_thread.is_alive()
+            reload_thread = self.reload_thread
         self._shoot_home_encoder = None
         self.reload_pending = False
         # 先停止 VESC/MKS，再等待 DM 回位。
@@ -1523,6 +1613,12 @@ class ManualController:
 
         self._emergency_stop(self.shoot_servo, "射擊機構")
         self._emergency_stop(self.ammo_servo, "彈藥倉")
+        for worker in (shot_thread, reload_thread):
+            if worker is not None and worker is not threading.current_thread():
+                worker.join()
+        if shot_was_active:
+            with self.lock:
+                self.shot_error = "發射機構已關閉，射擊已取消"
 
         try:
             if getattr(self, "dm_controller", None) is not None:

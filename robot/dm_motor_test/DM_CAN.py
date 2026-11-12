@@ -4,6 +4,12 @@ from enum import IntEnum
 from struct import unpack
 from struct import pack
 
+def _signed_temperature(value):
+    """Decode the signed int8 temperature bytes in DAMIAO feedback."""
+    value = int(value)
+    return value - 256 if value >= 128 else value
+
+
 
 class Motor:
     def __init__(self, MotorType, SlaveID, MasterID):
@@ -18,6 +24,8 @@ class Motor:
         self.state_q = float(0)
         self.state_dq = float(0)
         self.state_tau = float(0)
+        self.state_mos_temp_c = None
+        self.state_rotor_temp_c = None
         # Feedback D[1] is ID | (ERR << 4).  Keep ERR instead of dropping it
         # so callers can distinguish the commanded state from the real state.
         self.state_err = None
@@ -29,13 +37,25 @@ class Motor:
         self.NowControlMode = Control_Type.MIT
         self.temp_param_dict = {}
 
-    def recv_data(self, q: float, dq: float, tau: float, err=None):
+    def recv_data(
+        self,
+        q: float,
+        dq: float,
+        tau: float,
+        err=None,
+        mos_temp_c=None,
+        rotor_temp_c=None,
+    ):
         self.state_q = q
         self.state_dq = dq
         self.state_tau = tau
         self.last_feedback_at = monotonic()
         if err is not None:
             self.state_err = int(err)
+        if mos_temp_c is not None:
+            self.state_mos_temp_c = float(mos_temp_c)
+        if rotor_temp_c is not None:
+            self.state_rotor_temp_c = float(rotor_temp_c)
 
     def getPosition(self):
         """
@@ -61,6 +81,14 @@ class Motor:
     def getError(self):
         """Return the motor ERR nibble from the latest feedback frame."""
         return self.state_err
+
+    def getMosTemperature(self):
+        """Return the MOS temperature in degrees Celsius."""
+        return self.state_mos_temp_c
+
+    def getRotorTemperature(self):
+        """Return the rotor/coil temperature in degrees Celsius."""
+        return self.state_rotor_temp_c
 
     def getParam(self, RID):
         """
@@ -302,7 +330,14 @@ class MotorControl:
                     recv_q = uint_to_float(q_uint, -Q_MAX, Q_MAX, 16)
                     recv_dq = uint_to_float(dq_uint, -DQ_MAX, DQ_MAX, 12)
                     recv_tau = uint_to_float(tau_uint, -TAU_MAX, TAU_MAX, 12)
-                    self.motors_map[CANID].recv_data(recv_q, recv_dq, recv_tau, feedback_err)
+                    self.motors_map[CANID].recv_data(
+                        recv_q,
+                        recv_dq,
+                        recv_tau,
+                        feedback_err,
+                        _signed_temperature(data[6]),
+                        _signed_temperature(data[7]),
+                    )
             else:
                 MasterID=data[0] & 0x0f
                 if MasterID in self.motors_map:
@@ -316,7 +351,14 @@ class MotorControl:
                     recv_q = uint_to_float(q_uint, -Q_MAX, Q_MAX, 16)
                     recv_dq = uint_to_float(dq_uint, -DQ_MAX, DQ_MAX, 12)
                     recv_tau = uint_to_float(tau_uint, -TAU_MAX, TAU_MAX, 12)
-                    self.motors_map[MasterID].recv_data(recv_q, recv_dq, recv_tau, feedback_err)
+                    self.motors_map[MasterID].recv_data(
+                        recv_q,
+                        recv_dq,
+                        recv_tau,
+                        feedback_err,
+                        _signed_temperature(data[6]),
+                        _signed_temperature(data[7]),
+                    )
 
 
     def __process_set_param_packet(self, data, CANID, CMD):

@@ -4,6 +4,9 @@ Yaw is relative to the current feedback position.  Pitch is the absolute
 physical muzzle elevation and is limited to 0..35 degrees in the normal
 activity region.
 
+The CLI also starts main.py's dual VESC controller in stopped standby.
+The shared main_keep_enabled entry leaves VESC ownership to its caller.
+
 Examples::
 
     python3 -m turret_control.run_manual_move
@@ -20,14 +23,16 @@ from pathlib import Path
 from typing import Optional
 
 from .backends import DamiaoSerialBackend
-from .limits import load_motor_limits
+from .limits import (
+    load_motor_limits,
+    PITCH_MIN_DEG as MIN_MUZZLE_ELEVATION_DEG,
+    PITCH_MAX_DEG as MAX_MUZZLE_ELEVATION_DEG,
+)
 from .pitch import load_pitch_calibration, load_yaw_calibration
 from .trajectory import smoothstep_sample
 
 
 DEFAULT_STARTUP_POSE = Path(__file__).with_name("startup_pose.json")
-MIN_MUZZLE_ELEVATION_DEG = 0.0
-MAX_MUZZLE_ELEVATION_DEG = 35.0
 
 
 def angle_or_prompt(value: Optional[float], label: str) -> float:
@@ -71,7 +76,8 @@ def read_enabled_start(motors):
 
 def hold_position_forever(motors, target, speed, kp, yaw_tau_ff, pitch_tau_ff,
                           stop_event=None, ready_event=None, update_targets=None,
-                          yaw_kp=None, pitch_kp=None, yaw_kd=None, pitch_kd=None) -> None:
+                          yaw_kp=None, pitch_kp=None, yaw_kd=None, pitch_kd=None,
+                          check_health=None, log_status=True) -> None:
     """持續送出保持指令；不呼叫 close/disable，也沒有到時退出條件。"""
     motors.kp = kp
     motors.set_motor_gains({
@@ -84,6 +90,8 @@ def hold_position_forever(motors, target, speed, kp, yaw_tau_ff, pitch_tau_ff,
     }
     next_status = time.monotonic()
     while stop_event is None or not stop_event.is_set():
+        if check_health is not None:
+            check_health()
         # 先維持控制並收取回授，再檢查狀態；避免其他模組啟動後
         # 執行緒恢復時，直接拿上一輪快取的回授判定故障。
         motors.send_targets(targets)
@@ -93,7 +101,7 @@ def hold_position_forever(motors, target, speed, kp, yaw_tau_ff, pitch_tau_ff,
         if ready_event is not None:
             ready_event.set()
         now = time.monotonic()
-        if now >= next_status:
+        if log_status and now >= next_status:
             for motor_id in (0x03, 0x01):
                 state = motors.get_state(motor_id)
                 if state is None:
@@ -117,7 +125,8 @@ def hold_position_forever(motors, target, speed, kp, yaw_tau_ff, pitch_tau_ff,
 
 
 def main_keep_enabled(argv=None, *, confirm=True, stop_event=None, ready_event=None,
-                      on_shutdown=None, update_targets=None) -> None:
+                      on_shutdown=None, update_targets=None, enable_vesc=False,
+                      log_status=True) -> None:
     parser = argparse.ArgumentParser(description="輸入水平／垂直角度，讓兩顆馬達同步轉動")
     # Auto-detect the DAMIAO USB-to-CAN board by VID/PID. /dev/ttyACM* order
     # changes with USB enumeration and can point at the UART/VESC instead.
@@ -175,6 +184,7 @@ def main_keep_enabled(argv=None, *, confirm=True, stop_event=None, ready_event=N
         yaw_calibration=load_yaw_calibration(args.startup_pose),
         pitch_calibration=pitch_calibration,
     )
+    vesc = None
     try:
         if max(abs(args.yaw_tau_ff), abs(args.pitch_tau_ff)) > motors.tmax:
             raise ValueError(f"力矩前饋不可超過馬達上限 {motors.tmax:g} Nm")
@@ -186,6 +196,15 @@ def main_keep_enabled(argv=None, *, confirm=True, stop_event=None, ready_event=N
         )
         if confirm:
             input("確認機構安全後按 Enter 開始，Ctrl+C 可停止：")
+
+        if enable_vesc:
+            # Import only for standalone CLI use. ManualController already owns
+            # a VESC instance when it calls this shared motion entry.
+            from manual import VESCDualMotorController
+
+            vesc = VESCDualMotorController()
+            vesc.start()
+            vesc.check_health()
 
         motors.enable()
         start = read_enabled_start(motors)
@@ -207,6 +226,8 @@ def main_keep_enabled(argv=None, *, confirm=True, stop_event=None, ready_event=N
         next_move_status = start_time
         print(f"[MOVE] 預計軌跡時間 {duration:.2f}s", flush=True)
         while True:
+            if vesc is not None:
+                vesc.check_health()
             if stop_event is not None and stop_event.is_set():
                 stop_and_disable(motors)
                 return
@@ -280,6 +301,8 @@ def main_keep_enabled(argv=None, *, confirm=True, stop_event=None, ready_event=N
             update_targets=update_targets,
             yaw_kp=hold_gains[0], pitch_kp=hold_gains[1],
             yaw_kd=hold_gains[2], pitch_kd=hold_gains[3],
+            check_health=vesc.check_health if vesc is not None else None,
+            log_status=log_status,
         )
     except KeyboardInterrupt:
         print("\n使用者中止，安全停止。")
@@ -294,11 +317,14 @@ def main_keep_enabled(argv=None, *, confirm=True, stop_event=None, ready_event=N
                 on_shutdown(motors)
         finally:
             stop_and_disable(motors)
+    finally:
+        if vesc is not None:
+            vesc.close()
 
 
 def main() -> None:
     # manual.py 與命令列統一使用不會到位後自動失能的版本。
-    main_keep_enabled()
+    main_keep_enabled(enable_vesc=True)
 
 
 if __name__ == "__main__":

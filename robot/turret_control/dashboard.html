@@ -305,6 +305,8 @@
     .manual-controls button:hover { background: rgba(53, 217, 255, .17); }
     .manual-controls button:disabled { cursor: wait; opacity: .5; }
     .manual-controls button.reset { border-color: rgba(255, 200, 90, .35); background: rgba(255, 200, 90, .08); }
+    .manual-controls[hidden] { display: none; }
+    .manual-controls button.fire { min-height: 48px; border-color: var(--magenta); background: rgba(246, 70, 206, .14); font-size: 17px; }
     .manual-status { min-height: 18px; margin: 0 15px 11px; color: var(--muted); font-size: 11px; }
 
     .axis-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; padding: 0 15px; }
@@ -553,7 +555,12 @@
 
         <div class="safety" id="safetyMessage">等待目標與姿態資料</div>
 
-        <div class="manual-controls">
+        <div class="manual-controls" id="panelControls" hidden>
+          <button id="fireShot" class="fire" type="button" disabled title="每次點擊僅執行一個 FIRE 階段">射擊</button>
+        </div>
+        <div class="manual-status" id="launcherStatus" hidden>等待發射器狀態</div>
+
+        <div class="manual-controls" id="navigationControls">
           <button id="confirmNext" type="button">人工確認此孔 → 下一孔</button>
           <button id="resetPlan" class="reset" type="button" title="重設後切回第一孔；實機僅瞄準模式可能移動砲口">重設順序</button>
         </div>
@@ -646,6 +653,8 @@
     const stateText = { current: "目前孔位", confirmed: "已人工確認", fired: "已發射", pending: "待確認", skipped: "已略過", unscheduled: "未排程" };
     let manualState = {};
     let manualPending = false;
+    let panelState = {};
+    let panelPending = false;
     const $ = id => document.getElementById(id);
 
     function text(id, value) { $(id).textContent = value; }
@@ -788,8 +797,22 @@
       const home = data.home || {};
       const detectionOnly = Boolean(system.detection_only);
       const aimOnly = Boolean(system.aim_only);
+      const panelMode = Boolean(system.panel_fire);
+      const launcher = data.launcher || {};
+      panelState = data.panel_control || {};
+      // Mac and AGX clocks can differ slightly; the AGX endpoint still
+      // performs the authoritative freshness check when /api/fire is called.
+      const panelFresh = Boolean(system.online)
+        && Math.abs(Date.now() - Number(data.generated_at_ms || 0)) < 3000;
+      $("panelControls").hidden = !panelMode;
+      $("launcherStatus").hidden = !panelMode;
+      $("navigationControls").hidden = panelMode;
+      $("manualStatus").hidden = panelMode;
+      $("fireShot").disabled = panelPending || !panelState.enabled || !panelState.ready || !panelFresh;
+      text("fireShot", launcher.pending ? "發射階段執行中…" : panelState.ready ? `射擊 ${panelState.hole_id || ""}` : "等待瞄準到位");
+      text("launcherStatus", `雙飛輪 speed=${launcher.speed ?? "—"}／目標 ${launcher.target_rpm ?? "—"} RPM ｜ 格位 ${launcher.slot ?? "—"} ｜ 下一階段 ${launcher.next_stage ?? "—"}/3。${launcher.message || ""}`);
       const confirmationMode = detectionOnly || aimOnly;
-      text("modeSubtitle", detectionOnly ? "純偵測／唯讀：下一孔位、位置、距離與角度" : (aimOnly ? "實機僅瞄準：人工切換孔位，不發射" : "實機瞄準與射擊狀態"));
+      text("modeSubtitle", panelMode ? "自動瞄準／面板點擊發射" : detectionOnly ? "純偵測／唯讀：下一孔位、位置、距離與角度" : (aimOnly ? "實機僅瞄準：人工切換孔位，不發射" : "實機瞄準與射擊狀態"));
       text("targetTitle", detectionOnly ? "下一個孔位（唯讀計算）" : (aimOnly ? "下一個孔位（僅瞄準）" : "下一個孔位"));
 
       text("sumNext", target.hole_id || "—");
@@ -832,7 +855,12 @@
       text("modeMeta", `${score.enabled ? "SCORE" : "NORMAL"} / ${phaseName(system.match_phase)}`);
 
       const safety = $("safetyMessage");
-      if (firing.allowed) {
+      if (panelMode) {
+        safety.textContent = launcher.pending ? "發射階段執行中，砲口保持位置"
+          : panelState.ready ? "瞄準已到位，點擊「射擊」執行一次 FIRE；不會自動連發"
+          : firing.blocked_reason || "等待瞄準、姿態與冷卻條件成立";
+        safety.className = panelState.ready ? "safety ready" : "safety";
+      } else if (firing.allowed) {
         safety.textContent = firing.operator_confirmation_pending ? "發射條件成立，已收到 F 操作確認" : "瞄準條件成立；實際發射仍需操作確認與硬體安全迴路";
         safety.className = "safety ready";
       } else {
@@ -853,7 +881,7 @@
       text("muzzlePitch", fmt(target.muzzle_pitch_deg, 2, "°"));
       text("commandYaw", fmt(target.command_yaw_error_deg, 2, "°"));
       text("commandPitch", fmt(target.command_pitch_error_deg, 2, "°"));
-      text("operatorConfirm", aimOnly ? "不發射" : (firing.operator_confirmation_pending ? "已確認" : "等待 F"));
+      text("operatorConfirm", panelMode ? (launcher.pending ? "執行中" : "等待點擊射擊") : aimOnly ? "不發射" : (firing.operator_confirmation_pending ? "已確認" : "等待 F"));
 
       const manual = data.manual_control || {};
       manualState = manual;
@@ -899,9 +927,26 @@
     $("confirmNext").addEventListener("click", () => manualPost("/api/confirm"));
     $("resetPlan").addEventListener("click", () => manualPost("/api/reset"));
 
+    $("fireShot").addEventListener("click", async () => {
+      if (panelPending || !panelState.enabled || !panelState.ready || $("fireShot").disabled) return;
+      const requestState = { plan_index: panelState.plan_index, plan_revision: panelState.plan_revision, hole_id: panelState.hole_id, nonce: panelState.nonce };
+      panelPending = true;
+      $("fireShot").disabled = true;
+      try {
+        const response = await fetch("/api/fire", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(requestState) });
+        const result = await response.json();
+        text("launcherStatus", result.message || "射擊請求未完成");
+      } catch (error) {
+        text("launcherStatus", "無法確認射擊請求結果；請先查看目前階段，請求不會自動重送");
+      } finally {
+        panelPending = false;
+      }
+    });
+
     function setConnection(online, message) {
       $("connection").classList.toggle("online", online);
       text("connectionText", message);
+      if (!online) $("fireShot").disabled = true;
     }
 
     async function poll() {

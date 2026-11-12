@@ -164,7 +164,7 @@ class TurretConfig:
     board_pose_min_quad_hole_support: int = 3
     board_pose_smoothing_alpha: float = 0.35
     board_pose_stable_frames: int = 5
-    board_pose_stale_timeout_s: float = 0.25
+    board_pose_stale_timeout_s: float = 1
     # Brief partial-observation fallback, measured from the last stable PnP.
     board_pose_partial_max_age_s: float = 1.0
     board_pose_partial_min_confidence: float = 0.65
@@ -218,7 +218,7 @@ class TurretConfig:
     require_distance_to_fire: bool = True
 
     # Aiming and firing conditions.
-    aim_tolerance_rad: float = math.radians(1.5)
+    aim_tolerance_rad: float = math.radians(2.0)
     stable_frames_required: int = 5
     minimum_confidence: float = 0.40
 

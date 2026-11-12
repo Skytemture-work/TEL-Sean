@@ -12,8 +12,9 @@ class ManualDMStartupTests(unittest.TestCase):
     def test_startup_returns_while_dm_holds_and_close_stops_worker(self):
         stopped = threading.Event()
 
-        def run(argv, *, confirm, stop_event, ready_event, on_shutdown, update_targets):
+        def run(argv, *, confirm, stop_event, ready_event, on_shutdown, update_targets, log_status):
             self.assertFalse(confirm)
+            self.assertTrue(log_status)
             self.assertIs(on_shutdown, manual.return_dm_before_shutdown)
             self.assertTrue(callable(update_targets))
             self.assertEqual(argv[argv.index('--pitch') + 1], '20.0')
@@ -191,6 +192,83 @@ class ManualDMStartupTests(unittest.TestCase):
                     on_shutdown=Mock(side_effect=TimeoutError('return failed')),
                 )
         motors.close.assert_called_once()
+
+
+class ManualMoveVESCTests(unittest.TestCase):
+    def setUp(self):
+        self.motors = Mock(tmax=10.0)
+        self.motors.get_state.return_value = None
+        self.vesc = Mock()
+        self.clock = 0.0
+
+        def now():
+            self.clock += 100.0
+            return self.clock
+
+        patches = [
+            patch.object(move, 'DamiaoSerialBackend', return_value=self.motors),
+            patch.object(move, 'read_enabled_start', return_value={3: 0.5, 1: -0.52}),
+            patch.object(move, 'time', SimpleNamespace(monotonic=now, sleep=lambda s: None)),
+            patch.object(manual, 'VESCDualMotorController', return_value=self.vesc),
+            patch('builtins.print'),
+        ]
+        for patcher in patches:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.hold = self.enter_patch(patch.object(move, 'hold_position_forever'))
+
+    def enter_patch(self, patcher):
+        result = patcher.start()
+        self.addCleanup(patcher.stop)
+        return result
+
+    def run_move(self, **kwargs):
+        move.main_keep_enabled(['--yaw', '0', '--pitch', '15'], confirm=False, **kwargs)
+
+    def test_cli_starts_vesc_and_closes_both_controllers(self):
+        with patch('sys.argv', ['run_manual_move', '--yaw', '0', '--pitch', '15']), \
+             patch('builtins.input', return_value=''):
+            move.main()
+        self.vesc.start.assert_called_once()
+        self.vesc.set_speed.assert_not_called()
+        self.assertEqual(self.hold.call_args.kwargs['check_health'], self.vesc.check_health)
+        self.vesc.close.assert_called_once()
+        self.motors.close.assert_called_once()
+
+    def test_shared_entry_does_not_start_duplicate_vesc(self):
+        self.run_move()
+        self.vesc.start.assert_not_called()
+        self.vesc.close.assert_not_called()
+
+    def test_vesc_startup_failure_prevents_motion_and_closes_both(self):
+        self.vesc.start.side_effect = RuntimeError('VESC startup failed')
+        with self.assertRaisesRegex(RuntimeError, 'VESC startup failed'):
+            self.run_move(enable_vesc=True)
+        self.motors.enable.assert_not_called()
+        self.motors.close.assert_called_once()
+        self.vesc.close.assert_called_once()
+
+    def test_vesc_failure_during_motion_closes_both(self):
+        self.vesc.check_health.side_effect = [None, RuntimeError('VESC lost')]
+        with self.assertRaisesRegex(RuntimeError, 'VESC lost'):
+            self.run_move(enable_vesc=True)
+        self.hold.assert_not_called()
+        self.motors.close.assert_called_once()
+        self.vesc.close.assert_called_once()
+
+    def test_vesc_failure_during_hold_closes_both(self):
+        self.vesc.check_health.side_effect = [None, None, RuntimeError('VESC lost')]
+        self.hold.side_effect = lambda *args, **kwargs: kwargs['check_health']()
+        with self.assertRaisesRegex(RuntimeError, 'VESC lost'):
+            self.run_move(enable_vesc=True)
+        self.motors.close.assert_called_once()
+        self.vesc.close.assert_called_once()
+
+    def test_keyboard_interrupt_closes_both(self):
+        self.hold.side_effect = KeyboardInterrupt
+        self.run_move(enable_vesc=True)
+        self.motors.close.assert_called_once()
+        self.vesc.close.assert_called_once()
 
 
 if __name__ == '__main__':
