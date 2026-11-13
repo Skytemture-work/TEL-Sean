@@ -26,6 +26,9 @@ class TargetPixel:
     # disables the axis geometry and gravity corrections -- and blocks firing when the config
     # says those corrections matter.
     distance_m: Optional[float] = None
+    # Empirical elevation correction for this target, physical radians,
+    # positive = raise the muzzle.  Applied before limit/workspace checks.
+    pitch_trim_rad: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -203,6 +206,11 @@ class AimingController:
                     )
                 except ballistics.OutOfRange as exc:
                     blocked_reason = str(exc)
+
+        if target.pitch_trim_rad and not self.config.camera_on_turret:
+            # Base-fixed camera: pitch_error is a motor offset from zero, and
+            # motor = zero + pitch_sign * physical elevation.
+            pitch_error += self.config.pitch_sign * target.pitch_trim_rad
 
         if self.config.camera_on_turret:
             # The error is relative to where the turret already points.

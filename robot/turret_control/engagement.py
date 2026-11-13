@@ -72,10 +72,13 @@ class BoardEngagement:
         clock: Callable[[], float] = time.monotonic,
         event_log_path: Optional[Union[str, Path]] = None,
         fire_ready: Optional[Callable[[], bool]] = None,
+        pitch_trim_rad: Optional[Dict[str, float]] = None,
     ):
         if shot_cooldown_s < 0:
             raise ValueError("shot_cooldown_s must not be negative")
         self.config = config
+        # Per-hole empirical elevation trim (physical radians, + = muzzle up).
+        self.pitch_trim_rad: Dict[str, float] = dict(pitch_trim_rad or {})
         self.turret = turret
         self.plan = plan
         self.plan_revision = 0
@@ -180,7 +183,11 @@ class BoardEngagement:
                 remaining=self.plan.remaining,
             )
 
-        command = self.turret.update(target.to_pixel())
+        pixel = target.to_pixel()
+        trim = self.pitch_trim_rad.get(target.hole_id or "", 0.0)
+        if trim:
+            pixel = replace(pixel, pitch_trim_rad=trim)
+        command = self.turret.update(pixel)
         if not self._firing_enabled:
             command = replace(
                 command,

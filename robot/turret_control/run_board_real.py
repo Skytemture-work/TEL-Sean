@@ -13,7 +13,9 @@ from __future__ import annotations
 import argparse
 import math
 import time
+from collections import deque
 from contextlib import ExitStack
+import threading
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Sequence
@@ -29,6 +31,7 @@ from .board_vision import BoardVision, DEFAULT_MODEL, DEFAULT_CONFIDENCE
 from .board_depth_plane import apply_board_depth_plane, fit_board_depth_plane
 from .board_pose import (
     BoardPoseTracker,
+    board_lean_deg,
     prefer_observed_depth,
     project_targets_from_pose,
     update_plan_geometry,
@@ -65,6 +68,37 @@ from .zed_camera import ZedDepthCamera
 
 FireCallback = Callable[[BoardTarget], bool]
 TelemetryCallback = Callable[[Dict[str, Any]], None]
+
+
+_MAX_PITCH_TRIM_DEG = 3.0
+
+
+def _parse_pitch_trims(items):
+    """Parse ``["H10=0.8", ...]`` into ``{"H10": 0.8}`` (degrees, + = muzzle up)."""
+    trims = {}
+    for item in items:
+        hole, sep, value = str(item).partition("=")
+        hole = hole.strip().upper()
+        if not sep or not hole:
+            raise ValueError(f"--pitch-trim 格式應為 HOLE=DEG，例如 H10=0.8：{item!r}")
+        if hole.startswith("H") and hole[1:].isdigit():
+            number = int(hole[1:])
+            hole = f"H{number:02d}"
+        else:
+            number = 0
+        if not 1 <= number <= 12:
+            raise ValueError(f"--pitch-trim 孔位必須是 H01..H12：{item!r}")
+        try:
+            deg = float(value)
+        except ValueError:
+            raise ValueError(f"--pitch-trim 角度必須是數字：{item!r}") from None
+        if not math.isfinite(deg) or abs(deg) > _MAX_PITCH_TRIM_DEG:
+            raise ValueError(
+                f"--pitch-trim 角度必須在 ±{_MAX_PITCH_TRIM_DEG:g} 度內：{item!r}")
+        if hole in trims:
+            raise ValueError(f"--pitch-trim 重複指定 {hole}")
+        trims[hole] = deg
+    return trims
 
 
 def _yolo_ms(vision_result):
@@ -133,6 +167,7 @@ def main(
     *,
     fire_callback: Optional[FireCallback] = None,
     telemetry_callback: Optional[TelemetryCallback] = None,
+    stop_event: Optional[threading.Event] = None,
 ) -> None:
     """Run the real board pipeline.
 
@@ -140,6 +175,11 @@ def main(
     after the vision, pose, reachability and motor-settling gates all pass.  It
     must return True only after the requested ball was actually sent; False
     keeps the same target active.
+
+    ``stop_event`` lets a host program (e.g. ``main.py`` via
+    ``auto_session.AutoAimSession``) end the run: once set, the loop exits and
+    the normal shutdown runs -- stop the launcher, return along the recorded
+    safe path to home, disable the motors, release the camera.
 
     ``telemetry_callback`` receives the same dictionary exposed by
     ``GET /api/status`` once per processed camera frame.  Both callbacks run on
@@ -200,6 +240,14 @@ def main(
              "辨識結果以最新一次 YOLO 疊圖顯示（預設 15；0 = 舊流程，每次辨識才更新畫面）",
     )
     parser.add_argument(
+        "--pitch-trim",
+        action="append",
+        default=[],
+        metavar="HOLE=DEG",
+        help="依孔位微調仰角（度，正值 = 砲口抬高），可重複指定，例如 "
+             "--pitch-trim H10=0.8 --pitch-trim H11=0.8；微調後仍經過限位與工作空間檢查",
+    )
+    parser.add_argument(
         "--virtual-board",
         action="store_true",
         help="螢幕虛擬靶測試：關閉距離、視差與重力補正",
@@ -240,6 +288,10 @@ def main(
         parser.error("--target-timeout 不可小於 0")
     if not math.isfinite(args.preview_fps) or args.preview_fps < 0:
         parser.error("--preview-fps 必須是 >= 0 的有限數值")
+    try:
+        pitch_trim_deg = _parse_pitch_trims(args.pitch_trim)
+    except ValueError as exc:
+        parser.error(str(exc))
     if args.zed_calibration is not None and not args.zed_uvc:
         parser.error("--zed-calibration 必須配合 --zed-uvc 使用")
     if args.restore_completed_aim and (not args.aim_only or args.score_mode):
@@ -362,7 +414,12 @@ def main(
         target_timeout_s=(
             None if args.panel_fire or args.target_timeout == 0 else args.target_timeout
         ),
+        pitch_trim_rad={hole: math.radians(deg) for hole, deg in pitch_trim_deg.items()},
     )
+    if pitch_trim_deg:
+        print("仰角微調（度，正值抬高）："
+              + "，".join(f"{hole} {deg:+.2f}" for hole, deg in sorted(pitch_trim_deg.items())),
+              flush=True)
     pose_tracker = BoardPoseTracker(config)
     vision = BoardVision(model, config, confidence=args.conf, imgsz=args.imgsz,
                          device=args.device, virtual_board=args.virtual_board)
@@ -476,6 +533,7 @@ def main(
     last_report = 0.0
     last_target_id = None
     partial_shot_gate = PartialPoseShotGate()
+    board_lean_samples = deque(maxlen=150)
     if args.layout:
         board_plan = load_layout(args.layout)
         if not args.score_mode:
@@ -520,15 +578,20 @@ def main(
                   flush=True)
         frame_seq = 0
         while True:
+            if stop_event is not None and stop_event.is_set():
+                print("收到停止要求：結束自動瞄準，停止發射器並回 home。", flush=True)
+                break
             if launcher is not None:
                 launcher.check_health()
             loop_started_at = time.perf_counter()
             capture_started_at = loop_started_at
             if grabber is not None:
                 ok, frame, depth_data, frame_seq, frame_ready_at = grabber.wait_next(
-                    frame_seq, need_depth=use_zed_sdk)
+                    frame_seq, timeout=1.0, need_depth=use_zed_sdk)
                 if not ok:
-                    break
+                    if grabber.failed:
+                        break
+                    continue  # no frame yet; re-check stop_event and health
             else:
                 if use_zed_sdk:
                     ok, frame, depth_data = camera.read()
@@ -996,6 +1059,7 @@ def main(
                         "plan_index": plan.index if plan is not None else None,
                         "plan_revision": driver.plan_revision,
                         "hole_id": getattr(current, "hole_id", None),
+                        "pitch_trim_deg": pitch_trim_deg.get(getattr(current, "hole_id", None) or "", 0.0),
                         "nonce": dashboard.fire_nonce,
                     }
                 if args.aim_only and not args.score_mode:
@@ -1011,6 +1075,17 @@ def main(
                         "current_hole_id": getattr(status.target, "hole_id", None),
                         "plan_index": plan.index if plan is not None else None,
                     }
+                lean = None
+                if pose is not None and pose.source == "pnp" and pose_ready:
+                    lean = board_lean_deg(pose, config.camera_to_yaw_pitch_rad)
+                    if lean is not None:
+                        board_lean_samples.append(lean)
+                telemetry.setdefault("pose", {})["board_lean_deg"] = (
+                    round(lean, 2) if lean is not None else None)
+                telemetry["pose"]["board_lean_avg_deg"] = (
+                    round(float(np.mean(board_lean_samples)), 2)
+                    if len(board_lean_samples) >= 30 else None)
+                telemetry["pose"]["board_lean_samples"] = len(board_lean_samples)
                 if telemetry_callback is not None:
                     telemetry_callback(telemetry)
                 if dashboard is not None:

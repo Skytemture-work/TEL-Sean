@@ -518,3 +518,28 @@ def update_plan_geometry(
             )
         )
     plan.targets[:] = updated
+
+
+def board_lean_deg(pose: BoardPose, camera_pitch_rad: float) -> Optional[float]:
+    """Forward/back lean of the board relative to vertical, in degrees.
+
+    Diagnostic only; nothing in the aiming path uses it.  The PnP rotation is
+    expressed in the vehicle-level frame using the configured camera mount
+    pitch (``camera_to_yaw_pitch_rad``, positive = camera tilted up).  For a
+    truly vertical board seen from a level vehicle the value is 0; a steady
+    non-zero mean means the real camera pitch differs from the configured one:
+    ``actual camera pitch ~= configured pitch - lean``.
+    """
+    try:
+        rotation, _ = cv2.Rodrigues(np.asarray(pose.rvec, dtype=np.float64))
+    except (cv2.error, TypeError, ValueError):
+        return None
+    down_camera = rotation @ np.array([0.0, 1.0, 0.0])  # board "down" axis
+    c, s = math.cos(camera_pitch_rad), math.sin(camera_pitch_rad)
+    # Rows: camera x/y/z axes expressed in the level frame (x right, y up,
+    # z forward); OpenCV camera y points down.
+    level_to_camera = np.array([[1.0, 0.0, 0.0], [0.0, -c, s], [0.0, s, c]])
+    down_level = level_to_camera.T @ down_camera
+    if not np.all(np.isfinite(down_level)):
+        return None
+    return math.degrees(math.atan2(down_level[2], -down_level[1]))
