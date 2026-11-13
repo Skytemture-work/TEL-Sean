@@ -13,6 +13,11 @@ from .run_vertical_panel import (
 
 DEFAULT_AIM_SPEED_RAD_S = 0.35
 DEFAULT_AIM_ACCELERATION_RAD_S2 = 0.28
+# Keep the automatic panel controller aligned with manual.py's tested
+# holding gains.  MIT is required here because posvel does not use Kp/Kd.
+DEFAULT_AIM_KP = 350.0
+DEFAULT_AIM_KD = 2.0
+DEFAULT_AIM_CONTROL_MODE = "mit"
 
 
 class SharedMotorBackend:
@@ -32,9 +37,11 @@ class SharedMotorBackend:
             port=port, pitch_calibration=self.pitch_calibration,
             yaw_calibration=self.yaw_calibration,
             speed_rad_s=speed_rad_s, acceleration_rad_s2=acceleration_rad_s2,
-            torque_ff_nm=0., torque_ramp_s=1.5, kp=50., kd=1.5,
+            torque_ff_nm=0., torque_ramp_s=1.5,
+            kp=DEFAULT_AIM_KP, kd=DEFAULT_AIM_KD,
             max_tracking_error_deg=10., stall_timeout_s=2.,
-            min_muzzle_deg=0., max_muzzle_deg=45., control_mode="posvel",
+            min_muzzle_deg=0., max_muzzle_deg=45.,
+            control_mode=DEFAULT_AIM_CONTROL_MODE,
         )
         self._last_requested = None
         self._request_id = 0
