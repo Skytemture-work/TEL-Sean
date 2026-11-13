@@ -321,5 +321,24 @@ class DashboardTelemetryTests(unittest.TestCase):
         self.assertEqual(health, b"ok")
 
 
+class DashboardFrameWaitTest(unittest.TestCase):
+    def test_wait_frame_returns_new_frame_immediately(self):
+        import threading
+        state = DashboardState()
+        frame, version = state.wait_frame(-1, timeout=0.01)
+        self.assertIsNone(frame)
+        timer = threading.Timer(0.05, state.update_frame, args=(b"jpg",))
+        timer.start()
+        started = time.monotonic()
+        frame, new_version = state.wait_frame(version, timeout=2.0)
+        self.assertEqual(frame, b"jpg")
+        self.assertNotEqual(new_version, version)
+        self.assertLess(time.monotonic() - started, 1.0)
+        state.stop()
+        started = time.monotonic()
+        state.wait_frame(new_version, timeout=2.0)  # stop() wakes waiters
+        self.assertLess(time.monotonic() - started, 1.0)
+
+
 if __name__ == "__main__":
     unittest.main()

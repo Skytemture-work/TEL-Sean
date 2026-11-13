@@ -44,12 +44,16 @@ class ZedDepthCamera:
             self.camera.close()
             raise
 
-    def read(self):
+    def read(self, want_depth: bool = True):
+        """Grab one frame; ``want_depth=False`` skips the stereo depth compute."""
+        self.runtime.enable_depth = bool(want_depth)
         if self.camera.grab(self.runtime) != self.sl.ERROR_CODE.SUCCESS:
             return False, None, None
         if self.camera.retrieve_image(self.image, self.sl.VIEW.LEFT) != self.sl.ERROR_CODE.SUCCESS:
             return False, None, None
         frame = cv2.cvtColor(self.image.get_data(), cv2.COLOR_BGRA2BGR)
+        if not want_depth:
+            return True, frame, None
         status = self.camera.retrieve_measure(self.depth, self.sl.MEASURE.DEPTH)
         depth = self.depth.get_data() if status == self.sl.ERROR_CODE.SUCCESS else None
         if depth is not None and depth.shape[:2] != frame.shape[:2]:

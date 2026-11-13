@@ -53,6 +53,7 @@ from .shared_motor_backend import (
     SharedMotorBackend,
 )
 from .run_yolo_demo import _inference_frame
+from .live_preview import LatestFrameGrabber, LivePreviewPublisher
 from .scoring_light import ScoreRoundController, draw_score_light_overlay
 from .scoring_strategy import (
     MATCH_PHASES,
@@ -64,6 +65,15 @@ from .zed_camera import ZedDepthCamera
 
 FireCallback = Callable[[BoardTarget], bool]
 TelemetryCallback = Callable[[Dict[str, Any]], None]
+
+
+def _yolo_ms(vision_result):
+    """Ultralytics preprocess+inference+postprocess time, excluding board analysis."""
+    speed = getattr(getattr(vision_result, "result", None), "speed", None) or {}
+    try:
+        return float(sum(v for v in speed.values() if v is not None))
+    except (TypeError, ValueError):
+        return None
 
 
 def _apply_manual_aim_action(plan, action, confirmed_holes):
@@ -183,6 +193,13 @@ def main(
         help="即時影像、孔位與砲塔資料儀表板的 port（預設 8080；0 停用）",
     )
     parser.add_argument(
+        "--preview-fps",
+        type=float,
+        default=15.0,
+        help="儀表板即時畫面更新率；相機取像與預覽改由背景執行緒處理，"
+             "辨識結果以最新一次 YOLO 疊圖顯示（預設 15；0 = 舊流程，每次辨識才更新畫面）",
+    )
+    parser.add_argument(
         "--virtual-board",
         action="store_true",
         help="螢幕虛擬靶測試：關閉距離、視差與重力補正",
@@ -221,6 +238,8 @@ def main(
         parser.error("--cooldown 不可小於 0")
     if args.target_timeout < 0:
         parser.error("--target-timeout 不可小於 0")
+    if not math.isfinite(args.preview_fps) or args.preview_fps < 0:
+        parser.error("--preview-fps 必須是 >= 0 的有限數值")
     if args.zed_calibration is not None and not args.zed_uvc:
         parser.error("--zed-calibration 必須配合 --zed-uvc 使用")
     if args.restore_completed_aim and (not args.aim_only or args.score_mode):
@@ -390,6 +409,8 @@ def main(
     home_active = False
     home_error = None
     restore_completed = args.restore_completed_aim
+    grabber = None
+    preview = None
 
     def begin_home():
         nonlocal home_active, home_error
@@ -483,19 +504,41 @@ def main(
                   "僅點擊面板「射擊」才會執行 FIRE。", flush=True)
         if args.restore_completed_aim:
             begin_home()
+        if dashboard is not None and args.preview_fps > 0:
+            # Camera capture and dashboard preview run in background threads.
+            # The control loop below still makes exactly one decision per
+            # inference; it just starts each inference on the newest frame.
+            grabber = LatestFrameGrabber(
+                camera, has_depth=use_zed_sdk, depth_on_demand=use_zed_sdk)
+            preview = LivePreviewPublisher(
+                grabber,
+                dashboard.update_frame,
+                fps=args.preview_fps,
+                frame_transform=lambda f: _inference_frame(f, args.zed_uvc),
+            )
+            print(f"即時預覽：{args.preview_fps:g} FPS（辨識結果以最新一次 YOLO 疊圖顯示）。",
+                  flush=True)
+        frame_seq = 0
         while True:
             if launcher is not None:
                 launcher.check_health()
             loop_started_at = time.perf_counter()
             capture_started_at = loop_started_at
-            if use_zed_sdk:
-                ok, frame, depth_data = camera.read()
+            if grabber is not None:
+                ok, frame, depth_data, frame_seq, frame_ready_at = grabber.wait_next(
+                    frame_seq, need_depth=use_zed_sdk)
+                if not ok:
+                    break
             else:
-                ok, frame = camera.read()
-                depth_data = None
-            if not ok:
-                break
-            frame_ready_at = time.perf_counter()
+                if use_zed_sdk:
+                    ok, frame, depth_data = camera.read()
+                else:
+                    ok, frame = camera.read()
+                    depth_data = None
+                if not ok:
+                    break
+                frame_ready_at = time.perf_counter()
+            frame_waited_at = time.perf_counter()
             vision_frame = _inference_frame(frame, args.zed_uvc)
             frame_size_ok = (
                 vision_frame.shape[1] == config.image_width_px
@@ -617,6 +660,7 @@ def main(
                     "waiting for operator F confirmation",
                 )
 
+            pose_done_at = time.perf_counter()
             if now - last_report >= 2.0:
                 pose_report = "virtual"
                 if not args.virtual_board:
@@ -643,6 +687,7 @@ def main(
                 reference_plan,
                 trusted_quad,
             )
+            score_done_at = time.perf_counter()
             score_light_scores = (
                 score_probe_state.scores
                 if reference_plan is not None or trusted_quad is not None
@@ -736,6 +781,7 @@ def main(
             else:
                 status = driver.update()
             partial_shot_gate.record(pose, status.fired)
+            control_done_at = time.perf_counter()
             yaw_motor_state = motors.get_state(config.yaw_motor_id)
             pitch_motor_state = motors.get_state(config.pitch_motor_id)
             if (
@@ -875,8 +921,14 @@ def main(
                 2,
                 cv2.LINE_AA,
             )
+            render_done_at = time.perf_counter()
             jpeg_encode_ms = None
-            if dashboard is not None:
+            preview_stats = {}
+            if preview is not None:
+                preview.set_overlay(display, vision_frame)
+                preview_stats = preview.stats()
+                jpeg_encode_ms = preview_stats.get("preview_jpeg_encode_ms")
+            elif dashboard is not None:
                 encode_started_at = time.perf_counter()
                 ok_jpg, encoded = cv2.imencode(
                     ".jpg", display, [cv2.IMWRITE_JPEG_QUALITY, 80]
@@ -885,11 +937,18 @@ def main(
                 if ok_jpg:
                     dashboard.update_frame(encoded.tobytes())
             latency = {
-                "capture_ms": (frame_ready_at - capture_started_at) * 1000.0,
+                "capture_ms": (frame_waited_at - capture_started_at) * 1000.0,
                 "inference_ms": (inference_finished_at - inference_started_at) * 1000.0,
+                "yolo_ms": _yolo_ms(vision_result),
+                "pose_ms": (pose_done_at - inference_finished_at) * 1000.0,
+                "score_probe_ms": (score_done_at - pose_done_at) * 1000.0,
+                "control_ms": (control_done_at - score_done_at) * 1000.0,
+                "render_ms": (render_done_at - control_done_at) * 1000.0,
                 "frame_age_ms": (time.perf_counter() - frame_ready_at) * 1000.0,
                 "loop_ms": (time.perf_counter() - loop_started_at) * 1000.0,
                 "jpeg_encode_ms": jpeg_encode_ms,
+                "preview_fps": preview_stats.get("preview_fps"),
+                "vision_hz": 1.0 / max(time.perf_counter() - loop_started_at, 1e-6),
             }
             if dashboard is not None or telemetry_callback is not None:
                 telemetry = build_dashboard_snapshot(
@@ -1002,6 +1061,11 @@ def main(
             if not args.headless:
                 cleanup.callback(cv2.destroyAllWindows)
             cleanup.callback(camera.release)
+            # Stop background readers before the camera is released (LIFO).
+            if grabber is not None:
+                cleanup.callback(grabber.stop)
+            if preview is not None:
+                cleanup.callback(preview.stop)
             cleanup.callback(driver.close)
             cleanup.callback(shutdown_to_home)
             if dashboard is not None:

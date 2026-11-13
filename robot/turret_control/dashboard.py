@@ -21,12 +21,14 @@ class DashboardState:
 
     def __init__(self):
         self._frame: Optional[bytes] = None
+        self._frame_version = 0
         self._telemetry: Dict[str, Any] = {
             "generated_at_ms": 0,
             "system": {"online": False},
         }
         self._running = True
         self._lock = threading.Lock()
+        self._frame_cond = threading.Condition(self._lock)
         self._manual_enabled = False
         self._manual_action = None
         self._panel_fire_enabled = False
@@ -36,6 +38,17 @@ class DashboardState:
     def update_frame(self, frame: bytes) -> None:
         with self._lock:
             self._frame = frame
+            self._frame_version += 1
+            self._frame_cond.notify_all()
+
+    def wait_frame(self, last_version: int, timeout: float):
+        """Return ``(frame, version)`` as soon as a newer frame is published."""
+        with self._lock:
+            self._frame_cond.wait_for(
+                lambda: self._frame_version != last_version or not self._running,
+                timeout=timeout,
+            )
+            return self._frame, self._frame_version
 
     def update_telemetry(self, telemetry: Dict[str, Any]) -> None:
         with self._lock:
@@ -129,6 +142,7 @@ class DashboardState:
     def stop(self) -> None:
         with self._lock:
             self._running = False
+            self._frame_cond.notify_all()
             self._fire_action = None
             self._telemetry = {**self._telemetry, "system": {
                 **self._telemetry.get("system", {}), "online": False}}
@@ -589,8 +603,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
         self.end_headers()
         try:
+            version = -1
             while self.state.running:
-                frame = self.state.frame_snapshot()
+                # Push each new frame immediately (no fixed 50 ms polling);
+                # resend after 1 s idle to keep the connection alive.
+                frame, new_version = self.state.wait_frame(version, timeout=1.0)
+                version = new_version
                 if frame:
                     self.wfile.write(
                         b"--frame\r\nContent-Type: image/jpeg\r\n"
@@ -599,7 +617,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     self.wfile.write(frame)
                     self.wfile.write(b"\r\n")
                     self.wfile.flush()
-                time.sleep(0.05)
+                else:
+                    time.sleep(0.05)
         except (BrokenPipeError, ConnectionResetError):
             pass
 

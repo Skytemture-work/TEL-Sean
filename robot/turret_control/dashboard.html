@@ -228,7 +228,7 @@
 
     .latency-strip {
       display: grid;
-      grid-template-columns: repeat(5, 1fr);
+      grid-template-columns: repeat(6, 1fr);
       border-top: 1px solid var(--line);
       background: rgba(5, 10, 17, .42);
     }
@@ -533,9 +533,10 @@
         <div class="latency-strip">
           <div class="latency-stat"><span class="eyebrow">取像</span><b id="latencyCapture">—</b></div>
           <div class="latency-stat"><span class="eyebrow">畫面年齡</span><b id="latencyAge">—</b></div>
-          <div class="latency-stat"><span class="eyebrow">YOLO</span><b id="latencyInference">—</b></div>
+          <div class="latency-stat"><span class="eyebrow">YOLO / 辨識</span><b id="latencyInference">—</b></div>
           <div class="latency-stat"><span class="eyebrow">控制迴圈</span><b id="latencyLoop">—</b></div>
           <div class="latency-stat"><span class="eyebrow">JPEG</span><b id="latencyJpeg">—</b></div>
+          <div class="latency-stat"><span class="eyebrow">畫面 / 辨識</span><b id="latencyRates">—</b></div>
         </div>
       </article>
 
@@ -842,9 +843,11 @@
       const fmtMs = value => value === null || value === undefined ? "—" : `${Number(value).toFixed(1)} ms`;
       text("latencyCapture", fmtMs(latency.capture_ms));
       text("latencyAge", fmtMs(latency.frame_age_ms));
-      text("latencyInference", fmtMs(latency.inference_ms));
+      text("latencyInference", fmtMs(latency.yolo_ms) + " / " + fmtMs(latency.inference_ms));
       text("latencyLoop", fmtMs(latency.loop_ms));
       text("latencyJpeg", fmtMs(latency.jpeg_encode_ms));
+      text("latencyRates", (latency.preview_fps != null ? Number(latency.preview_fps).toFixed(1) : "—")
+        + " / " + (latency.vision_hz != null ? Number(latency.vision_hz).toFixed(1) : "—") + " Hz");
       text("videoTarget", `TARGET ${target.hole_id || "—"}`);
       text("videoPose", `POSE ${(pose.source || "—").toUpperCase()} ${(pose.state || "—").toUpperCase()}`);
 
