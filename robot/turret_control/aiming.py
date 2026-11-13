@@ -29,6 +29,9 @@ class TargetPixel:
     # Empirical elevation correction for this target, physical radians,
     # positive = raise the muzzle.  Applied before limit/workspace checks.
     pitch_trim_rad: float = 0.0
+    # Per-target "arrived" tolerance on the servo error; None uses
+    # config.aim_tolerance_rad.  Only ever tightens what may fire.
+    aim_tolerance_rad: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -245,11 +248,14 @@ class AimingController:
         if current_pitch_rad is not None:
             pitch_servo_error = pitch_target - current_pitch_rad
 
+        tolerance = self.config.aim_tolerance_rad
+        if target.aim_tolerance_rad is not None:
+            tolerance = min(tolerance, target.aim_tolerance_rad)
         if self.config.camera_on_turret:
             # Driving the target to image centre is exactly the goal.
             within_tolerance = (
-                abs(yaw_error) <= self.config.aim_tolerance_rad
-                and abs(pitch_error) <= self.config.aim_tolerance_rad
+                abs(yaw_error) <= tolerance
+                and abs(pitch_error) <= tolerance
             )
         elif yaw_servo_error is None or pitch_servo_error is None:
             # Base-fixed camera with no feedback: there is no way to know the
@@ -257,8 +263,8 @@ class AimingController:
             within_tolerance = False
         else:
             within_tolerance = (
-                abs(yaw_servo_error) <= self.config.aim_tolerance_rad
-                and abs(pitch_servo_error) <= self.config.aim_tolerance_rad
+                abs(yaw_servo_error) <= tolerance
+                and abs(pitch_servo_error) <= tolerance
             )
 
         within_tolerance = within_tolerance and reachable

@@ -36,6 +36,14 @@ LOWER_LINE_FIRST_IDS: Tuple[str, ...] = (
 )
 
 
+# Line-insurance value of a second ball per lower-half cell: the sum of the
+# line bonuses that cell belongs to (diagonal 8, vertical 4, horizontal 2).
+# A repeat shot keeps those lines alive when the first ball missed.
+LOWER_CENTER_ID = "H05"
+LOWER_CORNER_IDS: Tuple[str, ...] = ("H01", "H03", "H07", "H09")   # 14 each
+LOWER_EDGE_IDS: Tuple[str, ...] = ("H02", "H04", "H06", "H08")     # 6 each
+
+
 @dataclass(frozen=True)
 class FiringStrategy:
     """One complete legal shot allocation and its theoretical score."""
@@ -168,8 +176,13 @@ def build_max_score_strategy(
         )
 
     line_first = [by_id[hole_id] for hole_id in LOWER_LINE_FIRST_IDS]
-    seven_best = _most_reliable_targets(large_targets, 7)
-    repeat_pass = _nearest_neighbor_order(seven_best, line_first[-1])
+    # Seven second balls, highest line-insurance value first: centre (22),
+    # the four corners (14 each), then the two most reliable edges (6 each).
+    center = by_id[LOWER_CENTER_ID]
+    corners = _nearest_neighbor_order([by_id[h] for h in LOWER_CORNER_IDS], center)
+    edges = _nearest_neighbor_order(
+        _most_reliable_targets([by_id[h] for h in LOWER_EDGE_IDS], 2), corners[-1])
+    repeat_pass = [center] + corners + edges
     shots = [bonus_target] * 2 + line_first + repeat_pass
     return FiringStrategy(
         phase=phase,

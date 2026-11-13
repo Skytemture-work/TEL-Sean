@@ -201,8 +201,9 @@ python3 -m turret_control.camera_web_view --port 8080
 
 # 實機自動瞄準 + 區網即時儀表板（會連接並使能真實馬達，先確認急停）
 python3 -m turret_control.run_board_real
-# 可調整兩軸平滑軌跡速度與加速度（預設 0.35 rad/s、0.28 rad/s²）
-python3 -m turret_control.run_board_real --aim-only --aim-speed 0.35 --aim-acceleration 0.28
+# 兩軸平滑軌跡速度與加速度（預設 0.60 rad/s、3.0 rad/s²；上限 1.5、3.0），
+# 與 main.py 手動模式共用 turret_control/motion_profile.py；舊值 0.35/0.28 仍可用參數指定
+python3 -m turret_control.run_board_real --aim-only --aim-speed 0.60 --aim-acceleration 3.0
 # 同一區網的電腦／平板開啟：http://<robot-ip>:8080
 # 儀表板預設啟用；--web-port 其他埠號 可更改，--web-port 0 可停用
 

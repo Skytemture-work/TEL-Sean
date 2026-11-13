@@ -444,12 +444,86 @@ class AutoFireTests(unittest.TestCase):
     def test_cli_auto_fire_validation_before_hardware(self, _):
         for args in (['--auto-fire', '--aim-only'], ['--auto-fire', '--panel-fire'],
                      ['--auto-fire', '--web-port', '0'], ['--auto-fire', '--auto-fire-settle', '0.1'],
-                     ['--auto-fire', '--auto-fire-settle', 'nan']):
+                     ['--auto-fire', '--auto-fire-settle', 'nan'],
+                     ['--match-fire', '--no-score-mode'], ['--match-fire', '--auto-fire'],
+                     ['--match-fire', '--balls-loaded', '19'], ['--match-fire', '--balls-loaded', '0'],
+                     ['--match-fire', '--match-duration', '10'],
+                     ['--match-fire', '--small-fire-tolerance-deg', '0.01'],
+                     ['--match-fire', '--fire-tolerance-deg', '5']):
             with self.subTest(args=args), patch.object(real, 'SharedMotorBackend') as factory, \
                  patch('sys.stderr'), self.assertRaises(SystemExit) as raised:
                 real.main(args)
             self.assertEqual(raised.exception.code, 2)
             factory.assert_not_called()
+
+
+class PusherSpeedTests(unittest.TestCase):
+    @patch('builtins.print')
+    def _manual(self, _):
+        with patch.object(manual, 'VESCDualMotorController', return_value=Mock()), \
+             patch.object(manual, 'validate_mks_can_interfaces'), \
+             patch.object(manual.ManualController, '_initialize_can'):
+            return manual.ManualController(None, dm_controller=Mock())
+
+    def test_defaults_keep_manual_constants(self):
+        controller = self._manual()
+        self.assertEqual(controller.shooting_speed_rpm, manual.SHOOTING_SPEED_RPM)
+        self.assertEqual(controller.shooting_acceleration, manual.SHOOTING_ACCELERATION)
+        self.assertEqual(controller.home_speed_rpm, manual.HOME_SPEED_RPM)
+        # Faster pusher defaults shared by manual and auto modes; magazine unchanged.
+        self.assertEqual((manual.SHOOTING_SPEED_RPM, manual.SHOOTING_ACCELERATION,
+                          manual.HOME_SPEED_RPM, manual.ACCELERATION), (200, 200, 60, 2))
+        launcher = PanelLauncher(Mock(), controller_factory=Mock(return_value=controller))
+        self.assertEqual(controller.shooting_speed_rpm, manual.SHOOTING_SPEED_RPM)
+        launcher.close()
+
+    def test_launcher_overrides_only_the_pusher(self):
+        controller = self._manual()
+        launcher = PanelLauncher(Mock(), controller_factory=Mock(return_value=controller),
+                                 push_rpm=250, push_acceleration=40, push_home_rpm=80)
+        self.assertEqual((controller.shooting_speed_rpm, controller.shooting_acceleration,
+                          controller.home_speed_rpm), (250, 40, 80))
+        shoot, ammo = Mock(), Mock()
+        controller.shoot_servo, controller.ammo_servo = shoot, ammo
+        for servo in (shoot, ammo):
+            servo.read_encoder_value_addition.side_effect = [0, 5, 5, 5, 5, 5, 5, 5]
+            servo.is_motor_running.return_value = False
+            servo.run_motor_relative_motion_by_pulses.return_value = "ok"
+        with patch('builtins.print'):
+            controller._move_relative(shoot, 100, manual.MOVE_DIRECTION, controller.shooting_speed_rpm)
+            controller._move_relative(ammo, 100, manual.MOVE_DIRECTION, 10)
+        self.assertEqual(shoot.run_motor_relative_motion_by_pulses.call_args.args[1:3], (250, 40))
+        # Magazine moves keep the original acceleration constant.
+        self.assertEqual(ammo.run_motor_relative_motion_by_pulses.call_args.args[2], manual.ACCELERATION)
+        launcher.close()
+
+    @patch('builtins.print')
+    def test_cli_rejects_out_of_range_or_wrong_mode(self, _):
+        for args in (['--auto-fire', '--push-rpm', '1000'], ['--auto-fire', '--push-accel', '0'],
+                     ['--auto-fire', '--push-home-rpm', '300'], ['--aim-only', '--push-rpm', '200'],
+                     ['--auto-fire', '--aim-speed', '2.0'], ['--auto-fire', '--aim-acceleration', '5']):
+            with self.subTest(args=args), patch.object(real, 'SharedMotorBackend') as factory, \
+                 patch('sys.stderr'), self.assertRaises(SystemExit) as raised:
+                real.main(args)
+            self.assertEqual(raised.exception.code, 2)
+            factory.assert_not_called()
+
+
+class SharedMotionProfileTests(unittest.TestCase):
+    def test_manual_and_auto_use_the_same_dm_limits(self):
+        from turret_control import motion_profile, shared_motor_backend
+        self.assertEqual(manual.DM_STARTUP_TEST_SPEED_RAD_S, motion_profile.DM_SPEED_RAD_S)
+        self.assertEqual(shared_motor_backend.DEFAULT_AIM_SPEED_RAD_S, motion_profile.DM_SPEED_RAD_S)
+        self.assertEqual(shared_motor_backend.DEFAULT_AIM_ACCELERATION_RAD_S2,
+                         motion_profile.DM_ACCELERATION_RAD_S2)
+
+    def test_smoothstep_duration_respects_speed_and_acceleration(self):
+        from turret_control.motion_profile import smoothstep_duration
+        for distance in (0.01, 0.15, 0.7, 1.5):
+            duration = smoothstep_duration(distance, 0.6, 2.5)
+            self.assertLessEqual(1.5 * distance / duration, 0.6 + 1e-9)
+            self.assertLessEqual(6.0 * distance / duration ** 2, 2.5 + 1e-9)
+        self.assertEqual(smoothstep_duration(0.0), 0.25)
 
 
 class PanelEntryTests(unittest.TestCase):
@@ -484,7 +558,8 @@ class PanelEntryTests(unittest.TestCase):
                     else:
                         real.main(args)
                         launcher.close.assert_called_once()
-                    factory.assert_called_once_with(motors)
+                    factory.assert_called_once_with(motors, push_rpm=None, push_acceleration=None,
+                                                push_home_rpm=None)
                 motors.enable.assert_called_once()
                 motors.close.assert_called_once()
                 camera.release.assert_called_once()

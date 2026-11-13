@@ -27,6 +27,7 @@ import serial
 
 import can
 from config import DM_YAW_MIN_DEG, DM_YAW_MAX_DEG, DM_PITCH_MIN_DEG, DM_PITCH_MAX_DEG
+from turret_control.motion_profile import DM_SPEED_RAD_S, smoothstep_duration
 from mks_servo_can import MksServo
 from mks_servo_can.mks_enums import (
     Enable,
@@ -47,7 +48,8 @@ DM_STARTUP_TEST_PORT = None
 DM_STARTUP_TEST_YAW_DEG = 0.0
 DM_STARTUP_TEST_PITCH_DEG = 20.0
 DM_STARTUP_TEST_MOVE_KP = 20.0
-DM_STARTUP_TEST_SPEED_RAD_S = 0.40
+# 與自動瞄準共用同一組速度／加速度上限（turret_control/motion_profile.py）。
+DM_STARTUP_TEST_SPEED_RAD_S = DM_SPEED_RAD_S
 DM_STARTUP_TEST_KP = 30.0  # 與 run_manual_move 預設保持增益一致。
 DM_STARTUP_TEST_YAW_KP = 400.0
 DM_STARTUP_TEST_PITCH_KP = 500.0  # 俯仰慢回正；先小幅提高保持剛性。
@@ -101,14 +103,17 @@ AMMO_SLOT_PULSES = 6670
 RELOAD_SLOTS = 3
 RELOAD_PULSES = 6670 * RELOAD_SLOTS
 AMMO_SPEED_RPM = 2000
-SHOOTING_SPEED_RPM = 100      # 初次整合先低速測試
-ACCELERATION = 2
+SHOOTING_SPEED_RPM = 200      # 推球 ID1（手動與自動共用）；原 100
+# MKS 加速度 0～255，數值越大加速越快：每 (256-acc)*50us 加 1 RPM。
+# 原 2 → 0～100 RPM 約 1.27 s；200 → 0～200 RPM 約 0.56 s。
+SHOOTING_ACCELERATION = 200   # 推球 ID1（手動與自動共用）
+ACCELERATION = 2              # 彈藥倉 ID2 轉格維持原設定
 
 HOME_DIRECTION = Direction.CW
 MOVE_DIRECTION = (
     Direction.CCW if HOME_DIRECTION == Direction.CW else Direction.CW
 )
-HOME_SPEED_RPM = 40
+HOME_SPEED_RPM = 60           # ID1 無限位回零／推到底（以電流判定到底）；原 40
 HOME_CURRENT_MA = 400
 REVERSE_ANGLE = 0x0400
 
@@ -611,7 +616,7 @@ def return_dm_before_shutdown(motors):
                    1: cal[1].motor_from_muzzle(math.radians(shutdown_pitch_deg))}
     start = read_enabled_start(motors)
     speed = DM_STARTUP_TEST_SPEED_RAD_S
-    duration = max(1.5 * max(abs(destination[i] - start[i]) for i in (3, 1)) / speed, 1.0)
+    duration = max(smoothstep_duration(max(abs(destination[i] - start[i]) for i in (3, 1))), 1.0)
     motors.kp = DM_STARTUP_TEST_KP
     motors.set_motor_gains({
         0x03: (DM_STARTUP_TEST_KP, DM_STARTUP_TEST_KD),
@@ -936,8 +941,8 @@ class DMStartupController:
                 self._destination = self._pending
                 self._pending = None
                 self._start_positions = {i: states[i].position_rad for i in (3, 1)}
-                self._duration = max(1.5 * max(abs(self._destination[i] - self._start_positions[i])
-                                             for i in (3, 1)) / DM_STARTUP_TEST_SPEED_RAD_S, 0.25)
+                self._duration = smoothstep_duration(
+                    max(abs(self._destination[i] - self._start_positions[i]) for i in (3, 1)))
                 self._motion_start = now
                 self._settled_at = None
             elapsed = now - self._motion_start
@@ -1058,6 +1063,11 @@ class ManualController:
         # busy，但自動瞄準可以先轉向下一孔，不必等待轉格。
         self.shot_request_seq = 0
         self.shot_released_seq = 0
+        # 推球馬達 ID1 的運動參數；預設沿用模組常數（手動模式行為不變），
+        # 自動瞄準的 PanelLauncher 可依命令列覆寫。
+        self.shooting_speed_rpm = SHOOTING_SPEED_RPM
+        self.shooting_acceleration = SHOOTING_ACCELERATION
+        self.home_speed_rpm = HOME_SPEED_RPM
         self.reload_pending = False
         self._shoot_home_encoder = None
         self.shot_error = None
@@ -1326,12 +1336,12 @@ class ManualController:
                 raise RuntimeError("回零期間已離開手動模式，停止推球並禁止轉格")
             print("[Manual] 推球前回零確認完成，開始第 1 階段。", flush=True)
             self._move_relative(
-                self.shoot_servo, TARGET_POSITIONS[0], MOVE_DIRECTION, SHOOTING_SPEED_RPM
+                self.shoot_servo, TARGET_POSITIONS[0], MOVE_DIRECTION, self.shooting_speed_rpm
             )
         elif self.shot_stage == 1:
             self._move_relative(
                 self.shoot_servo, TARGET_POSITIONS[1] - TARGET_POSITIONS[0],
-                MOVE_DIRECTION, SHOOTING_SPEED_RPM
+                MOVE_DIRECTION, self.shooting_speed_rpm
             )
         elif self.shot_stage == 2:
             if not self.reload_pending:
@@ -1352,8 +1362,11 @@ class ManualController:
         if before is None:
             raise RuntimeError("移動前 Encoder 讀取失敗")
 
+        acceleration = (
+            self.shooting_acceleration if servo is self.shoot_servo else ACCELERATION
+        )
         result = servo.run_motor_relative_motion_by_pulses(
-            direction, speed, ACCELERATION, pulses
+            direction, speed, acceleration, pulses
         )
         print("[Manual] 相對移動 {} pulses，回傳：{}".format(pulses, result))
         if result is None:
@@ -1399,8 +1412,8 @@ class ManualController:
         home_data = [
             0,
             direction.value,
-            (HOME_SPEED_RPM >> 8) & 0x0F,
-            HOME_SPEED_RPM & 0xFF,
+            (self.home_speed_rpm >> 8) & 0x0F,
+            self.home_speed_rpm & 0xFF,
             0,
             1,  # noLimit 模式
         ]

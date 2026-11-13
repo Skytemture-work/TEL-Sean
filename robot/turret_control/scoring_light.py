@@ -337,6 +337,7 @@ class ScoreRoundController:
         self._active_hole_id: Optional[str] = None
         self._candidate_hole_id: Optional[str] = None
         self._candidate_frames = 0
+        self._candidate_since: Optional[float] = None
         self._started_at: Optional[float] = None
         self._expires_at: Optional[float] = None
 
@@ -355,6 +356,45 @@ class ScoreRoundController:
         self._candidate_frames = 0
         self._started_at = started_at
         self._expires_at = started_at + self.duration_s
+
+    def arm_auto_start(self) -> None:
+        """Wait for the scoring light itself and start the round when it is seen.
+
+        The light switches on at the whistle (rule p.14), so a confirmed light
+        is the start signal.  The 60-second window is timed from the first
+        frame of the confirmed detection.
+        """
+
+        self._phase = "armed"
+        self._active_hole_id = None
+        self._candidate_hole_id = None
+        self._candidate_frames = 0
+        self._candidate_since = None
+        self._started_at = None
+        self._expires_at = None
+
+    def _confirm_light(self, scores, current) -> Optional[str]:
+        ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+        best_hole_id, best_score = ranked[0] if ranked else (None, 0.0)
+        second_score = ranked[1][1] if len(ranked) > 1 else 0.0
+        if (
+            best_hole_id is not None
+            and best_score >= self.min_score
+            and best_score - second_score >= self.min_margin
+        ):
+            if best_hole_id == self._candidate_hole_id:
+                self._candidate_frames += 1
+            else:
+                self._candidate_hole_id = best_hole_id
+                self._candidate_frames = 1
+                self._candidate_since = current
+            if self._candidate_frames >= self.confirm_frames:
+                return best_hole_id
+        else:
+            self._candidate_hole_id = None
+            self._candidate_frames = 0
+            self._candidate_since = None
+        return None
 
     def stop_round(self) -> None:
         """End the round and ignore the light until the next whistle."""
@@ -383,7 +423,17 @@ class ScoreRoundController:
             min_value=self.min_value,
         )
 
-        if self._phase == "waiting":
+        if self._phase == "armed":
+            confirmed = self._confirm_light(scores, current)
+            if confirmed is not None:
+                since = self._candidate_since
+                started_at = current if since is None else since
+                self._round_id += 1
+                self._active_hole_id = confirmed
+                self._phase = "active"
+                self._started_at = started_at
+                self._expires_at = started_at + self.duration_s
+        elif self._phase == "waiting":
             if self._expires_at is not None and current >= self._expires_at:
                 self.stop_round()
             else:

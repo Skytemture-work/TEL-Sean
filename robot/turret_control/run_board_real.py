@@ -53,6 +53,8 @@ from .fixed_board import calibrate_layout, load_layout
 from .shared_motor_backend import (
     DEFAULT_AIM_ACCELERATION_RAD_S2,
     DEFAULT_AIM_SPEED_RAD_S,
+    MAX_AIM_ACCELERATION_RAD_S2,
+    MAX_AIM_SPEED_RAD_S,
     SharedMotorBackend,
 )
 from .run_yolo_demo import _inference_frame
@@ -68,6 +70,20 @@ from .zed_camera import ZedDepthCamera
 
 FireCallback = Callable[[BoardTarget], bool]
 TelemetryCallback = Callable[[Dict[str, Any]], None]
+
+
+_SMALL_HOLE_IDS = ("H10", "H11", "H12")
+
+
+def _fire_tolerance_map(large_deg, small_deg):
+    """Per-hole arrival tolerance in radians; holes left out keep the default."""
+    result = {}
+    for number in range(1, 13):
+        hole = f"H{number:02d}"
+        deg = small_deg if hole in _SMALL_HOLE_IDS else large_deg
+        if deg is not None:
+            result[hole] = math.radians(deg)
+    return result
 
 
 _MAX_PITCH_TRIM_DEG = 3.0
@@ -223,11 +239,13 @@ def main(
     parser.add_argument("--port", default=None, help="DM USB-to-CAN 序列埠；預設依裝置識別碼自動偵測")
     parser.add_argument(
         "--aim-speed", type=float, default=DEFAULT_AIM_SPEED_RAD_S,
-        help="雙軸自動瞄準的平滑速度上限 rad/s（預設 0.35）",
+        help=f"雙軸自動瞄準的平滑速度上限 rad/s（預設 {DEFAULT_AIM_SPEED_RAD_S}，"
+             f"上限 {MAX_AIM_SPEED_RAD_S}）",
     )
     parser.add_argument(
         "--aim-acceleration", type=float, default=DEFAULT_AIM_ACCELERATION_RAD_S2,
-        help="雙軸自動瞄準的平滑加速度上限 rad/s²（預設 0.28）",
+        help=f"雙軸自動瞄準的平滑加速度上限 rad/s²（預設 {DEFAULT_AIM_ACCELERATION_RAD_S2}，"
+             f"上限 {MAX_AIM_ACCELERATION_RAD_S2}）；相鄰孔移動主要受加速度限制",
     )
     camera_mode = parser.add_mutually_exclusive_group()
     camera_mode.add_argument("--zed-uvc", action="store_true", help="使用 ZED UVC 原始影像，不提供立體深度")
@@ -258,6 +276,40 @@ def main(
         "--auto-fire", action="store_true",
         help="全自動：與 --panel-fire 相同的瞄準與發射流程，瞄準到位並穩定 "
              "--auto-fire-settle 秒後自動發射，不需點擊；Ctrl+C 停止並回 home",
+    )
+    launcher_mode.add_argument(
+        "--match-fire", action="store_true",
+        help="比賽全自動：計分模式＋自動發射。啟動後保持不動，偵測到指定得分格亮燈即開賽；"
+             "依規則配球，比賽時間到或彈藥打完即停止發射",
+    )
+    parser.add_argument(
+        "--balls-loaded", type=int, default=18,
+        help="比賽模式：彈藥倉已裝球數（預設 18＝6 格 × 3 顆；範圍 1～18）",
+    )
+    parser.add_argument(
+        "--match-duration", type=float, default=180.0,
+        help="比賽模式：從開賽起算的發射時限秒數（預設 180；範圍 30～300）",
+    )
+    parser.add_argument(
+        "--fire-tolerance-deg", type=float, default=None,
+        help="大孔（九宮格）發射前砲口到位容許誤差，度（比賽模式預設 0.5；其他模式預設 2.0）",
+    )
+    parser.add_argument(
+        "--small-fire-tolerance-deg", type=float, default=None,
+        help="上方小孔發射前砲口到位容許誤差，度（比賽模式預設 0.25；其他模式預設 2.0）",
+    )
+    parser.add_argument(
+        "--push-rpm", type=int, default=None,
+        help="推球馬達 ID1 推球速度 RPM（預設沿用 manual.py 的 SHOOTING_SPEED_RPM=200；範圍 20～600）",
+    )
+    parser.add_argument(
+        "--push-accel", type=int, default=None,
+        help="推球馬達 ID1 推球加速度參數（MKS 0～255，數值越大加速越快；"
+             "預設沿用 manual.py 的 SHOOTING_ACCELERATION=200；範圍 1～255）",
+    )
+    parser.add_argument(
+        "--push-home-rpm", type=int, default=None,
+        help="推球馬達 ID1 回零／推到底速度 RPM（以電流判定到底；預設沿用 HOME_SPEED_RPM=60；範圍 20～120）",
     )
     parser.add_argument(
         "--auto-fire-settle", type=float, default=0.5,
@@ -316,10 +368,12 @@ def main(
         help="比賽半場；決定 27/18 球上限與最大得分射擊順序",
     )
     args = parser.parse_args(argv)
-    if not math.isfinite(args.aim_speed) or args.aim_speed <= 0:
-        parser.error("--aim-speed 必須是大於 0 的有限數值")
-    if not math.isfinite(args.aim_acceleration) or args.aim_acceleration <= 0:
-        parser.error("--aim-acceleration 必須是大於 0 的有限數值")
+    if (not math.isfinite(args.aim_speed) or args.aim_speed <= 0
+            or args.aim_speed > MAX_AIM_SPEED_RAD_S):
+        parser.error(f"--aim-speed 必須在 0～{MAX_AIM_SPEED_RAD_S} rad/s 之間")
+    if (not math.isfinite(args.aim_acceleration) or args.aim_acceleration <= 0
+            or args.aim_acceleration > MAX_AIM_ACCELERATION_RAD_S2):
+        parser.error(f"--aim-acceleration 必須在 0～{MAX_AIM_ACCELERATION_RAD_S2} rad/s² 之間")
     if args.cooldown < 0:
         parser.error("--cooldown 不可小於 0")
     if args.target_timeout < 0:
@@ -336,9 +390,32 @@ def main(
         parser.error("--restore-completed-aim 需要 --aim-only --no-score-mode")
     if not math.isfinite(args.auto_fire_settle) or not 0.2 <= args.auto_fire_settle <= 5.0:
         parser.error("--auto-fire-settle 必須在 0.2～5 秒之間")
-    if args.auto_fire:
+    for flag, value, low, high in (("--push-rpm", args.push_rpm, 20, 600),
+                                   ("--push-accel", args.push_accel, 1, 255),
+                                   ("--push-home-rpm", args.push_home_rpm, 20, 120)):
+        if value is not None and not low <= value <= high:
+            parser.error(f"{flag} 必須在 {low}～{high} 之間")
+    if not 1 <= args.balls_loaded <= 18:
+        parser.error("--balls-loaded 必須在 1～18 之間")
+    if not math.isfinite(args.match_duration) or not 30.0 <= args.match_duration <= 300.0:
+        parser.error("--match-duration 必須在 30～300 秒之間")
+    for flag, value in (("--fire-tolerance-deg", args.fire_tolerance_deg),
+                        ("--small-fire-tolerance-deg", args.small_fire_tolerance_deg)):
+        if value is not None and (not math.isfinite(value) or not 0.05 <= value <= 2.0):
+            parser.error(f"{flag} 必須在 0.05～2.0 度之間")
+    if args.match_fire:
+        if not args.score_mode:
+            parser.error("--match-fire 使用計分模式，不能搭配 --no-score-mode")
+        if args.fire_tolerance_deg is None:
+            args.fire_tolerance_deg = 0.5
+        if args.small_fire_tolerance_deg is None:
+            args.small_fire_tolerance_deg = 0.25
+    if args.auto_fire or args.match_fire:
         # Same pipeline as --panel-fire; only the click source differs.
         args.panel_fire = True
+    if not args.panel_fire and any(
+            v is not None for v in (args.push_rpm, args.push_accel, args.push_home_rpm)):
+        parser.error("--push-rpm/--push-accel/--push-home-rpm 只用於 --panel-fire、--auto-fire 或 --match-fire")
     if args.panel_fire and (not args.web_port or fire_callback is not None or args.virtual_board):
         parser.error("--panel-fire 需要網頁面板，不能搭配 fire_callback 或 --virtual-board")
 
@@ -385,7 +462,15 @@ def main(
             "不會發射。",
             flush=True,
         )
-    if args.score_mode:
+    if args.match_fire:
+        print(
+            f"比賽全自動模式（{args.match_phase}）：保持不動等待指定得分格亮燈即開賽；"
+            f"已裝 {args.balls_loaded} 顆，時限 {args.match_duration:g} 秒；"
+            f"到位容許誤差 大孔 {args.fire_tolerance_deg:g}°／小孔 {args.small_fire_tolerance_deg:g}°。"
+            "無法偵測燈號時，可在 OpenCV 視窗（不加 --headless）按 G 手動開賽。",
+            flush=True,
+        )
+    elif args.score_mode:
         print(
             f"特殊得分燈模式（{args.match_phase}）：比賽哨聲時按 G，"
             "程式會鎖定紅燈孔 60 秒。",
@@ -458,6 +543,8 @@ def main(
             None if args.panel_fire or args.target_timeout == 0 else args.target_timeout
         ),
         pitch_trim_rad={hole: math.radians(deg) for hole, deg in pitch_trim_deg.items()},
+        fire_tolerance_rad=_fire_tolerance_map(
+            args.fire_tolerance_deg, args.small_fire_tolerance_deg),
     )
     if pitch_trim_deg:
         print("仰角微調（度，正值抬高）："
@@ -482,6 +569,9 @@ def main(
         min_saturation=config.score_light_min_saturation,
         min_value=config.score_light_min_value,
     )
+    if args.match_fire:
+        # Stay still until the scoring light (= whistle) is confirmed.
+        score_round.arm_auto_start()
     strategy_round_id = None
     expiry_processed_round_id = None
     last_bonus_hole_id = None
@@ -513,6 +603,9 @@ def main(
     preview = None
     auto_fire = None
     previous_status = None
+    match_started_at = None
+    match_stop_reason = None
+    balls_remaining = args.balls_loaded
 
     def begin_home():
         nonlocal home_active, home_error
@@ -600,13 +693,30 @@ def main(
         if args.panel_fire:
             from .panel_launcher import PanelLauncher
 
-            launcher = PanelLauncher(motors)
+            launcher = PanelLauncher(
+                motors,
+                push_rpm=args.push_rpm,
+                push_acceleration=args.push_accel,
+                push_home_rpm=args.push_home_rpm,
+            )
+            print(
+                "推球馬達 ID1："
+                f"推球 {launcher.controller.shooting_speed_rpm} RPM、"
+                f"加速度 {launcher.controller.shooting_acceleration}、"
+                f"回零 {launcher.controller.home_speed_rpm} RPM。",
+                flush=True,
+            )
             driver.fire = launcher.fire
             driver.fire_ready = launcher.fire_ready
-            if args.auto_fire:
+            if args.auto_fire or args.match_fire:
                 from .panel_launcher import AutoFireTrigger
 
                 auto_fire = AutoFireTrigger(args.auto_fire_settle)
+            if args.match_fire:
+                print(f"比賽全自動：雙 VESC speed=100，目標 {launcher.target_rpm:g} RPM；"
+                      f"開賽後瞄準到位並穩定 {args.auto_fire_settle:g} 秒即自動發射。"
+                      "按 Ctrl+C 停止發射並回 home。", flush=True)
+            elif args.auto_fire:
                 print(f"全自動射擊模式：雙 VESC speed=100，目標 {launcher.target_rpm:g} RPM；"
                       f"瞄準到位並穩定 {args.auto_fire_settle:g} 秒後自動發射，不需點擊。"
                       "按 Ctrl+C 停止發射並回 home。", flush=True)
@@ -810,7 +920,23 @@ def main(
                 else None
             )
             score_state = score_probe_state if args.score_mode else None
-            if args.score_mode:
+            if args.match_fire:
+                if match_started_at is None and score_state.started_at is not None:
+                    match_started_at = score_state.started_at
+                    print(f"開賽：{score_state.active_hole_id or '手動開始'}；"
+                          f"時限 {args.match_duration:g} 秒。", flush=True)
+                stop_reason = None
+                if match_started_at is not None and now - match_started_at >= args.match_duration:
+                    stop_reason = "比賽時間到，停止發射"
+                elif balls_remaining <= 0:
+                    stop_reason = "已裝彈藥全部射出，停止發射"
+                if (stop_reason is not None and match_stop_reason is None
+                        and not (launcher is not None and launcher.pending)):
+                    match_stop_reason = stop_reason
+                    plan = EngagementPlan([])
+                    driver.set_plan(plan)
+                    print(f"{stop_reason}（剩餘 {balls_remaining} 顆）。", flush=True)
+            if args.score_mode and match_stop_reason is None:
                 if (
                     score_state.phase == "active"
                     and score_state.active_hole_id is not None
@@ -898,6 +1024,8 @@ def main(
             else:
                 status = driver.update()
             previous_status = status
+            if args.match_fire and status.fired:
+                balls_remaining -= 1
             partial_shot_gate.record(pose, status.fired)
             control_done_at = time.perf_counter()
             yaw_motor_state = motors.get_state(config.yaw_motor_id)
@@ -1106,6 +1234,18 @@ def main(
                     current = plan.current() if plan is not None else None
                     telemetry["system"]["panel_fire"] = True
                     telemetry["system"]["auto_fire"] = auto_fire is not None
+                    if args.match_fire:
+                        telemetry["match"] = {
+                            "phase": args.match_phase,
+                            "round_phase": score_state.phase if score_state is not None else None,
+                            "bonus_hole_id": last_bonus_hole_id,
+                            "elapsed_s": (round(now - match_started_at, 1)
+                                          if match_started_at is not None else None),
+                            "remaining_s": (round(max(0.0, args.match_duration - (now - match_started_at)), 1)
+                                            if match_started_at is not None else None),
+                            "balls_remaining": balls_remaining,
+                            "stopped": match_stop_reason,
+                        }
                     telemetry["launcher"] = launcher.snapshot()
                     telemetry["panel_control"] = {
                         "enabled": True,

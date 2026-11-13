@@ -63,8 +63,8 @@ class SharedMotorBackendTests(unittest.TestCase):
     def test_default_aim_trajectory_limits(self, worker_class):
         SharedMotorBackend("unused")
         kwargs = worker_class.call_args.kwargs
-        self.assertEqual(kwargs["speed_rad_s"], 0.35)
-        self.assertEqual(kwargs["acceleration_rad_s2"], 0.28)
+        self.assertEqual(kwargs["speed_rad_s"], 0.60)
+        self.assertEqual(kwargs["acceleration_rad_s2"], 3.0)
         self.assertEqual(kwargs["kp"], 50.0)
         self.assertEqual(kwargs["kd"], 1.5)
         self.assertEqual(kwargs["control_mode"], "posvel")

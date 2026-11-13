@@ -814,9 +814,13 @@
       text("fireShot", autoFire
         ? (launcher.pending ? "自動射擊：發射階段執行中…" : `自動射擊：${autoFire.state || "—"}`)
         : launcher.pending ? "發射階段執行中…" : panelState.ready ? `射擊 ${panelState.hole_id || ""}` : "等待瞄準到位");
-      text("launcherStatus", `雙飛輪 speed=${launcher.speed ?? "—"}／目標 ${launcher.target_rpm ?? "—"} RPM ｜ 格位 ${launcher.slot ?? "—"} ｜ 下一階段 ${launcher.next_stage ?? "—"}/3。${launcher.message || ""}`);
+      const match = data.match || null;
+      const matchText = !match ? "" : (match.elapsed_s == null
+        ? `【比賽 ${match.phase}】等待亮燈開賽｜已裝 ${match.balls_remaining} 顆。`
+        : `【比賽 ${match.phase}】${match.stopped || `剩 ${match.remaining_s}s`}｜加分格 ${match.bonus_hole_id || "—"}（${match.round_phase}）｜剩 ${match.balls_remaining} 顆。`);
+      text("launcherStatus", `${matchText}雙飛輪 speed=${launcher.speed ?? "—"}／目標 ${launcher.target_rpm ?? "—"} RPM ｜ 格位 ${launcher.slot ?? "—"} ｜ 下一階段 ${launcher.next_stage ?? "—"}/3。${launcher.message || ""}`);
       const confirmationMode = detectionOnly || aimOnly;
-      text("modeSubtitle", panelMode ? (panelState.auto_fire ? "全自動：自動瞄準＋自動發射（Ctrl+C 停止）" : "自動瞄準／面板點擊發射") : detectionOnly ? "純偵測／唯讀：下一孔位、位置、距離與角度" : (aimOnly ? "實機僅瞄準：人工切換孔位，不發射" : "實機瞄準與射擊狀態"));
+      text("modeSubtitle", panelMode ? (data.match ? "比賽全自動：亮燈開賽、規則配球、自動發射（Ctrl+C 停止）" : panelState.auto_fire ? "全自動：自動瞄準＋自動發射（Ctrl+C 停止）" : "自動瞄準／面板點擊發射") : detectionOnly ? "純偵測／唯讀：下一孔位、位置、距離與角度" : (aimOnly ? "實機僅瞄準：人工切換孔位，不發射" : "實機瞄準與射擊狀態"));
       text("targetTitle", detectionOnly ? "下一個孔位（唯讀計算）" : (aimOnly ? "下一個孔位（僅瞄準）" : "下一個孔位"));
 
       text("sumNext", target.hole_id || "—");

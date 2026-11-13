@@ -5,14 +5,21 @@ import time
 
 from .backends import MotorState
 from .limits import load_workspace_limit
+from .motion_profile import DM_ACCELERATION_RAD_S2, DM_SPEED_RAD_S
 from .pitch import load_pitch_calibration, load_yaw_calibration
 from .run_vertical_panel import (
     AUTO_HOME_INSET_DEG, DEFAULT_STARTUP_POSE, FEEDBACK_TIMEOUT_S, MotorWorker,
     SEQUENCE_STOP_SPEED_RAD_S,
 )
 
-DEFAULT_AIM_SPEED_RAD_S = 0.35
-DEFAULT_AIM_ACCELERATION_RAD_S2 = 0.28
+# Trapezoidal profile limits for both axes, shared with manual mode through
+# motion_profile.  Hole-to-hole moves (~0.15 rad) are acceleration-limited:
+# 0.35/0.28 -> ~1.46 s, 0.60/3.0 -> ~0.45 s per adjacent hole.
+DEFAULT_AIM_SPEED_RAD_S = DM_SPEED_RAD_S
+DEFAULT_AIM_ACCELERATION_RAD_S2 = DM_ACCELERATION_RAD_S2
+# Typo guards for the CLI, not tested mechanical limits.
+MAX_AIM_SPEED_RAD_S = 1.5
+MAX_AIM_ACCELERATION_RAD_S2 = 3.0
 # The automatic panel controller uses the AGX-verified position/velocity mode.
 # Its Kp/Kd are internal to the motor controller and are not sent by posvel.
 DEFAULT_AIM_KP = 50.0

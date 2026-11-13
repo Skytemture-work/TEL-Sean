@@ -38,7 +38,8 @@ class SharedAimMonitor:
 
 
 class PanelLauncher:
-    def __init__(self, motors, *, controller_factory=None, clock=time.monotonic):
+    def __init__(self, motors, *, controller_factory=None, clock=time.monotonic,
+                 push_rpm=None, push_acceleration=None, push_home_rpm=None):
         from manual import ManualController, VESC_MIN_RPM, VESC_RPM_PER_SPEED_UNIT
 
         self._clock = clock
@@ -52,6 +53,14 @@ class PanelLauncher:
         self.target_rpm = VESC_MIN_RPM + PANEL_FLYWHEEL_SPEED * VESC_RPM_PER_SPEED_UNIT
         factory = controller_factory or ManualController
         self.controller = factory(uart=None, log_status=False, dm_controller=SharedAimMonitor(motors))
+        # Pusher (MKS ID1) overrides for the auto pipeline only; None keeps the
+        # manual.py defaults so manual mode is unaffected.
+        if push_rpm is not None:
+            self.controller.shooting_speed_rpm = int(push_rpm)
+        if push_acceleration is not None:
+            self.controller.shooting_acceleration = int(push_acceleration)
+        if push_home_rpm is not None:
+            self.controller.home_speed_rpm = int(push_home_rpm)
         try:
             self.controller.vesc_controller.set_speed(PANEL_FLYWHEEL_SPEED)
             self.check_health()
