@@ -47,6 +47,7 @@ class PanelLauncher:
         self._pending_plan = None
         self._pending_index = None
         self._pending_revision = None
+        self._pending_seq = None
         self.message = "等待瞄準到位後，點擊「射擊」執行一個階段"
         self.target_rpm = VESC_MIN_RPM + PANEL_FLYWHEEL_SPEED * VESC_RPM_PER_SPEED_UNIT
         factory = controller_factory or ManualController
@@ -64,7 +65,25 @@ class PanelLauncher:
 
     @property
     def busy(self):
-        return self.pending and self.controller.busy
+        """A stage is in progress and the muzzle must hold its pose.
+
+        Once ID1 has finished (released), the muzzle is free even though the
+        controller stays busy while ID2 rotates the magazine.
+        """
+        return self.pending and self.controller.busy and not self._pending_shot_released()
+
+    @property
+    def mechanism_busy(self):
+        """Launcher hardware still moving (e.g. magazine rotating after shot 3).
+
+        The muzzle may already aim at the next hole, but no new shot may start.
+        """
+        return bool(self.controller.busy)
+
+    def _pending_shot_released(self):
+        released = getattr(self.controller, "shot_released_seq", None)
+        return (isinstance(released, int) and isinstance(self._pending_seq, int)
+                and released >= self._pending_seq)
 
     def check_health(self):
         self.controller.check_health()
@@ -79,6 +98,9 @@ class PanelLauncher:
                              or plan.current().hole_id != self._pending_target.hole_id):
             raise RuntimeError("發射期間孔位計畫已改變，停止操作")
         if action is None:
+            return
+        if not self.pending and self.mechanism_busy:
+            self.message = "彈藥倉轉格中，完成後再點擊「射擊」"
             return
         revision, index, hole_id, issued_at = action
         target = plan.current() if plan is not None else None
@@ -106,10 +128,17 @@ class PanelLauncher:
             if (target.hole_id != self._pending_target.hole_id or self._pending_plan.current() is not target
                     or self._pending_plan.index != self._pending_index):
                 raise RuntimeError("發射期間孔位計畫已改變，停止操作")
-            if self.controller.busy:
+            released = self._pending_shot_released()
+            if self.controller.busy and not released:
                 return False
             self._pending_target = self._pending_plan = self._pending_index = self._pending_revision = None
-            self.message = "本次發射階段完成，切換下一孔；再次發射仍需點擊「射擊」"
+            self._pending_seq = None
+            if self.controller.busy:
+                # Shot 3 is out and ID1 is home; ID2 keeps rotating while the
+                # turret already moves to the next hole.
+                self.message = "已發射，彈藥倉轉格中；砲口先轉向下一孔，轉格完成後才可射擊"
+            else:
+                self.message = "本次發射階段完成，切換下一孔；再次發射仍需點擊「射擊」"
             return True
         authorization = self._authorization
         self._authorization = None
@@ -119,11 +148,13 @@ class PanelLauncher:
         if target is not authorized_target or plan.current() is not target or plan.index != index:
             self.message = "孔位已改變，射擊未執行"
             return False
+        request_seq = getattr(self.controller, "shot_request_seq", None)
         if not self.controller.request_shot():
             self.message = "發射機構未接受指令，請檢查目前狀態"
             return False
         self._pending_target, self._pending_plan, self._pending_index = target, plan, index
         self._pending_revision = revision
+        self._pending_seq = request_seq + 1 if isinstance(request_seq, int) else None
         self.message = "正在執行發射階段，砲口保持位置；完成前不接受下一次射擊"
         return False
 
@@ -132,6 +163,7 @@ class PanelLauncher:
             "speed": PANEL_FLYWHEEL_SPEED,
             "target_rpm": self.target_rpm,
             "busy": bool(self.busy),
+            "magazine_rotating": bool(self.mechanism_busy and not self.pending),
             "pending": self.pending,
             "slot": self.controller.current_slot,
             "next_stage": self.controller.shot_stage + 1,
@@ -141,3 +173,54 @@ class PanelLauncher:
     def close(self):
         self._authorization = None
         self.controller.close()
+
+
+class AutoFireTrigger:
+    """Replace the operator's click with an automatic one (``--auto-fire``).
+
+    It only *creates the same click a person would make*; the click then goes
+    through ``PanelLauncher.arm`` and the engagement gate exactly like a panel
+    click, so every existing check (pose ready, aim reached and stable,
+    cooldown, same plan/hole, magazine not rotating) still applies on the very
+    tick the shot is taken.  On top of that the shot must have been ready
+    continuously for ``settle_s`` on the same hole.
+    """
+
+    def __init__(self, settle_s=0.5, *, clock=time.monotonic):
+        if not settle_s >= 0:
+            raise ValueError("settle_s must be >= 0")
+        self.settle_s = float(settle_s)
+        self._clock = clock
+        self._key = None
+        self._since = None
+        self.state = "等待瞄準到位"
+
+    def _reset(self, state):
+        self._key = None
+        self._since = None
+        self.state = state
+
+    def take(self, plan, plan_revision, ready):
+        """Return a click tuple once ready has held for ``settle_s``, else None."""
+        target = plan.current() if plan is not None else None
+        if target is None:
+            self._reset("沒有待射孔位")
+            return None
+        if not ready:
+            self._reset("等待瞄準到位")
+            return None
+        now = self._clock()
+        key = (plan_revision, plan.index, target.hole_id)
+        if key != self._key:
+            self._key, self._since = key, now
+        held = now - self._since
+        if held < self.settle_s:
+            self.state = f"{target.hole_id} 瞄準穩定中 {held:.1f}/{self.settle_s:.1f} s"
+            return None
+        self.state = f"{target.hole_id} 自動發射"
+        # Fire once per settled hole; a new click needs a fresh settle period.
+        self._key = self._since = None
+        return (plan_revision, plan.index, target.hole_id, now)
+
+    def snapshot(self):
+        return {"enabled": True, "settle_s": self.settle_s, "state": self.state}

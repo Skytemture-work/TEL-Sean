@@ -809,11 +809,14 @@
       $("launcherStatus").hidden = !panelMode;
       $("navigationControls").hidden = panelMode;
       $("manualStatus").hidden = panelMode;
-      $("fireShot").disabled = panelPending || !panelState.enabled || !panelState.ready || !panelFresh;
-      text("fireShot", launcher.pending ? "發射階段執行中…" : panelState.ready ? `射擊 ${panelState.hole_id || ""}` : "等待瞄準到位");
+      const autoFire = panelState.auto_fire || null;
+      $("fireShot").disabled = Boolean(autoFire) || panelPending || !panelState.enabled || !panelState.ready || !panelFresh;
+      text("fireShot", autoFire
+        ? (launcher.pending ? "自動射擊：發射階段執行中…" : `自動射擊：${autoFire.state || "—"}`)
+        : launcher.pending ? "發射階段執行中…" : panelState.ready ? `射擊 ${panelState.hole_id || ""}` : "等待瞄準到位");
       text("launcherStatus", `雙飛輪 speed=${launcher.speed ?? "—"}／目標 ${launcher.target_rpm ?? "—"} RPM ｜ 格位 ${launcher.slot ?? "—"} ｜ 下一階段 ${launcher.next_stage ?? "—"}/3。${launcher.message || ""}`);
       const confirmationMode = detectionOnly || aimOnly;
-      text("modeSubtitle", panelMode ? "自動瞄準／面板點擊發射" : detectionOnly ? "純偵測／唯讀：下一孔位、位置、距離與角度" : (aimOnly ? "實機僅瞄準：人工切換孔位，不發射" : "實機瞄準與射擊狀態"));
+      text("modeSubtitle", panelMode ? (panelState.auto_fire ? "全自動：自動瞄準＋自動發射（Ctrl+C 停止）" : "自動瞄準／面板點擊發射") : detectionOnly ? "純偵測／唯讀：下一孔位、位置、距離與角度" : (aimOnly ? "實機僅瞄準：人工切換孔位，不發射" : "實機瞄準與射擊狀態"));
       text("targetTitle", detectionOnly ? "下一個孔位（唯讀計算）" : (aimOnly ? "下一個孔位（僅瞄準）" : "下一個孔位"));
 
       text("sumNext", target.hole_id || "—");

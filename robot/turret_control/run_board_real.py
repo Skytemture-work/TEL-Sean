@@ -145,8 +145,31 @@ def _all_holes_confirmed(plan, confirmed_holes):
             and set(confirmed_holes) == {f"H{n:02d}" for n in range(1, 13)})
 
 
-def _update_panel_engagement(driver, launcher, dashboard, plan, pose_ready, blocked_reason):
-    """Validate a click on this frame; never retain an unexecuted authorization."""
+def _auto_fire_ready(driver, launcher, plan, pose_ready, previous_status):
+    """True when the previous tick already had a fire-allowed aim on this hole."""
+    current = plan.current() if plan is not None else None
+    return bool(
+        current is not None
+        and pose_ready
+        and previous_status is not None
+        and not previous_status.fired
+        and previous_status.target is not None
+        and previous_status.target.hole_id == current.hole_id
+        and previous_status.command.fire_allowed
+        and not launcher.pending
+        and not launcher.mechanism_busy
+        and driver.fire_cooldown_ready
+    )
+
+
+def _update_panel_engagement(driver, launcher, dashboard, plan, pose_ready, blocked_reason,
+                             auto_fire=None, previous_status=None):
+    """Validate a click on this frame; never retain an unexecuted authorization.
+
+    With ``auto_fire`` the click comes from ``AutoFireTrigger`` instead of the
+    web button (web clicks are consumed and ignored); the click is then checked
+    by exactly the same launcher and engagement gates.
+    """
     launcher.check_health()
     if launcher.busy and not pose_ready:
         raise RuntimeError("發射期間靶板姿態失效，停止發射控制")
@@ -155,7 +178,13 @@ def _update_panel_engagement(driver, launcher, dashboard, plan, pose_ready, bloc
         "發射階段執行中，砲口保持位置" if launcher.busy else blocked_reason,
     )
     driver.set_firing_enabled(pose_ready, blocked_reason)
-    launcher.arm(dashboard.take_panel_fire(), plan, driver.plan_revision)
+    action = dashboard.take_panel_fire()
+    if auto_fire is not None:
+        action = auto_fire.take(
+            plan, driver.plan_revision,
+            _auto_fire_ready(driver, launcher, plan, pose_ready, previous_status),
+        )
+    launcher.arm(action, plan, driver.plan_revision)
     try:
         return driver.update()
     finally:
@@ -224,6 +253,15 @@ def main(
     launcher_mode.add_argument(
         "--panel-fire", action="store_true",
         help="雙 VESC 預設 speed 100，自動瞄準；每次實際發射僅接受網頁射擊按鈕",
+    )
+    launcher_mode.add_argument(
+        "--auto-fire", action="store_true",
+        help="全自動：與 --panel-fire 相同的瞄準與發射流程，瞄準到位並穩定 "
+             "--auto-fire-settle 秒後自動發射，不需點擊；Ctrl+C 停止並回 home",
+    )
+    parser.add_argument(
+        "--auto-fire-settle", type=float, default=0.5,
+        help="全自動模式：同一孔位需連續符合發射條件的秒數（預設 0.5，範圍 0.2～5）",
     )
     parser.add_argument("--restore-completed-aim", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
@@ -296,6 +334,11 @@ def main(
         parser.error("--zed-calibration 必須配合 --zed-uvc 使用")
     if args.restore_completed_aim and (not args.aim_only or args.score_mode):
         parser.error("--restore-completed-aim 需要 --aim-only --no-score-mode")
+    if not math.isfinite(args.auto_fire_settle) or not 0.2 <= args.auto_fire_settle <= 5.0:
+        parser.error("--auto-fire-settle 必須在 0.2～5 秒之間")
+    if args.auto_fire:
+        # Same pipeline as --panel-fire; only the click source differs.
+        args.panel_fire = True
     if args.panel_fire and (not args.web_port or fire_callback is not None or args.virtual_board):
         parser.error("--panel-fire 需要網頁面板，不能搭配 fire_callback 或 --virtual-board")
 
@@ -454,7 +497,7 @@ def main(
 
     external_fire = fire_callback is not None
     driver.fire = fire_callback if external_fire else operator_fire
-    fire_label = "PANEL button only" if args.panel_fire else "AIM ONLY / no fire" if args.aim_only else (
+    fire_label = "AUTO FIRE" if args.auto_fire else "PANEL button only" if args.panel_fire else "AIM ONLY / no fire" if args.aim_only else (
         "external fire callback" if external_fire else "F confirm"
     )
     window = f"REAL BOARD AIM - {fire_label} / S skip / G score start / Q quit"
@@ -468,6 +511,8 @@ def main(
     restore_completed = args.restore_completed_aim
     grabber = None
     preview = None
+    auto_fire = None
+    previous_status = None
 
     def begin_home():
         nonlocal home_active, home_error
@@ -558,8 +603,16 @@ def main(
             launcher = PanelLauncher(motors)
             driver.fire = launcher.fire
             driver.fire_ready = launcher.fire_ready
-            print(f"面板射擊模式：雙 VESC speed=100，目標 {launcher.target_rpm:g} RPM；"
-                  "僅點擊面板「射擊」才會執行 FIRE。", flush=True)
+            if args.auto_fire:
+                from .panel_launcher import AutoFireTrigger
+
+                auto_fire = AutoFireTrigger(args.auto_fire_settle)
+                print(f"全自動射擊模式：雙 VESC speed=100，目標 {launcher.target_rpm:g} RPM；"
+                      f"瞄準到位並穩定 {args.auto_fire_settle:g} 秒後自動發射，不需點擊。"
+                      "按 Ctrl+C 停止發射並回 home。", flush=True)
+            else:
+                print(f"面板射擊模式：雙 VESC speed=100，目標 {launcher.target_rpm:g} RPM；"
+                      "僅點擊面板「射擊」才會執行 FIRE。", flush=True)
         if args.restore_completed_aim:
             begin_home()
         if dashboard is not None and args.preview_fps > 0:
@@ -840,9 +893,11 @@ def main(
                         begin_home()
             if launcher is not None:
                 status = _update_panel_engagement(
-                    driver, launcher, dashboard, plan, pose_ready, pose_blocked_reason)
+                    driver, launcher, dashboard, plan, pose_ready, pose_blocked_reason,
+                    auto_fire=auto_fire, previous_status=previous_status)
             else:
                 status = driver.update()
+            previous_status = status
             partial_shot_gate.record(pose, status.fired)
             control_done_at = time.perf_counter()
             yaw_motor_state = motors.get_state(config.yaw_motor_id)
@@ -1050,15 +1105,18 @@ def main(
                 if launcher is not None:
                     current = plan.current() if plan is not None else None
                     telemetry["system"]["panel_fire"] = True
+                    telemetry["system"]["auto_fire"] = auto_fire is not None
                     telemetry["launcher"] = launcher.snapshot()
                     telemetry["panel_control"] = {
                         "enabled": True,
                         "ready": bool(current is not None and pose_ready and not launcher.pending
+                                      and not launcher.mechanism_busy
                                       and not status.fired and status.command.fire_allowed
                                       and driver.fire_cooldown_ready),
                         "plan_index": plan.index if plan is not None else None,
                         "plan_revision": driver.plan_revision,
                         "hole_id": getattr(current, "hole_id", None),
+                        "auto_fire": auto_fire.snapshot() if auto_fire is not None else None,
                         "pitch_trim_deg": pitch_trim_deg.get(getattr(current, "hole_id", None) or "", 0.0),
                         "nonce": dashboard.fire_nonce,
                     }

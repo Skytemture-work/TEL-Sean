@@ -1053,6 +1053,11 @@ class ManualController:
         self.current_slot = 1
         # 這只是下一筆 FIRE 的階段；實際原點必須在第 1 階段開始前完成回零。
         self.shot_stage = 0
+        # 每次接受 FIRE 遞增 shot_request_seq；ID1 本階段完成（第 3 階段為推到底並
+        # 退回原點）時把 shot_released_seq 設為同一序號。之後的 ID2 轉格仍佔用
+        # busy，但自動瞄準可以先轉向下一孔，不必等待轉格。
+        self.shot_request_seq = 0
+        self.shot_released_seq = 0
         self.reload_pending = False
         self._shoot_home_encoder = None
         self.shot_error = None
@@ -1205,6 +1210,7 @@ class ManualController:
                 return False
             self.busy = True
             self._shot_cancel.clear()
+            self.shot_request_seq += 1
 
         worker = threading.Thread(target=self._shot_worker, daemon=True)
         with self.lock:
@@ -1269,12 +1275,16 @@ class ManualController:
             if self._shot_cancel.is_set():
                 return
             stage = self.shot_stage
+            with self.lock:
+                request_seq = self.shot_request_seq
             print("[Manual] FIRE：執行第 {}/3 階段，彈藥格位 {}。".format(
                 stage + 1, self.current_slot
             ), flush=True)
             self._run_one_shot_cycle()
             if self._shot_cancel.is_set():
                 return
+            with self.lock:
+                self.shot_released_seq = request_seq
             if stage < 2:
                 self.shot_stage = stage + 1
                 print("[Manual] 本階段完成，放開 FIRE 後再按一次執行第 {}/3 階段。".format(

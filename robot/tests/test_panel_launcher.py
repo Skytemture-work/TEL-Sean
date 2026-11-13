@@ -233,6 +233,225 @@ class SharedLauncherLifecycleTests(unittest.TestCase):
         vesc.close.assert_called_once()
 
 
+class MagazineRotationOverlapTests(unittest.TestCase):
+    """Shot 3: once ID1 is home the turret may aim at the next hole while ID2
+    rotates, but no new shot can start until the rotation is finished."""
+
+    def setUp(self):
+        self.now = 0.0
+        self.clock = lambda: self.now
+        self.controller = Mock(busy=False, shot_error=None, current_slot=1, shot_stage=2,
+                               shot_request_seq=0, shot_released_seq=0)
+
+        def start_shot():
+            self.controller.busy = True
+            self.controller.shot_request_seq += 1
+            return True
+
+        self.controller.request_shot.side_effect = start_shot
+        self.launcher = PanelLauncher(Mock(), controller_factory=Mock(return_value=self.controller),
+                                      clock=self.clock)
+        self.plan = EngagementPlan([BoardTarget(640, 360, 40, 40, hole_id=f'H{i:02d}')
+                                    for i in range(1, 5)])
+        self.turret = ReadyTurret()
+        self.driver = BoardEngagement(TurretConfig(), self.turret, plan=self.plan,
+                                      fire=self.launcher.fire, fire_ready=self.launcher.fire_ready,
+                                      target_timeout_s=None, clock=self.clock)
+        self.action = None
+        self.dashboard = Mock()
+        self.dashboard.take_panel_fire.side_effect = self._take
+
+    def _take(self):
+        action, self.action = self.action, None
+        return action
+
+    def click(self):
+        self.action = (self.driver.plan_revision, self.plan.index, self.plan.current().hole_id, self.now)
+
+    def tick(self):
+        return real._update_panel_engagement(self.driver, self.launcher, self.dashboard,
+                                             self.driver.plan, True, None)
+
+    def test_turret_moves_on_while_magazine_rotates_but_cannot_fire(self):
+        self.click()
+        self.assertFalse(self.tick().fired)
+        self.assertTrue(self.launcher.busy)          # muzzle holds while ID1 pushes
+        self.assertFalse(self.tick().fired)
+        self.assertIsNone(self.turret.targets[-1])
+        # Third ball out and ID1 home; ID2 rotation still running (busy=True).
+        self.controller.shot_released_seq = 1
+        self.now += 1.1
+        self.assertTrue(self.tick().fired)
+        self.assertEqual(self.plan.index, 1)
+        self.assertFalse(self.launcher.pending)
+        self.assertFalse(self.launcher.busy)
+        self.assertTrue(self.launcher.mechanism_busy)
+        self.assertTrue(self.launcher.snapshot()['magazine_rotating'])
+        # Next tick aims at H02 already (not held).
+        self.now += 1.1
+        self.tick()
+        self.assertEqual(self.turret.targets[-1].u_px, 640)
+        self.assertIsNotNone(self.turret.targets[-1])
+        # A click during rotation is refused and never queued.
+        self.click()
+        self.assertFalse(self.tick().fired)
+        self.assertIn('轉格中', self.launcher.message)
+        self.assertEqual(self.controller.request_shot.call_count, 1)
+        self.now += 5
+        self.assertFalse(self.tick().fired)
+        self.assertEqual(self.controller.request_shot.call_count, 1)
+        # Rotation done: a fresh click starts the next stage.
+        self.controller.busy = False
+        self.click()
+        self.tick()
+        self.assertEqual(self.controller.request_shot.call_count, 2)
+        self.assertTrue(self.launcher.pending)
+
+    def test_without_release_signal_still_waits_for_full_completion(self):
+        self.click()
+        self.tick()
+        self.now += 1.1
+        self.assertFalse(self.tick().fired)          # busy, not released
+        self.assertEqual(self.plan.index, 0)
+
+    @patch('builtins.print')
+    def test_manual_worker_releases_before_rotating_magazine(self, _):
+        with patch.object(manual, 'VESCDualMotorController', return_value=Mock()), \
+             patch.object(manual, 'validate_mks_can_interfaces'), \
+             patch.object(manual.ManualController, '_initialize_can'):
+            controller = manual.ManualController(None, dm_controller=Mock())
+        controller.shot_stage = 2
+        seen = {}
+        controller._run_one_shot_cycle = lambda: None
+
+        def rotate():
+            seen['released'] = controller.shot_released_seq
+            seen['request'] = controller.shot_request_seq
+            seen['busy'] = controller.busy
+
+        controller._rotate_ammo_one_slot = rotate
+        try:
+            self.assertTrue(controller.request_shot())
+            controller._shot_thread.join(2)
+        finally:
+            controller.close()
+        self.assertEqual(seen, {'released': 1, 'request': 1, 'busy': True})
+        self.assertEqual(controller.current_slot, 2)
+        self.assertEqual(controller.shot_stage, 0)
+
+
+class AutoFireTests(unittest.TestCase):
+    """--auto-fire: the trigger only replaces the click; every gate still applies."""
+
+    def setUp(self):
+        from turret_control.panel_launcher import AutoFireTrigger
+        self.now = 0.0
+        self.clock = lambda: self.now
+        self.controller = Mock(busy=False, shot_error=None, current_slot=1, shot_stage=0,
+                               shot_request_seq=0, shot_released_seq=0)
+
+        def start_shot():
+            self.controller.busy = True
+            self.controller.shot_request_seq += 1
+            return True
+
+        self.controller.request_shot.side_effect = start_shot
+        self.launcher = PanelLauncher(Mock(), controller_factory=Mock(return_value=self.controller),
+                                      clock=self.clock)
+        self.plan = EngagementPlan([BoardTarget(640, 360, 40, 40, hole_id=f'H{i:02d}')
+                                    for i in range(1, 5)])
+        self.turret = ReadyTurret()
+        self.driver = BoardEngagement(TurretConfig(), self.turret, plan=self.plan,
+                                      fire=self.launcher.fire, fire_ready=self.launcher.fire_ready,
+                                      target_timeout_s=None, clock=self.clock)
+        self.auto = AutoFireTrigger(0.5, clock=self.clock)
+        self.dashboard = Mock()
+        self.dashboard.take_panel_fire.return_value = None
+        self.previous = None
+
+    def tick(self, pose_ready=True, dt=0.1):
+        self.now += dt
+        status = real._update_panel_engagement(
+            self.driver, self.launcher, self.dashboard, self.driver.plan, pose_ready,
+            None if pose_ready else 'pose invalid', auto_fire=self.auto,
+            previous_status=self.previous)
+        self.previous = status
+        return status
+
+    def finish_stage(self):
+        self.controller.shot_released_seq = self.controller.shot_request_seq
+        self.controller.busy = False
+
+    def test_fires_without_click_only_after_settle_and_once_per_hole(self):
+        for _ in range(5):          # 0.1 .. 0.5 s: still settling
+            self.tick()
+        self.controller.request_shot.assert_not_called()
+        for _ in range(3):
+            self.tick()
+        self.assertEqual(self.controller.request_shot.call_count, 1)
+        self.assertTrue(self.launcher.pending)
+        for _ in range(10):         # stage running: no second request
+            self.tick()
+        self.assertEqual(self.controller.request_shot.call_count, 1)
+        self.finish_stage()
+        fired = [self.tick().fired for _ in range(3)]
+        self.assertIn(True, fired)
+        self.assertEqual(self.plan.index, 1)
+        # Next hole: a fresh settle period is required before the next request.
+        self.now += 1.1
+        for _ in range(3):
+            self.tick()
+        self.assertEqual(self.controller.request_shot.call_count, 1)
+        for _ in range(6):
+            self.tick()
+        self.assertEqual(self.controller.request_shot.call_count, 2)
+
+    def test_never_fires_while_aim_not_ready(self):
+        self.turret.ready = False
+        for _ in range(50):
+            self.tick()
+        self.controller.request_shot.assert_not_called()
+
+    def test_losing_ready_restarts_settle(self):
+        for _ in range(4):
+            self.tick()
+        self.turret.ready = False
+        self.tick()
+        self.turret.ready = True
+        for _ in range(5):
+            self.tick()
+        self.controller.request_shot.assert_not_called()
+        for _ in range(3):
+            self.tick()
+        self.assertEqual(self.controller.request_shot.call_count, 1)
+
+    def test_never_fires_without_pose(self):
+        for _ in range(50):
+            self.tick(pose_ready=False)
+        self.controller.request_shot.assert_not_called()
+
+    def test_waits_for_magazine_rotation(self):
+        self.controller.busy = True   # e.g. ID2 still rotating from the previous slot
+        for _ in range(30):
+            self.tick()
+        self.controller.request_shot.assert_not_called()
+        self.controller.busy = False
+        for _ in range(8):
+            self.tick()
+        self.assertEqual(self.controller.request_shot.call_count, 1)
+
+    @patch('builtins.print')
+    def test_cli_auto_fire_validation_before_hardware(self, _):
+        for args in (['--auto-fire', '--aim-only'], ['--auto-fire', '--panel-fire'],
+                     ['--auto-fire', '--web-port', '0'], ['--auto-fire', '--auto-fire-settle', '0.1'],
+                     ['--auto-fire', '--auto-fire-settle', 'nan']):
+            with self.subTest(args=args), patch.object(real, 'SharedMotorBackend') as factory, \
+                 patch('sys.stderr'), self.assertRaises(SystemExit) as raised:
+                real.main(args)
+            self.assertEqual(raised.exception.code, 2)
+            factory.assert_not_called()
+
+
 class PanelEntryTests(unittest.TestCase):
     @patch('builtins.print')
     def test_mode_validation_happens_before_any_hardware_startup(self, _):
