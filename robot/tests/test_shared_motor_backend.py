@@ -65,9 +65,9 @@ class SharedMotorBackendTests(unittest.TestCase):
         kwargs = worker_class.call_args.kwargs
         self.assertEqual(kwargs["speed_rad_s"], 0.35)
         self.assertEqual(kwargs["acceleration_rad_s2"], 0.28)
-        self.assertEqual(kwargs["kp"], 350.0)
-        self.assertEqual(kwargs["kd"], 2.0)
-        self.assertEqual(kwargs["control_mode"], "mit")
+        self.assertEqual(kwargs["kp"], 50.0)
+        self.assertEqual(kwargs["kd"], 1.5)
+        self.assertEqual(kwargs["control_mode"], "posvel")
 
     @patch("turret_control.shared_motor_backend.MotorWorker")
     def test_invalid_trajectory_limits_are_rejected(self, worker_class):

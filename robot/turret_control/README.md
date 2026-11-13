@@ -208,7 +208,7 @@ python3 -m turret_control.run_board_real --aim-only --aim-speed 0.35 --aim-accel
 
 # 自動瞄準 + 真實雙 VESC／MKS 發射；只有面板「射擊」按鈕才可觸發 FIRE
 python3 -m turret_control.run_board_real --panel-fire --no-score-mode --headless --web-port 8080
-# 面板雙軸使用 MIT 控制：水平／垂直 Kp=350、Kd=2（與 Mac manual.py 同步）
+# 面板雙軸恢復使用 AGX 已驗證的 posvel 位置／速度控制；外部 Kp/Kd 不會套用
 # 原本使用 --zed-uvc、--model 或 --camera 時，繼續保留相同相機／模型參數。
 # VESC 預設 speed=100，目標轉速由 manual.py 現有公式決定（目前 6000 RPM）。
 # 點擊一次執行一個已驗證的 FIRE 階段；完成後換下一孔，第三階段回零後轉一格。

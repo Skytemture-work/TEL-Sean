@@ -13,11 +13,11 @@ from .run_vertical_panel import (
 
 DEFAULT_AIM_SPEED_RAD_S = 0.35
 DEFAULT_AIM_ACCELERATION_RAD_S2 = 0.28
-# Keep the automatic panel controller aligned with manual.py's tested
-# holding gains.  MIT is required here because posvel does not use Kp/Kd.
-DEFAULT_AIM_KP = 350.0
-DEFAULT_AIM_KD = 2.0
-DEFAULT_AIM_CONTROL_MODE = "mit"
+# The automatic panel controller uses the AGX-verified position/velocity mode.
+# Its Kp/Kd are internal to the motor controller and are not sent by posvel.
+DEFAULT_AIM_KP = 50.0
+DEFAULT_AIM_KD = 1.5
+DEFAULT_AIM_CONTROL_MODE = "posvel"
 
 
 class SharedMotorBackend:
