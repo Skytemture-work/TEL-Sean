@@ -597,6 +597,9 @@
           <div class="mini"><span class="eyebrow">馬達命令偏角（相對零位）</span><b id="commandYaw">—</b></div>
           <div class="mini"><span class="eyebrow">馬達命令偏角（相對零位）</span><b id="commandPitch">—</b></div>
           <div class="mini"><span class="eyebrow">操作確認</span><b id="operatorConfirm">—</b></div>
+          <div class="mini"><span class="eyebrow">幾何仰角（直線對孔心）</span><b id="geometricPitch">—</b></div>
+          <div class="mini"><span class="eyebrow">彈道補償</span><b id="ballisticCorrection">—</b></div>
+          <div class="mini"><span class="eyebrow">距離 PnP / ZED</span><b id="rangeCompare">—</b></div>
         </div>
 
         <div class="score-box">
@@ -891,6 +894,10 @@
       text("muzzlePitch", fmt(target.muzzle_pitch_deg, 2, "°"));
       text("commandYaw", fmt(target.command_yaw_error_deg, 2, "°"));
       text("commandPitch", fmt(target.command_pitch_error_deg, 2, "°"));
+      text("geometricPitch", fmt(target.geometric_pitch_deg, 2, "°"));
+      text("ballisticCorrection", target.ballistic_correction_deg == null ? "—"
+        : (target.ballistic_correction_deg >= 0 ? "+" : "") + fmt(target.ballistic_correction_deg, 2, "°"));
+      text("rangeCompare", `${fmt(target.pnp_distance_m, 2, "")} / ${fmt(target.zed_distance_m, 2, "")} m`);
       text("operatorConfirm", panelMode ? (launcher.pending ? "執行中" : "等待點擊射擊") : aimOnly ? "不發射" : (firing.operator_confirmation_pending ? "已確認" : "等待 F"));
 
       const manual = data.manual_control || {};

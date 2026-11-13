@@ -52,6 +52,22 @@ class SharedMotorBackendTests(unittest.TestCase):
         self.assertEqual(len(self.worker.requests), 1)
         self.assertTrue(self.backend.motion_ready(self.yaw, self.pitch))
 
+    def test_pose_jitter_below_deadband_neither_retargets_nor_blocks_firing(self):
+        self.backend.send_targets(self.targets)
+        jitter = math.radians(0.05)
+        moved = {3: (self.yaw + jitter, .06, 0, 0), 1: (self.pitch - jitter, .06, 0, 0)}
+        self.backend.send_targets(moved)
+        self.assertEqual(len(self.worker.requests), 1)
+        self.assertTrue(self.backend.motion_ready(self.yaw + jitter, self.pitch - jitter))
+
+    def test_real_target_change_retargets_and_waits_for_the_worker(self):
+        self.backend.send_targets(self.targets)
+        step = math.radians(0.3)
+        self.backend.send_targets({3: (self.yaw, .06, 0, 0), 1: (self.pitch + step, .06, 0, 0)})
+        self.assertEqual(len(self.worker.requests), 2)
+        # The worker is still on the old target -> not ready.
+        self.assertFalse(self.backend.motion_ready(self.yaw, self.pitch + step))
+
     @patch("turret_control.shared_motor_backend.MotorWorker")
     def test_speed_and_acceleration_are_passed_to_motor_worker(self, worker_class):
         SharedMotorBackend("unused", speed_rad_s=0.12, acceleration_rad_s2=0.08)

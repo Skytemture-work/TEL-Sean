@@ -7,6 +7,10 @@ import time
 
 PANEL_FLYWHEEL_SPEED = 100
 FIRE_REQUEST_TTL_S = 1.0
+# A stage may start only when both flywheels are within this fraction of the
+# target and the reading is fresh (the VESC thread polls at 10 Hz).
+FLYWHEEL_READY_FRACTION = 0.03
+FLYWHEEL_READING_MAX_AGE_S = 0.5
 
 
 class SharedAimMonitor:
@@ -49,6 +53,11 @@ class PanelLauncher:
         self._pending_index = None
         self._pending_revision = None
         self._pending_seq = None
+        # Test/diagnostic record of the most recently *started* stage.
+        self.shots_started = 0
+        self.last_shot = None
+        self._last_started_at = None
+        self._last_released_at = None
         self.message = "等待瞄準到位後，點擊「射擊」執行一個階段"
         self.target_rpm = VESC_MIN_RPM + PANEL_FLYWHEEL_SPEED * VESC_RPM_PER_SPEED_UNIT
         factory = controller_factory or ManualController
@@ -89,6 +98,33 @@ class PanelLauncher:
         """
         return bool(self.controller.busy)
 
+    def shot_released(self):
+        """The pending stage has released its ball (ID1 done); complete it now."""
+        return self.pending and self._pending_shot_released()
+
+    @property
+    def last_released_at(self):
+        """Clock time the previous stage released its ball (None before any)."""
+        return self._last_released_at
+
+    def flywheel_rpm(self):
+        """(left, right) RPM when the reading is fresh, else None."""
+        rpm = getattr(getattr(self.controller, "vesc_controller", None), "last_rpm", None)
+        if not (isinstance(rpm, tuple) and len(rpm) == 3):
+            return None
+        left, right, read_at = rpm
+        if not 0 <= time.monotonic() - read_at <= FLYWHEEL_READING_MAX_AGE_S:
+            return None
+        return left, right
+
+    @property
+    def flywheel_ready(self):
+        rpm = self.flywheel_rpm()
+        if rpm is None:
+            return False
+        limit = FLYWHEEL_READY_FRACTION * self.target_rpm
+        return all(abs(value - self.target_rpm) <= limit for value in rpm)
+
     def _pending_shot_released(self):
         released = getattr(self.controller, "shot_released_seq", None)
         return (isinstance(released, int) and isinstance(self._pending_seq, int)
@@ -110,6 +146,11 @@ class PanelLauncher:
             return
         if not self.pending and self.mechanism_busy:
             self.message = "彈藥倉轉格中，完成後再點擊「射擊」"
+            return
+        if not self.pending and not self.flywheel_ready:
+            rpm = self.flywheel_rpm()
+            self.message = ("飛輪尚未達到轉速（目標 {:.0f} RPM，目前 {}），請稍候".format(
+                self.target_rpm, "無讀值" if rpm is None else "{:.0f}/{:.0f}".format(*rpm)))
             return
         revision, index, hole_id, issued_at = action
         target = plan.current() if plan is not None else None
@@ -142,6 +183,7 @@ class PanelLauncher:
                 return False
             self._pending_target = self._pending_plan = self._pending_index = self._pending_revision = None
             self._pending_seq = None
+            self._last_released_at = self._clock()
             if self.controller.busy:
                 # Shot 3 is out and ID1 is home; ID2 keeps rotating while the
                 # turret already moves to the next hole.
@@ -158,9 +200,29 @@ class PanelLauncher:
             self.message = "孔位已改變，射擊未執行"
             return False
         request_seq = getattr(self.controller, "shot_request_seq", None)
+        slot = getattr(self.controller, "current_slot", None)
+        stage = getattr(self.controller, "shot_stage", None)
+        rpm = getattr(getattr(self.controller, "vesc_controller", None), "last_rpm", None)
         if not self.controller.request_shot():
             self.message = "發射機構未接受指令，請檢查目前狀態"
             return False
+        now = self._clock()
+        self.shots_started += 1
+        released = self._last_released_at
+        previous = self._last_started_at
+        self.last_shot = {
+            "prev_mechanism_s": (round(released - previous, 2)
+                                 if released is not None and previous is not None
+                                 and released >= previous else None),
+            "wait_after_release_s": round(now - released, 2) if released is not None else None,
+            "started_at": now,
+            "hole_id": target.hole_id,
+            "plan_index": index,
+            "slot": slot if isinstance(slot, int) else None,
+            "stage": stage + 1 if isinstance(stage, int) else None,
+            "rpm": rpm if isinstance(rpm, tuple) and len(rpm) == 3 else None,
+        }
+        self._last_started_at = now
         self._pending_target, self._pending_plan, self._pending_index = target, plan, index
         self._pending_revision = revision
         self._pending_seq = request_seq + 1 if isinstance(request_seq, int) else None
@@ -176,6 +238,8 @@ class PanelLauncher:
             "pending": self.pending,
             "slot": self.controller.current_slot,
             "next_stage": self.controller.shot_stage + 1,
+            "flywheel_rpm": self.flywheel_rpm(),
+            "flywheel_ready": bool(self.flywheel_ready),
             "message": self.message,
         }
 

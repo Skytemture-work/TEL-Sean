@@ -186,6 +186,22 @@ class LivePreviewPublisherTest(unittest.TestCase):
         self.assertTrue(all(p[:2] == b"\xff\xd8" for p in published))
         self.assertIsNotNone(preview.stats()["preview_fps"])
 
+    def test_published_jpeg_is_downscaled(self):
+        grabber = LatestFrameGrabber(_FakeUvc(), has_depth=False)
+        frames = []
+        preview = LivePreviewPublisher(grabber, frames.append, fps=20, scale=0.5)
+        try:
+            time.sleep(0.4)
+        finally:
+            preview.stop()
+            grabber.stop()
+        self.assertTrue(frames)
+        image = cv2.imdecode(np.frombuffer(frames[-1], dtype=np.uint8), cv2.IMREAD_COLOR)
+        source = _FakeUvc().read()[1]
+        self.assertEqual(image.shape[:2], (source.shape[0] // 2, source.shape[1] // 2))
+        with self.assertRaises(ValueError):
+            LivePreviewPublisher(grabber, frames.append, fps=10, scale=0.0)
+
     def test_overlay_annotations_are_copied_onto_live_frame(self):
         grabber = LatestFrameGrabber(_FakeUvc(), has_depth=False)
         preview = LivePreviewPublisher(grabber, lambda _b: None, fps=1)

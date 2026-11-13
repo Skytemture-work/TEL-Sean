@@ -211,6 +211,10 @@ class TurretConfig:
     muzzle_speed_m_s: float = 20.0
     gravity_m_s2: float = 9.81
     compensate_gravity: bool = True
+    # Empirical: the ball leaves at ``launch_angle_ratio`` x the barrel's
+    # elevation above horizontal (1.0 = exactly along the barrel).  Only used
+    # by the rotating-exit ballistic solve of the base-fixed-camera path.
+    launch_angle_ratio: float = 1.0
 
     # Both corrections need the range to the target, which a single YOLO box
     # does not provide.  When a correction is enabled but no distance is given,
@@ -271,10 +275,8 @@ class TurretConfig:
             raise ValueError("stable_frames_required must be at least 1")
         if self.compensate_gravity and self.muzzle_speed_m_s <= 0:
             raise ValueError("muzzle_speed_m_s must be positive to compensate gravity")
-        if (self.use_axis_geometry and not self.camera_on_turret
-                and self.compensate_gravity
-                and (self.pitch_exit_offset_y_m != 0.0 or self.pitch_exit_offset_z_m != 0.0)):
-            raise ValueError("gravity with a rotating exit offset is not implemented")
+        if not 0.5 <= self.launch_angle_ratio <= 1.5:
+            raise ValueError("launch_angle_ratio must be between 0.5 and 1.5")
         if self.gravity_m_s2 < 0:
             raise ValueError("gravity_m_s2 must not be negative")
         if self.small_hole_diameter_m <= 0 or self.large_hole_diameter_m <= 0:
@@ -422,12 +424,16 @@ def with_recorded_mechanism_geometry(config: TurretConfig) -> TurretConfig:
     These are the signed measurements recorded in ``mechanism_geometry.json``:
     the camera is pitched 20 degrees above the yaw-axis frame, the yaw axis is
     101.662 mm behind the camera, and the pitch axis is 72.1 mm above it.
+    The ZED image used for aiming is the LEFT lens, whose optical centre is
+    60 mm left of the camera centre line that the turret axes sit on, so the
+    yaw axis is +60 mm (to the right) in the camera frame (user-confirmed
+    2026-11-13; it was 0 before, which shifted shots ~6 cm right at 5.5 m).
     Callers should use this explicitly when they intend to enable real motors.
     """
     return replace(
         config,
         camera_to_yaw_pitch_rad=math.radians(20.0),
-        yaw_axis_offset_x_m=0.0,
+        yaw_axis_offset_x_m=0.060,
         yaw_axis_offset_y_m=0.0,
         yaw_axis_offset_z_m=-0.101662,
         pitch_axis_offset_x_m=0.0,

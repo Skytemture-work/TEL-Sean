@@ -72,6 +72,7 @@ class BoardEngagement:
         clock: Callable[[], float] = time.monotonic,
         event_log_path: Optional[Union[str, Path]] = None,
         fire_ready: Optional[Callable[[], bool]] = None,
+        fire_released: Optional[Callable[[], bool]] = None,
         pitch_trim_rad: Optional[Dict[str, float]] = None,
         fire_tolerance_rad: Optional[Dict[str, float]] = None,
     ):
@@ -87,6 +88,11 @@ class BoardEngagement:
         self.plan_revision = 0
         self.fire = fire
         self.fire_ready = fire_ready
+        # True once a launcher stage that ``fire`` already started has released
+        # its ball.  The shot is then completed (plan advances) without first
+        # re-settling the aim on the hole that was just shot, so the turret can
+        # turn to the next hole while the magazine is still rotating.
+        self.fire_released = fire_released
         self.shot_cooldown_s = shot_cooldown_s
         self.target_timeout_s = target_timeout_s
         self._clock = clock
@@ -170,6 +176,21 @@ class BoardEngagement:
 
         target = self.plan.current()
 
+        if (self.fire is not None and self.fire_released is not None
+                and self.fire_released()):
+            # The ball already left on a fire-allowed aim; keep holding for this
+            # one tick and aim at the next hole from the next tick on.
+            command = self.turret.update(None)
+            status = EngagementStatus(
+                command=command,
+                target=target,
+                index=self.plan.index,
+                remaining=self.plan.remaining,
+            )
+            if bool(self.fire(target)):
+                self._mark_fired(target, now, status)
+                return status
+
         if not self._aiming_enabled:
             command = self.turret.update(None)
             command = replace(
@@ -218,18 +239,7 @@ class BoardEngagement:
             self._last_fire_attempt_at = now
             fired = True if self.fire is None else bool(self.fire(target))
             if fired:
-                plan_index = self.plan.index
-                self.shots += 1
-                self.plan.mark_engaged()
-                self._target_started_at = now
-                self._record_event(
-                    "fired",
-                    target,
-                    plan_index,
-                    shot_number=self.shots,
-                )
-                status.fired = True
-                status.finished = self.plan.finished
+                self._mark_fired(target, now, status)
                 return status
 
         if self._firing_enabled and self._timed_out(now):
@@ -247,6 +257,20 @@ class BoardEngagement:
             status.finished = self.plan.finished
 
         return status
+
+    def _mark_fired(self, target: BoardTarget, now: float, status: EngagementStatus) -> None:
+        plan_index = self.plan.index
+        self.shots += 1
+        self.plan.mark_engaged()
+        self._target_started_at = now
+        self._record_event(
+            "fired",
+            target,
+            plan_index,
+            shot_number=self.shots,
+        )
+        status.fired = True
+        status.finished = self.plan.finished
 
     def _cooldown_expired(self, now: float) -> bool:
         if self._last_fire_attempt_at is None:

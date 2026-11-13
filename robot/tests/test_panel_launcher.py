@@ -1,3 +1,4 @@
+import math
 import threading
 import time
 import unittest
@@ -29,11 +30,20 @@ class ReadyTurret:
                           fire_allowed=self.ready and target is not None)
 
 
+class FreshFlywheels(Mock):
+    """VESC stand-in whose flywheels always read a fresh 4000 RPM."""
+
+    @property
+    def last_rpm(self):
+        return (4000.0, 4000.0, time.monotonic())
+
+
 class PanelLauncherTests(unittest.TestCase):
     def setUp(self):
         self.now = 0.0
         self.clock = lambda: self.now
         self.controller = Mock(busy=False, shot_error=None, current_slot=1, shot_stage=0)
+        self.controller.vesc_controller = FreshFlywheels()
 
         def start_shot():
             self.controller.busy = True
@@ -242,6 +252,7 @@ class MagazineRotationOverlapTests(unittest.TestCase):
         self.clock = lambda: self.now
         self.controller = Mock(busy=False, shot_error=None, current_slot=1, shot_stage=2,
                                shot_request_seq=0, shot_released_seq=0)
+        self.controller.vesc_controller = FreshFlywheels()
 
         def start_shot():
             self.controller.busy = True
@@ -256,6 +267,7 @@ class MagazineRotationOverlapTests(unittest.TestCase):
         self.turret = ReadyTurret()
         self.driver = BoardEngagement(TurretConfig(), self.turret, plan=self.plan,
                                       fire=self.launcher.fire, fire_ready=self.launcher.fire_ready,
+                                      fire_released=self.launcher.shot_released,
                                       target_timeout_s=None, clock=self.clock)
         self.action = None
         self.dashboard = Mock()
@@ -307,6 +319,23 @@ class MagazineRotationOverlapTests(unittest.TestCase):
         self.assertEqual(self.controller.request_shot.call_count, 2)
         self.assertTrue(self.launcher.pending)
 
+    def test_release_advances_without_resettling_on_the_shot_hole(self):
+        # Real aiming needs several fresh stable frames after the hold; the
+        # released shot must not wait for them (magazine already rotating).
+        self.click()
+        self.tick()
+        self.turret.ready = False
+        self.controller.shot_released_seq = 1
+        status = self.tick()
+        self.assertTrue(status.fired)
+        self.assertEqual(status.target.hole_id, 'H01')
+        self.assertEqual(self.plan.index, 1)
+        self.assertIsNone(self.turret.targets[-1])      # holds on the release tick
+        self.tick()
+        self.assertIsNotNone(self.turret.targets[-1])   # next tick drives to H02
+        self.assertEqual(self.plan.current().hole_id, 'H02')
+        self.assertEqual(self.controller.request_shot.call_count, 1)
+
     def test_without_release_signal_still_waits_for_full_completion(self):
         self.click()
         self.tick()
@@ -349,6 +378,7 @@ class AutoFireTests(unittest.TestCase):
         self.clock = lambda: self.now
         self.controller = Mock(busy=False, shot_error=None, current_slot=1, shot_stage=0,
                                shot_request_seq=0, shot_released_seq=0)
+        self.controller.vesc_controller = FreshFlywheels()
 
         def start_shot():
             self.controller.busy = True
@@ -472,10 +502,26 @@ class PusherSpeedTests(unittest.TestCase):
         self.assertEqual(controller.home_speed_rpm, manual.HOME_SPEED_RPM)
         # Faster pusher defaults shared by manual and auto modes; magazine unchanged.
         self.assertEqual((manual.SHOOTING_SPEED_RPM, manual.SHOOTING_ACCELERATION,
-                          manual.HOME_SPEED_RPM, manual.ACCELERATION), (200, 200, 60, 2))
+                          manual.HOME_SPEED_RPM, manual.ACCELERATION), (200, 200, 40, 2))
         launcher = PanelLauncher(Mock(), controller_factory=Mock(return_value=controller))
         self.assertEqual(controller.shooting_speed_rpm, manual.SHOOTING_SPEED_RPM)
         launcher.close()
+
+    @patch('builtins.print')
+    def test_stage3_push_to_end_uses_slow_speed_and_return_uses_home_speed(self, _):
+        controller = self._manual()
+        controller.shoot_servo = Mock()
+        controller.shoot_servo.read_encoder_value_addition.return_value = 0
+        controller.shot_stage = 2
+        calls = []
+        controller._go_home = lambda servo, direction, label, speed_rpm=None: (
+            calls.append((direction, speed_rpm)) or 100)
+        with patch.object(manual.time, 'sleep'):
+            controller._run_one_shot_cycle()
+        self.assertEqual(calls, [(manual.MOVE_DIRECTION, manual.PUSH_END_SPEED_RPM),
+                                 (manual.HOME_DIRECTION, None)])
+        self.assertEqual(manual.PUSH_END_SPEED_RPM, 40)
+        self.assertTrue(controller.reload_pending)
 
     def test_launcher_overrides_only_the_pusher(self):
         controller = self._manual()
@@ -501,12 +547,163 @@ class PusherSpeedTests(unittest.TestCase):
     def test_cli_rejects_out_of_range_or_wrong_mode(self, _):
         for args in (['--auto-fire', '--push-rpm', '1000'], ['--auto-fire', '--push-accel', '0'],
                      ['--auto-fire', '--push-home-rpm', '300'], ['--aim-only', '--push-rpm', '200'],
-                     ['--auto-fire', '--aim-speed', '2.0'], ['--auto-fire', '--aim-acceleration', '5']):
+                     ['--auto-fire', '--aim-speed', '2.0'], ['--auto-fire', '--aim-acceleration', '5'],
+                     ['--auto-fire', '--camera-pitch-deg', '45'], ['--auto-fire', '--muzzle-speed', '5'],
+                     ['--auto-fire', '--launch-angle-ratio', '1.3'],
+                     ['--auto-fire', '--range-source', 'lidar'],
+                     ['--auto-fire', '--stable-frames', '0'], ['--auto-fire', '--stable-frames', '11']):
             with self.subTest(args=args), patch.object(real, 'SharedMotorBackend') as factory, \
                  patch('sys.stderr'), self.assertRaises(SystemExit) as raised:
                 real.main(args)
             self.assertEqual(raised.exception.code, 2)
             factory.assert_not_called()
+
+
+class StallProtectionTests(unittest.TestCase):
+    @patch('builtins.print')
+    def _manual(self, _):
+        with patch.object(manual, 'VESCDualMotorController', return_value=Mock()), \
+             patch.object(manual, 'validate_mks_can_interfaces'), \
+             patch.object(manual.ManualController, '_initialize_can'):
+            return manual.ManualController(None, dm_controller=Mock())
+
+    @patch('builtins.print')
+    def test_startup_releases_a_latched_stall_protection(self, _):
+        controller, servo = self._manual(), Mock()
+        servo.read_motor_shaft_protection_state.side_effect = [SimpleNamespace(value=1),
+                                                               SimpleNamespace(value=0)]
+        with patch.object(manual.time, 'sleep'):
+            controller._clear_stall_protection_at_startup(servo, '彈藥倉')
+        servo.release_motor_shaft_locked_protection_state.assert_called_once_with()
+
+    @patch('builtins.print')
+    def test_startup_refuses_when_protection_cannot_be_released(self, _):
+        controller, servo = self._manual(), Mock()
+        servo.read_motor_shaft_protection_state.return_value = SimpleNamespace(value=1)
+        with patch.object(manual.time, 'sleep'), self.assertRaisesRegex(RuntimeError, '無法解除'):
+            controller._clear_stall_protection_at_startup(servo, '彈藥倉')
+
+    @patch('builtins.print')
+    def test_unprotected_servo_is_left_alone(self, _):
+        controller, servo = self._manual(), Mock()
+        servo.read_motor_shaft_protection_state.return_value = SimpleNamespace(value=0)
+        controller._clear_stall_protection_at_startup(servo, '射擊機構')
+        servo.release_motor_shaft_locked_protection_state.assert_not_called()
+
+    @patch('builtins.print')
+    def test_rotation_refused_by_stall_protection_reports_the_cause(self, _):
+        controller = self._manual()
+        controller.ammo_servo, controller.shoot_servo = Mock(), Mock()
+        controller.ammo_servo.read_encoder_value_addition.return_value = 0
+        controller.ammo_servo.run_motor_relative_motion_by_pulses.return_value = SimpleNamespace(name='RunFail')
+        controller.ammo_servo.read_motor_shaft_protection_state.return_value = SimpleNamespace(value=1)
+        controller._verify_shooter_home_before_reload = Mock()
+        with self.assertRaisesRegex(RuntimeError, '堵轉保護'):
+            controller._rotate_ammo_slots(manual.AMMO_SLOT_PULSES)
+
+
+class ShotToolTests(unittest.TestCase):
+    def test_shot_order_parses_repeats_and_rejects_bad_ids(self):
+        self.assertEqual(real._parse_shot_order("h7, H08,H5,H05"), ['H07', 'H08', 'H05', 'H05'])
+        self.assertIsNone(real._parse_shot_order(None))
+        for bad in ("H13", "X01", "", ",".join(["H01"] * 37)):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                real._parse_shot_order(bad)
+
+    @patch('builtins.print')
+    def test_cli_rejects_shot_order_in_score_mode(self, _):
+        for args in (['--match-fire', '--shot-order', 'H01'],
+                     ['--auto-fire', '--no-score-mode', '--shot-order', 'H99']):
+            with self.subTest(args=args), patch.object(real, 'SharedMotorBackend') as factory, \
+                 patch('sys.stderr'), self.assertRaises(SystemExit) as raised:
+                real.main(args)
+            self.assertEqual(raised.exception.code, 2)
+            factory.assert_not_called()
+
+    def test_launcher_records_slot_stage_and_rpm_of_each_started_stage(self):
+        now = [10.0]
+        controller = Mock(busy=False, shot_error=None, current_slot=2, shot_stage=1,
+                          shot_request_seq=0, shot_released_seq=0)
+        controller.vesc_controller.last_rpm = (3990.0, 4010.0, time.monotonic())
+        controller.request_shot.return_value = True
+        launcher = PanelLauncher(Mock(), controller_factory=Mock(return_value=controller),
+                                 clock=lambda: now[0])
+        plan = EngagementPlan([BoardTarget(640, 360, 40, 40, hole_id='H05')])
+        launcher.arm((0, 0, 'H05', now[0]), plan, 0)
+        self.assertFalse(launcher.fire(plan.current()))
+        self.assertEqual(launcher.shots_started, 1)
+        shot = dict(launcher.last_shot)
+        self.assertEqual(shot.pop('rpm')[:2], (3990.0, 4010.0))
+        self.assertEqual(shot, {
+            'prev_mechanism_s': None, 'wait_after_release_s': None,
+            'started_at': 10.0, 'hole_id': 'H05', 'plan_index': 0, 'slot': 2, 'stage': 2})
+
+    def test_shot_record_reports_physical_angles(self):
+        config = real.with_recorded_mechanism_geometry(real.with_competition_geometry(real.TurretConfig()))
+        target_pitch = config.pitch_zero_rad + config.pitch_sign * math.radians(18.0)
+        target_yaw = config.yaw_zero_rad + config.yaw_sign * math.radians(9.6)
+        command = AimCommand(has_target=True, target_yaw_rad=target_yaw, target_pitch_rad=target_pitch,
+                             yaw_servo_error_rad=0.0,
+                             pitch_servo_error_rad=config.pitch_sign * math.radians(0.1),
+                             pitch_axis_distance_m=5.7, geometric_pitch_rad=math.radians(15.6),
+                             ballistic_correction_rad=math.radians(2.4))
+        shot = {'started_at': 12.5, 'hole_id': 'H05', 'plan_index': 4, 'slot': 2, 'stage': 2,
+                'rpm': (3990.0, 4010.0, 12.4)}
+        record = real._shot_record(shot, 5, 10.0, command, config, pitch_trim_deg=0.0,
+                                   range_pair=(5.55, 5.98), lean_deg=-0.1)
+        self.assertEqual(record['shot'], 5)
+        self.assertAlmostEqual(record['muzzle_pitch_target_deg'], 18.0, places=3)
+        self.assertAlmostEqual(record['muzzle_pitch_current_deg'], 17.9, places=3)
+        self.assertAlmostEqual(record['muzzle_yaw_target_deg'], 9.6, places=3)
+        self.assertEqual((record['rpm_left'], record['rpm_right'], record['rpm_age_s']), (3990.0, 4010.0, 0.1))
+        self.assertEqual(record['since_prev_shot_s'], 2.5)
+        self.assertEqual((record['pnp_distance_m'], record['zed_distance_m']), (5.55, 5.98))
+        self.assertAlmostEqual(record['geometric_pitch_deg'], 15.6, places=3)
+
+
+class FlywheelGateTests(unittest.TestCase):
+    def _launcher(self, rpm):
+        controller = Mock(busy=False, shot_error=None, current_slot=1, shot_stage=0,
+                          shot_request_seq=0, shot_released_seq=0)
+        controller.vesc_controller.last_rpm = rpm
+        return PanelLauncher(Mock(), controller_factory=Mock(return_value=controller)), controller
+
+    def test_click_is_refused_until_both_flywheels_are_at_speed(self):
+        now = time.monotonic()
+        for rpm, ready in (((4000.0, 4000.0, now), True), ((4100.0, 3900.0, now), True),
+                           ((4000.0, 3500.0, now), False), ((1200.0, 1100.0, now), False),
+                           ((4000.0, 4000.0, now - 2.0), False), (None, False)):
+            with self.subTest(rpm=rpm):
+                launcher, controller = self._launcher(rpm)
+                self.assertEqual(launcher.flywheel_ready, ready)
+                plan = EngagementPlan([BoardTarget(640, 360, 40, 40, hole_id='H01')])
+                launcher.arm((0, 0, 'H01', time.monotonic()), plan, 0)
+                self.assertEqual(launcher.fire_ready(), ready)
+                if not ready:
+                    self.assertIn('飛輪尚未達到轉速', launcher.message)
+
+    def test_auto_fire_waits_for_flywheels(self):
+        launcher, _ = self._launcher((2000.0, 2000.0, time.monotonic()))
+        plan = EngagementPlan([BoardTarget(640, 360, 40, 40, hole_id='H01')])
+        previous = SimpleNamespace(fired=False, target=plan.current(),
+                                   command=SimpleNamespace(fire_allowed=True))
+        driver = SimpleNamespace(fire_cooldown_ready=True)
+        self.assertFalse(real._auto_fire_ready(driver, launcher, plan, True, previous))
+        launcher.controller.vesc_controller.last_rpm = (4000.0, 4000.0, time.monotonic())
+        self.assertTrue(real._auto_fire_ready(driver, launcher, plan, True, previous))
+
+
+class LeftLensOffsetTests(unittest.TestCase):
+    def test_yaw_axis_is_60mm_right_of_the_left_lens(self):
+        from turret_control.geometry import target_to_axis_aim
+        config = real.with_recorded_mechanism_geometry(real.with_competition_geometry(real.TurretConfig()))
+        self.assertAlmostEqual(config.yaw_axis_offset_x_m, 0.060)
+        # A point straight ahead of the yaw axis (6 cm right of the lens) needs
+        # no yaw; with the old 0 offset it would have been aimed ~6 cm right.
+        z = 5.5
+        u = config.camera_center_x_px + config.focal_length_x_px * 0.060 / z
+        aim = target_to_axis_aim(u, config.camera_center_y_px, z, config)
+        self.assertAlmostEqual(aim.yaw_rad, 0.0, places=6)
 
 
 class SharedMotionProfileTests(unittest.TestCase):

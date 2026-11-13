@@ -2,6 +2,7 @@ import math
 import unittest
 from dataclasses import replace
 
+from turret_control import ballistics
 from turret_control.aiming import AimingController, TargetPixel
 from turret_control.competition_geometry import with_competition_geometry
 from turret_control.config import TurretConfig
@@ -46,10 +47,58 @@ class TurretGeometryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "behind the launch exit"):
             target_to_axis_aim(config.camera_center_x_px, config.camera_center_y_px, 0.5, config)
 
-    def test_gravity_and_rotating_exit_cannot_be_combined_silently(self):
-        config = replace(with_competition_geometry(TurretConfig()), compensate_gravity=True)
-        with self.assertRaisesRegex(ValueError, "gravity with a rotating exit offset"):
-            config.validate()
+    def test_gravity_with_rotating_exit_hits_the_target(self):
+        config = replace(with_competition_geometry(TurretConfig(
+            yaw_zero_rad=0.0, yaw_sign=1, pitch_zero_rad=0.0, pitch_sign=1,
+            yaw_min_rad=-1.0, yaw_max_rad=1.0, pitch_min_rad=-1.0, pitch_max_rad=1.0,
+        )), compensate_gravity=True, muzzle_speed_m_s=32.0, launch_angle_ratio=0.942)
+        config.validate()
+        controller = AimingController(config)
+        geometric = AimingController(replace(config, compensate_gravity=False))
+        for v_px in (300.0, 450.0, 600.0):
+            with self.subTest(v=v_px):
+                target = TargetPixel(700.0, v_px, distance_m=5.5)
+                command = controller.update(target)
+                straight = geometric.update(target)
+                self.assertTrue(command.target_reachable, command.blocked_reason)
+                self.assertAlmostEqual(command.geometric_pitch_rad, straight.target_pitch_rad, places=9)
+                self.assertGreater(command.ballistic_correction_rad, 0.0)
+                self.assertAlmostEqual(command.target_pitch_rad,
+                                       straight.target_pitch_rad + command.ballistic_correction_rad,
+                                       places=9)
+                geometry = target_to_axis_aim(700.0, v_px, 5.5, config)
+                point = geometry.target_from_pitch_axis
+                impact = ballistics.rotating_exit_impact_height(
+                    command.target_pitch_rad, math.hypot(point.x, point.z), 32.0, 9.81,
+                    config.pitch_exit_offset_y_m, config.pitch_exit_offset_z_m, 0.942)
+                self.assertAlmostEqual(impact, point.y, places=5)
+
+    def test_rotating_exit_solve_matches_plain_gravity_without_offset(self):
+        for d, h in ((5.0, 1.0), (6.0, 2.5), (3.0, -0.2)):
+            with self.subTest(d=d, h=h):
+                plain = ballistics.gravity_pitch(d, h, 25.0)
+                solved = ballistics.rotating_exit_gravity_pitch(
+                    d, h, 25.0, 9.81, 0.0, 0.0, initial_pitch_rad=math.atan2(h, d))
+                self.assertAlmostEqual(solved, plain, places=7)
+
+    def test_measured_row_misses_are_reproduced_by_the_default_model(self):
+        # 2026-11-13: pitch axis 5.49 m from the board, 0.315 m high; barrel
+        # angles from the dashboard (inclinometer-verified); observed misses.
+        from turret_control import run_board_real as real
+        config = with_competition_geometry(TurretConfig())
+        for hole_height, barrel_deg, miss_m in ((1.20, 10.79, 0.08), (1.80, 16.77, 0.11),
+                                                (2.40, 22.43, 0.15), (2.90, 26.82, 0.20)):
+            with self.subTest(height=hole_height):
+                impact = 0.315 + ballistics.rotating_exit_impact_height(
+                    math.radians(barrel_deg), 5.49, real.DEFAULT_MUZZLE_SPEED_M_S, 9.81,
+                    config.pitch_exit_offset_y_m, config.pitch_exit_offset_z_m,
+                    real.DEFAULT_LAUNCH_ANGLE_RATIO)
+                self.assertAlmostEqual(impact, hole_height - miss_m, delta=0.01)
+
+    def test_unreachable_ballistic_target_is_reported(self):
+        with self.assertRaises(ballistics.OutOfRange):
+            ballistics.rotating_exit_gravity_pitch(
+                60.0, 0.0, 10.0, 9.81, -0.04, 0.17, initial_pitch_rad=0.0)
 
     def test_center_target_has_zero_angles_when_axes_are_coincident(self):
         config = TurretConfig(

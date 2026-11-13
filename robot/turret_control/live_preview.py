@@ -147,9 +147,14 @@ class LivePreviewPublisher:
         fps: float,
         frame_transform: Callable[[np.ndarray], np.ndarray] = lambda f: f,
         jpeg_quality: int = 80,
+        scale: float = 1.0,
     ):
         if fps <= 0:
             raise ValueError("fps must be > 0")
+        if not 0 < scale <= 1:
+            raise ValueError("scale must be in (0, 1]")
+        # Downscale only the published JPEG; overlays are composed at full size.
+        self._scale = float(scale)
         self._grabber = grabber
         self._publish = publish
         self._period = 1.0 / fps
@@ -234,6 +239,9 @@ class LivePreviewPublisher:
                 next_due += self._period
             try:
                 display = self.compose(self._transform(frame))
+                if self._scale != 1.0:
+                    display = cv2.resize(display, None, fx=self._scale, fy=self._scale,
+                                         interpolation=cv2.INTER_AREA)
                 started = time.perf_counter()
                 ok_jpg, encoded = cv2.imencode(
                     ".jpg", display, [cv2.IMWRITE_JPEG_QUALITY, self._quality]

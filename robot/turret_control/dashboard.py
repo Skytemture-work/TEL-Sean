@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import json
 import math
+import socket
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import threading
 import time
 from typing import Any, Dict, Optional
 from urllib.parse import urlsplit
+
+# Kernel send buffer per MJPEG client (bytes); see the /stream handler.
+STREAM_SEND_BUFFER_BYTES = 64 * 1024
 
 
 DASHBOARD_HTML_PATH = Path(__file__).with_name("dashboard.html")
@@ -523,6 +527,11 @@ def build_dashboard_snapshot(
             # pixel bearings or motor encoder coordinates.
             "muzzle_yaw_deg": yaw["target_deg"],
             "muzzle_pitch_deg": pitch["target_deg"],
+            # Barrel elevation pointing straight at the hole (no gravity /
+            # trim) and the ballistic correction added on top of it.
+            "geometric_pitch_deg": _degrees(getattr(command, "geometric_pitch_rad", None)),
+            "ballistic_correction_deg": _degrees(
+                getattr(command, "ballistic_correction_rad", None)),
             "yaw": yaw,
             "pitch": pitch,
         },
@@ -602,6 +611,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
         )
         self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
         self.end_headers()
+        try:
+            # Keep at most ~1-2 frames queued in the kernel.  Over a slow Wi-Fi
+            # link a large (auto-tuned) send buffer holds seconds of stale
+            # frames; with a small one the writer blocks and simply sends the
+            # newest frame next, so the picture stays current (lower FPS
+            # instead of growing delay).
+            self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, STREAM_SEND_BUFFER_BYTES)
+        except (OSError, AttributeError):
+            pass
         try:
             version = -1
             while self.state.running:

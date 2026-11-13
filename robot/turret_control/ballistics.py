@@ -111,6 +111,84 @@ def gravity_pitch(
     return math.atan2(v2 - root, g * d)
 
 
+def rotating_exit_impact_height(
+    pitch_rad: float,
+    horizontal_distance_m: float,
+    muzzle_speed_m_s: float,
+    gravity_m_s2: float,
+    exit_y_m: float,
+    exit_z_m: float,
+    launch_angle_ratio: float = 1.0,
+) -> float:
+    """Height (from the pitch axis) where the ball crosses the target's plane.
+
+    The barrel is at elevation ``pitch_rad``.  At zero elevation the exit sits
+    at ``(exit_y, exit_z)`` (up, forward) from the pitch axis and rotates with
+    the barrel.  The ball leaves the exit at ``launch_angle_ratio * pitch_rad``
+    with ``muzzle_speed_m_s`` and then follows a drag-free parabola.
+    """
+    c, s = math.cos(pitch_rad), math.sin(pitch_rad)
+    exit_forward = exit_z_m * c - exit_y_m * s
+    exit_up = exit_z_m * s + exit_y_m * c
+    run = horizontal_distance_m - exit_forward
+    if run <= 0:
+        raise OutOfRange("target is behind the launch exit")
+    launch = launch_angle_ratio * pitch_rad
+    cos_launch = math.cos(launch)
+    if cos_launch <= 1e-6:
+        raise OutOfRange("launch angle is vertical")
+    v = muzzle_speed_m_s
+    return (exit_up + run * math.tan(launch)
+            - gravity_m_s2 * run * run / (2.0 * v * v * cos_launch * cos_launch))
+
+
+def rotating_exit_gravity_pitch(
+    horizontal_distance_m: float,
+    height_m: float,
+    muzzle_speed_m_s: float,
+    gravity_m_s2: float,
+    exit_y_m: float,
+    exit_z_m: float,
+    initial_pitch_rad: float,
+    launch_angle_ratio: float = 1.0,
+) -> float:
+    """Barrel elevation whose (flat) trajectory passes through the target.
+
+    ``horizontal_distance_m``/``height_m`` are measured from the pitch axis.
+    Starts from ``initial_pitch_rad`` (the straight-line solution) and walks
+    up the rising side of the impact-height curve, which keeps the flat shot.
+    Raises :class:`OutOfRange` when no flat solution exists.
+    """
+    if muzzle_speed_m_s <= 0:
+        raise ValueError("muzzle_speed_m_s must be positive")
+
+    def miss(pitch):
+        return rotating_exit_impact_height(
+            pitch, horizontal_distance_m, muzzle_speed_m_s, gravity_m_s2,
+            exit_y_m, exit_z_m, launch_angle_ratio) - height_m
+
+    pitch = initial_pitch_rad
+    step = 1e-5
+    for _ in range(30):
+        error = miss(pitch)
+        if abs(error) < 1e-7:
+            break
+        slope = (miss(pitch + step) - miss(pitch - step)) / (2.0 * step)
+        if slope <= 1e-6:
+            raise OutOfRange(
+                f"cannot reach {horizontal_distance_m:.2f} m out and {height_m:.2f} m up "
+                f"at {muzzle_speed_m_s:.1f} m/s")
+        correction = error / slope
+        # Never jump more than ~6 degrees per iteration.
+        correction = max(-0.1, min(0.1, correction))
+        pitch -= correction
+    else:
+        raise OutOfRange("ballistic pitch solve did not converge")
+    if not -math.pi / 2 < pitch < math.pi / 2:
+        raise OutOfRange("ballistic pitch solution is out of range")
+    return pitch
+
+
 def solve_aim(
     yaw_rad: float,
     pitch_rad: float,

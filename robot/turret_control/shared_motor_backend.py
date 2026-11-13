@@ -22,6 +22,11 @@ MAX_AIM_SPEED_RAD_S = 1.5
 MAX_AIM_ACCELERATION_RAD_S2 = 3.0
 # The automatic panel controller uses the AGX-verified position/velocity mode.
 # Its Kp/Kd are internal to the motor controller and are not sent by posvel.
+# Vision re-targets below this size (degrees) are ignored: the PnP target
+# jitters ~0.01-0.03 deg frame to frame, and every re-target restarts the
+# motion and resets aim stability.  0.1 deg is ~1 cm at 5.5 m.  (Was 0.02 deg,
+# which kept the 3-stable-frame gate failing for ~5 s after each shot.)
+AIM_RETARGET_DEADBAND_DEG = 0.1
 DEFAULT_AIM_KP = 50.0
 DEFAULT_AIM_KD = 1.5
 DEFAULT_AIM_CONTROL_MODE = "posvel"
@@ -110,7 +115,7 @@ class SharedMotorBackend:
             raise ValueError("雙軸目標必須是有限數字")
         # Suppress tiny frame-to-frame jitter without continually restarting
         # the clearance sequence. Motor angles remain the caller's units.
-        epsilon = math.radians(.02)
+        epsilon = math.radians(AIM_RETARGET_DEADBAND_DEG)
         if self._last_requested is not None and all(
             abs(a - b) <= epsilon for a, b in zip(desired, self._last_requested)
         ):
@@ -136,12 +141,15 @@ class SharedMotorBackend:
         if any(value is None or not math.isfinite(value)
                or abs(value) > SEQUENCE_STOP_SPEED_RAD_S for value in velocities):
             return False
-        epsilon = math.radians(.025)
+        exact = math.radians(.025)
+        # The worker must be on exactly the last requested target; the caller's
+        # current target may differ from it by up to the re-target deadband.
+        deadband = math.radians(AIM_RETARGET_DEADBAND_DEG) + 1e-9
         return (
-            abs(snapshot.yaw_target_rad - yaw_target) <= epsilon
-            and abs(snapshot.target_rad - pitch_target) <= epsilon
-            and abs(self._last_requested[0] - yaw_target) <= epsilon
-            and abs(self._last_requested[1] - pitch_target) <= epsilon
+            abs(snapshot.yaw_target_rad - self._last_requested[0]) <= exact
+            and abs(snapshot.target_rad - self._last_requested[1]) <= exact
+            and abs(self._last_requested[0] - yaw_target) <= deadband
+            and abs(self._last_requested[1] - pitch_target) <= deadband
             and self.get_state(0x03) is not None
             and self.get_state(0x01) is not None
         )

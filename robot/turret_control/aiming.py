@@ -57,6 +57,10 @@ class AimCommand:
     # Distances after transforming the target into the two joint frames.
     yaw_axis_distance_m: Optional[float] = None
     pitch_axis_distance_m: Optional[float] = None
+    # Physical barrel elevation that points the barrel line straight at the
+    # target (no gravity, no trim), and the ballistic correction added on top.
+    geometric_pitch_rad: Optional[float] = None
+    ballistic_correction_rad: Optional[float] = None
     stable: bool = False
     fire_allowed: bool = False
 
@@ -132,6 +136,8 @@ class AimingController:
 
         blocked_reason = None
         geometry_result = None
+        geometric_pitch = None
+        ballistic_correction = None
         if self.config.use_axis_geometry and not self.config.camera_on_turret:
             # A base-fixed camera must use the target's 3-D position.  The
             # virtual screen test disables this branch because its apparent
@@ -171,17 +177,23 @@ class AimingController:
                     yaw_error = wanted_yaw - self.config.yaw_zero_rad
                     pitch_error = wanted_pitch - self.config.pitch_zero_rad
 
+                    geometric_pitch = geometry_result.pitch_rad
                     if self.config.compensate_gravity:
                         horizontal = math.hypot(
                             geometry_result.target_from_pitch_axis.x,
                             geometry_result.target_from_pitch_axis.z,
                         )
-                        pitch_for_projectile = ballistics.gravity_pitch(
+                        pitch_for_projectile = ballistics.rotating_exit_gravity_pitch(
                             horizontal,
                             geometry_result.target_from_pitch_axis.y,
                             self.config.muzzle_speed_m_s,
                             self.config.gravity_m_s2,
+                            geometry_config.pitch_exit_offset_y_m,
+                            geometry_config.pitch_exit_offset_z_m,
+                            initial_pitch_rad=geometric_pitch,
+                            launch_angle_ratio=self.config.launch_angle_ratio,
                         )
+                        ballistic_correction = pitch_for_projectile - geometric_pitch
                         pitch_error = self.config.pitch_sign * pitch_for_projectile
                 except (ValueError, ballistics.OutOfRange) as exc:
                     blocked_reason = str(exc)
@@ -288,6 +300,8 @@ class AimingController:
             pitch_axis_distance_m=(
                 geometry_result.pitch_axis_distance_m if geometry_result is not None else None
             ),
+            geometric_pitch_rad=geometric_pitch,
+            ballistic_correction_rad=ballistic_correction,
             stable=stable,
             # The launcher should still have a separate physical safety gate.
             fire_allowed=stable,

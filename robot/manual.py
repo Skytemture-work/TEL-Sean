@@ -113,7 +113,11 @@ HOME_DIRECTION = Direction.CW
 MOVE_DIRECTION = (
     Direction.CCW if HOME_DIRECTION == Direction.CW else Direction.CW
 )
-HOME_SPEED_RPM = 60           # ID1 無限位回零／推到底（以電流判定到底）；原 40
+# ID1 無限位回零以電流 HOME_CURRENT_MA 判定到底。實測 60 RPM 會讓第三階段
+# 推到底／從底部退回時電流尖峰誤判到底（未推出或未復位就轉格），因此兩者都
+# 維持原本驗證過的 40 RPM，不要再調高。
+HOME_SPEED_RPM = 40           # 往原點回零
+PUSH_END_SPEED_RPM = 40       # 第三階段往推球方向推到底
 HOME_CURRENT_MA = 400
 REVERSE_ANGLE = 0x0400
 
@@ -295,6 +299,8 @@ class VESCDualMotorController:
         self._ser_right = None
         self.error = None
         self._ready_event = threading.Event()
+        # 最近一次讀到的實際轉速 (left_rpm, right_rpm, monotonic 時間)；供發射記錄使用。
+        self.last_rpm = None
 
     def start(self):
         print("[VESC] 啟動控制執行緒，檢查雙馬達遙測；初始保持停轉。", flush=True)
@@ -475,6 +481,11 @@ class VESCDualMotorController:
 
                 left = self._read_runtime_motor(reader_left, "LEFT", self._ser_left)
                 right = self._read_runtime_motor(reader_right, "RIGHT", self._ser_right)
+                self.last_rpm = (
+                    left["erpm"] / VESC_LEFT_POLE_PAIRS,
+                    right["erpm"] / VESC_RIGHT_POLE_PAIRS,
+                    time.monotonic(),
+                )
 
                 speed_value = self._get_speed_value()
                 target_rpm = (
@@ -1068,6 +1079,7 @@ class ManualController:
         self.shooting_speed_rpm = SHOOTING_SPEED_RPM
         self.shooting_acceleration = SHOOTING_ACCELERATION
         self.home_speed_rpm = HOME_SPEED_RPM
+        self.push_end_speed_rpm = PUSH_END_SPEED_RPM
         self.reload_pending = False
         self._shoot_home_encoder = None
         self.shot_error = None
@@ -1129,6 +1141,35 @@ class ManualController:
             if result != SuccessStatus.Success:
                 raise RuntimeError("{}馬達啟用失敗".format(label))
             time.sleep(0.2)
+            # 堵轉保護會一直保留到解除或斷電；保護中所有運動指令都回 RunFail。
+            # 啟動時（尚未下任何運動指令、操作者在場）解除一次並回報。
+            self._clear_stall_protection_at_startup(servo, label)
+
+    @staticmethod
+    def _stall_protected(servo):
+        """True/False = 是否在堵轉保護；None = 讀取失敗。"""
+        reader = getattr(servo, "read_motor_shaft_protection_state", None)
+        if reader is None:
+            return None
+        state = reader()
+        if state is None:
+            return None
+        return getattr(state, "value", state) == 1
+
+    def _clear_stall_protection_at_startup(self, servo, label):
+        protected = self._stall_protected(servo)
+        if protected is None:
+            print("[Manual] {}堵轉保護狀態讀取失敗，略過檢查。".format(label), flush=True)
+            return
+        if not protected:
+            return
+        print("[Manual Warning] {}在堵轉保護中（上次可能卡球或被手動轉動），"
+              "啟動時解除。".format(label), flush=True)
+        servo.release_motor_shaft_locked_protection_state()
+        time.sleep(0.1)
+        if self._stall_protected(servo):
+            raise RuntimeError("{}堵轉保護無法解除，請檢查是否卡住後重新上電".format(label))
+        print("[Manual] {}堵轉保護已解除。".format(label), flush=True)
 
     def check_health(self):
         self.dm_controller.check_health()
@@ -1346,7 +1387,11 @@ class ManualController:
         elif self.shot_stage == 2:
             if not self.reload_pending:
                 self._shoot_home_encoder = None
-                self._go_home(self.shoot_servo, MOVE_DIRECTION, "反向無限位回零")
+                before = self.shoot_servo.read_encoder_value_addition()
+                end = self._go_home(self.shoot_servo, MOVE_DIRECTION, "反向無限位回零",
+                                    speed_rpm=self.push_end_speed_rpm)
+                if isinstance(before, int) and isinstance(end, int):
+                    print("[Manual] 第三階段推到底 Encoder 位移：{}".format(end - before), flush=True)
                 time.sleep(SETTLE_TIME)
                 self._shoot_home_encoder = self._go_home(
                     self.shoot_servo, HOME_DIRECTION, "正向無限位回零"
@@ -1406,14 +1451,15 @@ class ManualController:
             raise RuntimeError("移動後 Encoder 讀取失敗")
         print("[Manual] Encoder 位移：{}".format(after - before))
 
-    def _go_home(self, servo, direction, label):
+    def _go_home(self, servo, direction, label, speed_rpm=None):
         self._shoot_home_encoder = None
-        print("[Manual] 開始{}".format(label))
+        speed = int(self.home_speed_rpm if speed_rpm is None else speed_rpm)
+        print("[Manual] 開始{}（{} RPM）".format(label, speed))
         home_data = [
             0,
             direction.value,
-            (self.home_speed_rpm >> 8) & 0x0F,
-            self.home_speed_rpm & 0xFF,
+            (speed >> 8) & 0x0F,
+            speed & 0xFF,
             0,
             1,  # noLimit 模式
         ]
@@ -1548,6 +1594,12 @@ class ManualController:
         print("[Manual] 彈藥倉移動指令回傳：", result)
         if result is None:
             raise RuntimeError("彈藥倉移動指令沒有有效回覆")
+        if getattr(result, "name", None) == "RunFail":
+            if self._stall_protected(self.ammo_servo):
+                raise RuntimeError(
+                    "彈藥倉驅動器在堵轉保護中，拒絕轉格（可能卡球，或彈藥倉被手動轉動過）；"
+                    "請檢查彈藥倉後重新啟動程式（啟動時會解除保護）")
+            raise RuntimeError("彈藥倉驅動器拒絕轉格指令（RunFail）")
         print("[Manual] 彈藥倉驅動器回覆狀態：{}".format(result), flush=True)
 
         start = time.monotonic()
