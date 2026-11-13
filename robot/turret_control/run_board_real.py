@@ -144,11 +144,11 @@ def main(
     parser.add_argument("--port", default=None, help="DM USB-to-CAN 序列埠；預設依裝置識別碼自動偵測")
     parser.add_argument(
         "--aim-speed", type=float, default=DEFAULT_AIM_SPEED_RAD_S,
-        help="雙軸自動瞄準的平滑速度上限 rad/s（預設 0.09）",
+        help="雙軸自動瞄準的平滑速度上限 rad/s（預設 0.35）",
     )
     parser.add_argument(
         "--aim-acceleration", type=float, default=DEFAULT_AIM_ACCELERATION_RAD_S2,
-        help="雙軸自動瞄準的平滑加速度上限 rad/s²（預設 0.075）",
+        help="雙軸自動瞄準的平滑加速度上限 rad/s²（預設 0.28）",
     )
     camera_mode = parser.add_mutually_exclusive_group()
     camera_mode.add_argument("--zed-uvc", action="store_true", help="使用 ZED UVC 原始影像，不提供立體深度")
