@@ -17,8 +17,8 @@ unsigned long lastIbusTime = 0;
 // =====================
 // Xavier UART (Serial2)
 // =====================
-#define XAVIER_RX 1
-#define XAVIER_TX 2
+#define XAVIER_RX 44
+#define XAVIER_TX 43
 
 HardwareSerial xavierSerial(2);
 
@@ -26,30 +26,28 @@ HardwareSerial xavierSerial(2);
 
 // =====================
 // GB42 四輪腳位
+// ESP32-S3 DevKitC-1
 // =====================
+
 // Front Left
-#define FL_PWM 4
-#define FL_DIR 5
+#define FL_PWM    4
+#define FL_DIR    5
+#define FL_BRAKE  6
 
 // Front Right
-#define FR_PWM 6
-#define FR_DIR 7
+#define FR_PWM    7
+#define FR_DIR    15
+#define FR_BRAKE  16
 
 // Rear Left
-#define RL_PWM 15
-#define RL_DIR 16
+#define RL_PWM    17
+#define RL_DIR    18
+#define RL_BRAKE  8
 
 // Rear Right
-#define RR_PWM 17
-#define RR_DIR 18
-
-// =====================
-// GB42 四輪煞車腳位
-// =====================
-#define FL_BRAKE 9
-#define FR_BRAKE 10
-#define RL_BRAKE 11
-#define RR_BRAKE 12
+#define RR_PWM    9
+#define RR_DIR    10
+#define RR_BRAKE  11
 
 // 暫定 HIGH 啟動煞車、LOW 解除煞車
 // 請依馬達驅動器規格確認有效電位
@@ -344,7 +342,8 @@ void loop() {
   int ch3 = applyDeadzone(safeRead(2));
   int ch4 = applyDeadzone(safeRead(3));
 
-  // Switch
+  // 旋鈕與開關
+  int vrA = safeRead(4);  // VRA（CH5）
   int vrB = safeRead(5);
   int swA = toSwitch(safeRead(6));
   int swB = safeRead(7);
@@ -434,7 +433,7 @@ void loop() {
 
   // ==========================================
   // 4. 發送狀態封包給 Xavier
-  // E,MODE,VX,VY,WZ,YAW,PITCH,FIRE,SPEED\n
+  // E,MODE,VX,VY,WZ,YAW,PITCH,FIRE,SPEED,RELOAD,AUTO_START\n
   // ==========================================
   int send_vx =
     (currentMode == 'M') ? forward : auto_vx;
@@ -451,13 +450,16 @@ void loop() {
   int send_pitch =
     (currentMode == 'M') ? manual_pitch : auto_pitch;
 
-  int send_fire =
-    (fire_allow == 1)
-      ? ((currentMode == 'M') ? 0 : auto_fire)
-      : 0;
+  int send_fire = fire_allow;
 
   int send_speed =
     (currentMode == 'M') ? speed_val : auto_speed;
+
+  // SWC（CH9）：Reload 開關
+  int send_reload = (swC > 1500) ? 1 : 0;
+
+  // VRA 轉到高端時，自動模式才送出啟動訊號。
+  int send_auto_start = (currentMode == 'A' && vrA >= 1800) ? 1 : 0;
 
   String txPacket =
     "E," + String(currentMode) + "," +
@@ -467,7 +469,9 @@ void loop() {
     String(send_yaw) + "," +
     String(send_pitch) + "," +
     String(send_fire) + "," +
-    String(send_speed) + "\n";
+    String(send_speed) + "," +
+    String(send_reload) + "," +
+    String(send_auto_start) + "\n";
 
   xavierSerial.print(txPacket);
 
@@ -494,22 +498,25 @@ void loop() {
 
   delay(20);
 
-  Serial.print("\tSWA:");
-  Serial.print(swA);
+  // Serial.print("\tSWA:");
+  // Serial.print(swA);
 
-  Serial.print("\tswC:");
-  Serial.print(swC);
+  // Serial.print("\tswC:");
+  // Serial.print(swC);
 
-  Serial.print("\tswB:");
-  Serial.print(swB);
+  // Serial.print("\tswB:");
+  // Serial.print(swB);
 
-  Serial.print("\tswD:");
-  Serial.print(swD);
+  // Serial.print("\tswD:");
+  // Serial.print(swD);
 
-  Serial.print("\tvrB:");
-  Serial.println(vrB);
+  // Serial.print("\tvrB:");
+  // Serial.print(vrB);
 
-  delay(20);
+  // Serial.print("\tSWC Reload:");
+  // Serial.println(send_reload);
+
+  // delay(20);
 }
 
 // =====================
