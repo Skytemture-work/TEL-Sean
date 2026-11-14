@@ -146,6 +146,9 @@ class ManualDMStartupTests(unittest.TestCase):
             return clock[0]
 
         motors = Mock()
+        # 無位置限位／工作空間：回位目標不受限幅。
+        motors._position_limits = {}
+        motors._workspace = None
         positions = {3: 0.5, 1: -0.52}
 
         def send(targets):

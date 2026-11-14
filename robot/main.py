@@ -39,10 +39,11 @@ def main():
 
             if packet is not None:
                 packet_mode = packet.get("mode", "?")
-                packet_speed = normalize_vrb_speed(packet.get("speed", 0))
+                raw_speed = packet.get("speed")
+                packet_speed = normalize_vrb_speed(raw_speed) if raw_speed is not None else 0
                 vesc_target = (
                     "STOP"
-                    if packet_mode != "M" or packet_speed <= 0
+                    if packet_mode != "M" or raw_speed is None
                     else "{} RPM".format(
                         int(VESC_MIN_RPM + packet_speed * VESC_RPM_PER_SPEED_UNIT)
                     )
@@ -59,7 +60,7 @@ def main():
                         packet.get("pitch", 50),
                         packet.get("fire", 0),
                         packet.get("speed", 0),
-                        packet["reload"],
+                        packet.get("reload"),
                         packet_speed,
                         vesc_target,
                     ),
@@ -71,19 +72,22 @@ def main():
 
                 if new_mode != current_mode:
                     print(
-                        "\n[Mode Switch] 切換至：{}".format(
+                        "\n[Mode Switch] 正在切換至：{}".format(
                             "自動模式" if new_mode == "A" else "手動模式"
                         )
                     )
-                    current_mode = new_mode
-                    is_auto = current_mode == "A"
-                    vision.set_active(is_auto)
-                    lidar.set_active(is_auto)
+                    if new_mode == "M":
+                        vision.set_active(False)
+                        lidar.set_active(False)
 
-                    # 切換模式時清除手動按鈕邊緣狀態，避免按住按鈕時誤觸發
+                    # 手動切自動時，等待 ID1 回零及 DM 回位、失能完成。
                     manual.on_mode_change(
-                        current_mode, fire=packet.get("fire", 0), reload=packet["reload"]
+                        new_mode, fire=packet.get("fire", 0), reload=packet.get("reload")
                     )
+                    if new_mode == "A":
+                        vision.set_active(True)
+                        lidar.set_active(True)
+                    current_mode = new_mode
 
                 if current_mode == "M":
                     # 手動模式：使用遙控器 yaw/pitch 控制砲台方向，

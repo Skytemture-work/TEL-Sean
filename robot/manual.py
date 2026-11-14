@@ -106,7 +106,7 @@ AMMO_MOTOR_CAN_ID = 2
 SHOOTING_MOTOR_CAN_ID = 1
 
 AMMO_SLOT_PULSES = 6670
-RELOAD_SLOTS = 3
+RELOAD_SLOTS = 2
 RELOAD_PULSES = 6670 * RELOAD_SLOTS
 AMMO_SPEED_RPM = 2000
 SHOOTING_SPEED_RPM = 200      # 推球 ID1（手動與自動共用）；原 100
@@ -336,8 +336,7 @@ class VESCDualMotorController:
     def set_speed(self, speed_value):
         if speed_value is not None:
             speed_value = max(0, min(100, int(speed_value)))
-            # Zero throttle is a stop command. Mapping it to VESC_MIN_RPM made
-            # an idle/manual packet unexpectedly spin both flywheels.
+            # 手動速度 0 對應 VESC_MIN_RPM；None 才代表停止。
         with self._lock:
             previous = self._speed_value
             self._speed_value = speed_value
@@ -392,6 +391,8 @@ class VESCDualMotorController:
             try:
                 return self._read_motor(reader)
             except TimeoutError as exc:
+                if self._stop_event.is_set():
+                    return None
                 last_error = exc
                 if attempt < VESC_RUNTIME_READ_ATTEMPTS:
                     print(
@@ -430,19 +431,19 @@ class VESCDualMotorController:
         raise RuntimeError("{} VESC 啟動遙測重試耗盡：{}".format(label, last_error))
 
     def _stop_motors(self):
-        for ser in (self._ser_left, self._ser_right):
-            if ser is not None and ser.is_open:
-                try:
-                    vesc_send_set_rpm(ser, 0)
-                except Exception:
-                    pass
-        time.sleep(0.05)
-        for ser in (self._ser_left, self._ser_right):
-            if ser is not None and ser.is_open:
-                try:
-                    vesc_send_set_rpm(ser, 0)
-                except Exception:
-                    pass
+        failures = {}
+        stopped = set()
+        for attempt in range(2):
+            if attempt:
+                time.sleep(0.05)
+            for label, ser in (("LEFT", self._ser_left), ("RIGHT", self._ser_right)):
+                if ser is not None and ser.is_open:
+                    try:
+                        vesc_send_set_rpm(ser, 0)
+                        stopped.add(label)
+                    except Exception as exc:
+                        failures[label] = exc
+        return {label: exc for label, exc in failures.items() if label not in stopped}
 
     @staticmethod
     def _write_rpm(label, ser, erpm):
@@ -498,7 +499,11 @@ class VESCDualMotorController:
                 last_time = now
 
                 left = self._read_runtime_motor(reader_left, "LEFT", self._ser_left)
+                if self._stop_event.is_set():
+                    break
                 right = self._read_runtime_motor(reader_right, "RIGHT", self._ser_right)
+                if self._stop_event.is_set():
+                    break
                 self.last_rpm = (
                     left["erpm"] / VESC_LEFT_POLE_PAIRS,
                     right["erpm"] / VESC_RIGHT_POLE_PAIRS,
@@ -568,7 +573,9 @@ class VESCDualMotorController:
             print("[VESC ERROR] 停止雙馬達控制：{}".format(exc))
         finally:
             self._ready_event.set()
-            self._stop_motors()
+            stop_failures = self._stop_motors()
+            if stop_failures and self.error is None:
+                self.error = "VESC 停止命令寫入失敗：{}".format(stop_failures)
             for ser in (self._ser_left, self._ser_right):
                 if ser is not None and ser.is_open:
                     try:
@@ -582,8 +589,8 @@ class VESCDualMotorController:
         self._stop_event.set()
         if self._thread is not None:
             self._thread.join(timeout=timeout)
-        # 若執行緒仍在 telemetry timeout，盡可能送出停止命令。
-        self._stop_motors()
+            if self._thread.is_alive():
+                raise TimeoutError("VESC 遙測執行緒關閉逾時")
 
 
 def enable_motor_compat(servo, enabled=True):
@@ -639,6 +646,7 @@ def return_dm_before_shutdown(motors):
     from turret_control.run_manual_move import DEFAULT_STARTUP_POSE, read_enabled_start
     from turret_control.pitch import load_pitch_calibration, load_yaw_calibration
     from turret_control.trajectory import smoothstep_sample
+    from turret_control.limits import clamp_motor_position, clamp_workspace_target
 
     cal = {3: load_yaw_calibration(DEFAULT_STARTUP_POSE),
            1: load_pitch_calibration(DEFAULT_STARTUP_POSE)}
@@ -646,6 +654,22 @@ def return_dm_before_shutdown(motors):
     destination = {3: cal[3].motor_from_muzzle(0.0),
                    1: cal[1].motor_from_muzzle(math.radians(shutdown_pitch_deg))}
     start = read_enabled_start(motors)
+
+    # 與 DM 後端使用同一份實機工作空間及馬達位置限制。
+    for motor_id in (3, 1):
+        limits = motors._position_limits.get(motor_id)
+        if limits is not None:
+            destination[motor_id], _ = clamp_motor_position(destination[motor_id], limits)
+    workspace = getattr(motors, "_workspace", None)
+    if workspace is not None:
+        (destination[3], destination[1]), _ = clamp_workspace_target(
+            workspace, start[3], start[1], destination[3], destination[1]
+        )
+    park_yaw_deg = math.degrees(cal[3].muzzle_from_motor(destination[3]))
+    park_pitch_deg = math.degrees(cal[1].muzzle_from_motor(destination[1]))
+    if abs(park_yaw_deg) > DM_POSITION_TOLERANCE_DEG:
+        raise RuntimeError(f"DM 工作空間無法回到 yaw 0°，限幅後目標為 {park_yaw_deg:+.2f}°")
+
     speed = DM_STARTUP_TEST_SPEED_RAD_S
     duration = max(smoothstep_duration(max(abs(destination[i] - start[i]) for i in (3, 1))), 1.0)
     motors.kp = DM_STARTUP_TEST_KP
@@ -656,7 +680,11 @@ def return_dm_before_shutdown(motors):
     began = time.monotonic()
     settled = None
     next_status = began
-    print(f"[Manual DM] 關閉前回位 yaw=0° pitch={shutdown_pitch_deg:g}°，軌跡約 {duration:.1f}s。", flush=True)
+    print(
+        f"[Manual DM] 回位目標 yaw={park_yaw_deg:+.2f}° pitch={park_pitch_deg:+.2f}°"
+        f"（原始 pitch={shutdown_pitch_deg:g}°），軌跡約 {duration:.1f}s。",
+        flush=True,
+    )
     while True:
         now = time.monotonic()
         elapsed = now - began
@@ -682,6 +710,9 @@ def return_dm_before_shutdown(motors):
                 f"{name}={math.degrees(cal[i].muzzle_from_motor(states[i].position_rad)):+.1f}°"
                 for i, name in ((3, "yaw"), (1, "pitch"))), flush=True)
             next_status = now + 1.0
+        arrived = arrived and abs(
+            math.degrees(cal[3].muzzle_from_motor(states[3].position_rad))
+        ) <= DM_POSITION_TOLERANCE_DEG
         if arrived:
             if settled is None:
                 settled = now
@@ -1067,6 +1098,7 @@ class ManualController:
             run_dm_startup_test()
             raise SystemExit(0)
         self.uart = uart
+        self._log_status = log_status
         self._owns_dm_controller = dm_controller is None
         self.dm_controller = (
             DMStartupController(log_status=log_status)
@@ -1193,7 +1225,8 @@ class ManualController:
 
     def check_health(self):
         self.dm_controller.check_health()
-        self.vesc_controller.check_health()
+        if self.current_mode == "M":
+            self.vesc_controller.check_health()
 
     @property
     def dm_yaw_deg(self):
@@ -1204,27 +1237,66 @@ class ManualController:
         return self.dm_controller.pitch_deg
 
     def on_mode_change(self, mode, fire=None, reload=None):
-        self.current_mode = mode
-        # 記住切換當下的按鈕狀態，避免切入手動時誤觸發。
-        self.last_fire = 1 if fire else 0
-        self.last_reload = reload
-        if mode != "M":
-            # 切到自動模式時停止手動射擊雙 VESC 馬達。
+        # 排空舊的馬達工作期間拒絕新的 FIRE / RELOAD。
+        with self.lock:
+            previous_mode = self.current_mode
+            self.last_fire = 1 if fire else 0
+            self.last_reload = reload
+            if mode == previous_mode:
+                return
+            if previous_mode == "transition":
+                raise RuntimeError("上一個模式切換尚未完成")
+            if mode == "A" and not self._owns_dm_controller:
+                raise RuntimeError("共享 DM 的回位與釋放須由建立該控制器的程式處理")
+            self.current_mode = "transition"
+            shot_thread = self._shot_thread
+            reload_thread = self.reload_thread
+
+        if mode == "A":
             self.last_speed = 0
-            if getattr(self, "vesc_controller", None) is not None:
-                self.vesc_controller.set_speed(None)
-            # 切換時透過既有 UART 協定送出中立方向值。
+            self.vesc_controller.close()
+            self.vesc_controller.check_health()
+            for worker in (shot_thread, reload_thread):
+                if worker is not None:
+                    worker.join()
+
+            try:
+                self._go_home(self.shoot_servo, HOME_DIRECTION, "切換自動前 ID1 正向無限位回零")
+            except Exception:
+                self._emergency_stop(self.shoot_servo, "切換自動前 ID1 回零失敗")
+                raise
+
+            self._shoot_home_encoder = None
+            self.reload_pending = False
+            self.shot_stage = 0
+            self.dm_controller.close()
+            self.dm_controller.check_health()
             self._send_turret_command(50, 50, 0, 0, mode="A")
+        elif mode == "M":
+            self.vesc_controller = VESCDualMotorController()
+            self.vesc_controller.start()
+            if self._owns_dm_controller:
+                self.dm_controller = DMStartupController(log_status=self._log_status)
+                self.dm_controller.start()
+
+        with self.lock:
+            self.current_mode = mode
 
     def handle_packet(self, packet):
         """處理一筆 ESP32 遙控器封包。"""
         self.last_yaw = self._clamp(packet.get("yaw", 50), 0, 100)
         self.last_pitch = self._clamp(packet.get("pitch", 50), 0, 100)
-        raw_vrb = packet.get("speed", 0)
-        self.last_speed = normalize_vrb_speed(raw_vrb)
-        self.vesc_controller.set_speed(self.last_speed)
+        raw_vrb = packet.get("speed")
+        self.last_speed = normalize_vrb_speed(raw_vrb) if raw_vrb is not None else 0
+        packet_mode = packet.get("mode", self.current_mode)
+        speed_command = (
+            self.last_speed
+            if packet_mode == "M" and self.current_mode != "transition" and raw_vrb is not None
+            else None
+        )
+        self.vesc_controller.set_speed(speed_command)
         vesc_target = (
-            "STOP" if self.last_speed == 0
+            "STOP" if speed_command is None
             else "{} RPM".format(
                 int(VESC_MIN_RPM + self.last_speed * VESC_RPM_PER_SPEED_UNIT)
             )
@@ -1245,7 +1317,6 @@ class ManualController:
         self.last_vy = self._clamp(packet.get("vy", 0), -100, 100)
         self.last_wz = self._clamp(packet.get("wz", 0), -100, 100)
 
-        packet_mode = packet.get("mode", self.current_mode)
         if packet_mode != self.current_mode:
             self.on_mode_change(
                 packet_mode, fire=packet.get("fire", 0), reload=packet.get("reload")
@@ -1282,17 +1353,14 @@ class ManualController:
             self.busy = True
             self._shot_cancel.clear()
             self.shot_request_seq += 1
-
-        worker = threading.Thread(target=self._shot_worker, daemon=True)
-        with self.lock:
+            worker = threading.Thread(target=self._shot_worker, daemon=True)
             self._shot_thread = worker
-        try:
-            worker.start()
-        except RuntimeError:
-            with self.lock:
+            try:
+                worker.start()
+            except RuntimeError:
                 self.busy = False
                 self._shot_thread = None
-            raise
+                raise
         return True
 
     def request_reload(self):
