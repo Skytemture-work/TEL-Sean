@@ -41,8 +41,8 @@ class ExpectedPixelTests(unittest.TestCase):
                                             boresight_yaw_rad=0.5 * DEG, boresight_pitch_rad=0.5 * DEG)
         base = expected_hole_pixel(INTRINSICS, SETTINGS, 5.0, 0.0)
         shifted = expected_hole_pixel(INTRINSICS, settings, 5.0, 0.0)
-        self.assertGreater(shifted[0], base[0])  # camera axis right of barrel
-        self.assertLess(shifted[1], base[1])     # camera axis above barrel
+        self.assertGreater(shifted[0], base[0])  # barrel points right in the image
+        self.assertLess(shifted[1], base[1])     # barrel points up in the image
 
 
 class AimErrorTests(unittest.TestCase):
@@ -72,6 +72,24 @@ class LocateHoleTests(unittest.TestCase):
         self.assertIsNone(locate_hole(self.plan, [_hole(200.0, 200.0, size=10.0)], "H22"))
         self.assertIsNone(locate_hole(self.plan, [_hole(200.0, 200.0)], "H99"))
         self.assertIsNone(locate_hole(None, [_hole(200.0, 200.0)], "H22"))
+
+
+class BoresightCalibrationTests(unittest.TestCase):
+    def test_calibrating_with_the_mean_error_zeroes_the_error(self):
+        # Simulate a mount whose real error is the calibrated offset.
+        truth = MuzzleCorrectionSettings(offset_x_m=-0.0665, offset_y_m=0.060,
+                                         boresight_yaw_rad=-0.50 * DEG,
+                                         boresight_pitch_rad=-2.83 * DEG)
+        measured = expected_hole_pixel(INTRINSICS, truth, 6.39, 2.79 * DEG)
+        uncalibrated = expected_hole_pixel(INTRINSICS, SETTINGS, 6.39, 2.79 * DEG)
+        yaw, pitch = aim_error_rad(INTRINSICS, uncalibrated, measured)
+        self.assertAlmostEqual(math.degrees(yaw), -0.50, delta=0.02)
+        self.assertAlmostEqual(math.degrees(pitch), -2.83, delta=0.05)
+        calibrated = MuzzleCorrectionSettings(offset_x_m=-0.0665, offset_y_m=0.060,
+                                              boresight_yaw_rad=yaw, boresight_pitch_rad=pitch)
+        yaw2, pitch2 = aim_error_rad(
+            INTRINSICS, expected_hole_pixel(INTRINSICS, calibrated, 6.39, 2.79 * DEG), measured)
+        self.assertLess(math.degrees(math.hypot(yaw2, pitch2)), 0.02)
 
 
 class CorrectorTests(unittest.TestCase):

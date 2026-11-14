@@ -166,10 +166,15 @@ class TurretConfig:
     muzzle_barrel_offset_y_m: float = 0.060
     # Range used for the parallax shift until a target distance is known.
     muzzle_fallback_distance_m: float = 5.0
-    # Measured camera-vs-barrel misalignment (deg, + = camera axis right of /
-    # above the barrel).  0 = assumed parallel until shot data says otherwise.
-    muzzle_boresight_yaw_deg: float = 0.0
-    muzzle_boresight_pitch_deg: float = 0.0
+    # Where the barrel really points in the muzzle image, relative to the
+    # parallel-axis model (deg, + = right / up).  It equals the mean
+    # muzzle_error_*_deg of shots that hit.  Calibrated 2026-11-14 from 36
+    # measured shots on H01-H06 (all 9 H06 hits): the error stayed constant
+    # while the ballistic correction varied 2.19-2.81 deg, so it is the camera
+    # mount (tilted ~2.8 deg up), not the ballistic model.  Residual median
+    # 0.11 deg, 90 % within 0.20 deg.
+    muzzle_boresight_yaw_deg: float = -0.50
+    muzzle_boresight_pitch_deg: float = -2.83
 
     # Live metric pose (PnP) of the 300 x 340 cm target board.  The pose is
     # solved every frame, so moving the robot changes the projected hole

@@ -8,8 +8,9 @@ correctly, the hole appears at
   ``muzzle_camera.barrel_aim_pixel``),
 * lowered by the barrel's deliberate elevation above the line of sight
   (ballistic correction + any configured per-hole pitch trim),
-* shifted by the measured camera-vs-barrel misalignment (boresight offsets,
-  0 until calibrated -- the axes are assumed parallel).
+* shifted by the measured camera-vs-barrel misalignment (boresight offsets:
+  where the barrel points in the image relative to the parallel-axis model,
+  + = right / up; equal to the mean measured error of shots that hit).
 
 The difference between that expected pixel and the detected hole centre is
 the remaining aim error.  Modes:
