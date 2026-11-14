@@ -16,14 +16,14 @@ from manual import (
 )
 
 
-VISION_WARMUP_SECONDS = 3.0
 AUTO_STATUS_INTERVAL_SECONDS = 1.0
-POSITIVE_VY_IS_LEFT = True
 AUTO_TARGET_DISTANCE_M = 2.60
 AUTO_FORWARD_VX = 40
-VISION_CENTER_VY = 5
-VISION_LOST_TIMEOUT_SECONDS = 3.0
 OCCLUSION_STRAFE_VY = 5
+MAX_STRAFE_SECONDS = 1.0
+VISION_WAIT_SECONDS = 10.0
+NORMAL_STRAFE_DURATION_SCALE = 1.5
+OCCLUSION_BRAKE_SECONDS = 0.15
 
 
 AUTO_FIRE_WEB_PORT = 8765
@@ -78,18 +78,17 @@ def main():
         current_mode = "M"
         awaiting_phase = False
         last_auto_reload = None
-        vision_ready_at = 0.0
         next_auto_status_at = 0.0
         last_received_mode = None
         auto_complete = False
         auto_started = False
-        center_only = False
-        vision_detected_once = False
-        last_target_side = 0
-        occlusion_strafe_side = 0
-        vision_lost_since = None
-        held_vy = 0
-        vy_hold_until = 0.0
+        locked_vy = None
+        vy_recorded_before_release = False
+        strafe_until = None
+        vision_wait_until = None
+        positioning_moved = False
+        brake_until = None
+        avoid_until = None
         print("[System] 已啟動，預設手動模式，等待 ESP32 遙控器封包...")
 
         while True:
@@ -142,13 +141,13 @@ def main():
                     auto_complete = False
                     auto_started = False
                     awaiting_phase = False
-                    center_only = False
-                    vision_detected_once = False
-                    last_target_side = 0
-                    occlusion_strafe_side = 0
-                    vision_lost_since = None
-                    held_vy = 0
-                    vy_hold_until = 0.0
+                    locked_vy = None
+                    vy_recorded_before_release = False
+                    strafe_until = None
+                    vision_wait_until = None
+                    positioning_moved = False
+                    brake_until = None
+                    avoid_until = None
                     if new_mode == "M":
                         try:
                             stop_aim_process(aim_process)
@@ -177,8 +176,7 @@ def main():
                         vision = VisionTracker()
                         vision.start()
                         vision.set_active(True)
-                        vision_ready_at = time.monotonic() + VISION_WARMUP_SECONDS
-                        print(f"[Vision] 相機與模型初始化等待 {VISION_WARMUP_SECONDS:g} 秒", flush=True)
+                        print("[Vision] 正在準備相機與模型", flush=True)
                         lidar.set_active(True)
                         next_auto_status_at = 0.0
                     current_mode = new_mode
@@ -194,24 +192,46 @@ def main():
             else:
                 uart.report_if_silent()
 
-            if current_mode == "A" and not auto_started:
-                # 僅使用暖機完成後讀到的 A 模式封包。
-                if (
-                    time.monotonic() >= vision_ready_at
-                    and packet is not None
-                    and packet.get("mode") == "A"
-                    and packet.get("auto_start", 0) > 0
-                ):
-                    auto_started = True
-                    print("[Auto Drive] 收到 VRA 啟動，開始自動定位", flush=True)
-                else:
+            if current_mode == "A" and not auto_complete:
+                now = time.monotonic()
+                if packet is not None and packet.get("mode") == "A":
+                    swa_enabled = packet.get("auto_start") == 1
+                    if not swa_enabled:
+                        if auto_started:
+                            print("[Auto Drive] SWA 關閉，暫停定位", flush=True)
+                            locked_vy = None
+                        auto_started = False
+                        vy_recorded_before_release = False
+                        strafe_until = None
+                        vision_wait_until = None
+                        positioning_moved = False
+                        brake_until = None
+                        avoid_until = None
+                    elif not auto_started:
+                        auto_started = True
+                        vy_recorded_before_release = locked_vy is not None
+                        next_auto_status_at = 0.0
+                        print(
+                            f"[Auto Drive] SWA 已放行，開始自動定位，Vision vy={locked_vy}",
+                            flush=True,
+                        )
+
+                if not auto_started:
+                    (_, preview_vy, _), _, detected = vision.get_vision_data()
+                    if detected:
+                        locked_vy = preview_vy
                     uart.send_packet(
                         mode="A", vx=0, vy=0, wz=0, yaw=50, pitch=50, fire=0, speed=0
                     )
-                    now = time.monotonic()
-                    if now >= vision_ready_at and now >= next_auto_status_at:
+                    if now >= next_auto_status_at:
                         next_auto_status_at = now + AUTO_STATUS_INTERVAL_SECONDS
-                        print("[Auto Drive] 相機暖機完成，等待 VRA 啟動", flush=True)
+                        if locked_vy is None:
+                            print("[Auto Drive] 等待 auto_start=1", flush=True)
+                        else:
+                            print(
+                                f"[Auto Drive] 等待 auto_start=1｜放行前已偵測到靶面，保留 vy={locked_vy}",
+                                flush=True,
+                            )
                     time.sleep(0.02)
                     continue
 
@@ -256,98 +276,92 @@ def main():
             if current_mode == "A" and not auto_complete:
                 # 自動模式維持原有視覺追蹤 + LiDAR 避障流程
                 now = time.monotonic()
-                vision_warming_up = now < vision_ready_at
                 fresh_scan, front_distance_m = lidar.get_front_obstacle()
                 distance_text = (
                     "無有效距離" if front_distance_m is None
                     else f"前方 {front_distance_m * 100:.1f} cm"
                 )
 
-                raw_vx, raw_vy, raw_wz = 0, 0, 0
                 yaw, pitch = 50, 50
-                detected = False
-                if not vision_warming_up:
-                    (raw_vx, raw_vy, raw_wz), (yaw, pitch), detected = (
-                        vision.get_vision_data()
-                    )
-                if not detected:
-                    yaw, pitch = 50, 50
-
-                if not vision_warming_up:
-                    if vision_lost_since is not None and (
-                        now - vision_lost_since >= VISION_LOST_TIMEOUT_SECONDS
-                    ):
-                        center_only = True
-                    if detected:
-                        vision_lost_since = None
-                    elif vision_lost_since is None:
-                        vision_lost_since = now
-
-                vision_detected_once = vision_detected_once or detected
-                centered = detected and abs(raw_vy) < VISION_CENTER_VY
-                if detected and not center_only:
-                    last_target_side = int(raw_vy > 0) - int(raw_vy < 0)
-
                 final_vx, final_vy, final_wz = 0, 0, 0
                 fire_cmd, fire_speed = 0, 0
-
-                lidar_allows_motion = (
-                    fresh_scan and front_distance_m is not None
-                    and front_distance_m > lidar.safe_dist_m
-                )
-                if vision_warming_up or not lidar_allows_motion:
-                    held_vy = 0
-                    vy_hold_until = 0.0
-                elif detected:
-                    held_vy = 0 if centered else raw_vy
-                    # 等差縮放：|vy|=21 時達到 2 秒上限。
-                    hold_seconds = min(2.0, (abs(raw_vy) + 3) / 12.0)
-                    vy_hold_until = now + hold_seconds if held_vy else 0.0
-                holding_vy = not detected and held_vy != 0 and now < vy_hold_until
-
                 arrived = False
-                if not fresh_scan:
+
+                valid_distance = fresh_scan and front_distance_m is not None
+                blocked = valid_distance and front_distance_m <= lidar.safe_dist_m
+                auto_complete = False
+                completion_reason = "已抵達目標距離並完成橫移"
+
+                if blocked and positioning_moved and brake_until is None:
+                    brake_until = now + OCCLUSION_BRAKE_SECONDS
+                    print("[Auto Drive] 移動中遇到遮擋，緊急停止", flush=True)
+
+                if brake_until is not None:
+                    lidar_status = "遮擋後緊急停止"
+                    if not vy_recorded_before_release:
+                        if now >= brake_until:
+                            auto_complete = True
+                            completion_reason = "遮擋後停止，放行前未記錄 vy，跳過橫移"
+                    elif not valid_distance:
+                        avoid_until = None
+                    elif now >= brake_until:
+                        if avoid_until is not None and now >= avoid_until:
+                            auto_complete = True
+                            completion_reason = "遮擋後短距離橫移完成"
+                        else:
+                            if avoid_until is None:
+                                avoid_until = now + MAX_STRAFE_SECONDS
+                            final_vy = -OCCLUSION_STRAFE_VY if (locked_vy or 0) < 0 else OCCLUSION_STRAFE_VY
+                            lidar_status = "遮擋後短距離橫移"
+                elif (
+                    vision_wait_until is not None
+                    and locked_vy is None
+                    and now >= vision_wait_until
+                ):
+                    auto_complete = True
+                    completion_reason = "LiDAR 已到位，等待 Vision 10 秒逾時，定位完成"
+                elif not fresh_scan:
                     lidar_status = "等待有效前方掃描"
                 elif front_distance_m is None:
                     lidar_status = "偵測範圍內無前方回波"
-                elif front_distance_m <= lidar.safe_dist_m:
-                    lidar_status = "偵測到障礙，停止移動"
+                elif blocked:
+                    lidar_status = "起步前有障礙，等待前方清空"
                 else:
-                    arrived = front_distance_m < AUTO_TARGET_DISTANCE_M
-                    lidar_status = (
-                        "抵達目標距離" if arrived else "尚未抵達目標距離"
+                    arrived = (
+                        vision_wait_until is not None
+                        or front_distance_m < AUTO_TARGET_DISTANCE_M
                     )
-                    if not vision_warming_up:
-                        final_vx = 0 if arrived or center_only else AUTO_FORWARD_VX
+                    if arrived and locked_vy is None:
+                        if vision_wait_until is None:
+                            vision_wait_until = now + VISION_WAIT_SECONDS
+                            next_auto_status_at = 0.0
+                        (_, raw_vy, _), _, detected = vision.get_vision_data()
                         if detected:
-                            final_vy = 0 if centered else raw_vy
-                            final_wz = 0 if center_only else raw_wz
-                        elif holding_vy:
-                            final_vy = held_vy
+                            locked_vy = raw_vy
+                    lidar_status = "抵達目標距離" if arrived else "尚未抵達目標距離"
+                    final_vx = 0 if arrived else AUTO_FORWARD_VX
+                    if locked_vy is not None and strafe_until is None:
+                        duration = 0.0
+                        if locked_vy:
+                            duration = NORMAL_STRAFE_DURATION_SCALE * min(
+                                MAX_STRAFE_SECONDS, (abs(locked_vy) + 3) / 12.0
+                            )
+                        strafe_until = now + duration
+                        next_auto_status_at = 0.0
+                        print(
+                            f"[Auto Drive] Vision vy={locked_vy}，正常橫移指令 "
+                            f"vy={locked_vy}，持續 {duration:.2f} 秒",
+                            flush=True,
+                        )
+                    if strafe_until is not None:
+                        if now < strafe_until:
+                            final_vy = max(-100, min(100, locked_vy))
+                            if not arrived:
+                                final_vx = abs(final_vy)
+                        else:
+                            auto_complete = arrived
+                    positioning_moved = positioning_moved or bool(final_vx or final_vy)
 
-                target_would_reverse = (
-                    center_only and detected and not centered
-                    and raw_vy * occlusion_strafe_side < 0
-                )
-                if target_would_reverse:
-                    auto_complete = True
-                elif center_only:
-                    final_vx, final_vy, final_wz = 0, 0, 0
-                    front_clear = fresh_scan and (
-                        front_distance_m is None or front_distance_m > lidar.safe_dist_m
-                    )
-                    auto_complete = front_clear and vision_detected_once
-                    if front_clear:
-                        lidar_status = "前方障礙已解除"
-                        if not vision_detected_once:
-                            lidar_status += "，等待鏡頭首次偵測靶面"
-                    elif fresh_scan and last_target_side:
-                        final_vy = last_target_side * OCCLUSION_STRAFE_VY
-                        lidar_status = f"前方有障礙，沿最後靶面方向橫移（vy={final_vy}）"
-                    elif fresh_scan:
-                        lidar_status = "前方有障礙，無可用的靶面方向"
-                else:
-                    auto_complete = centered and arrived
                 if auto_complete:
                     final_vx, final_vy, final_wz = 0, 0, 0
                     yaw, pitch = 50, 50
@@ -355,10 +369,11 @@ def main():
 
                 # 自動模式的底盤前後方向與 Xavier 的正負號相反。
                 tx_vx = -final_vx
+                tx_vy = final_vy
                 uart.send_packet(
                     mode="A",
                     vx=tx_vx,
-                    vy=final_vy,
+                    vy=tx_vy,
                     wz=final_wz,
                     yaw=yaw,
                     pitch=pitch,
@@ -366,18 +381,12 @@ def main():
                     speed=fire_speed,
                 )
 
-                if center_only and final_vy:
-                    occlusion_strafe_side = last_target_side
-
                 if auto_complete:
                     lidar.set_active(False)
-                    if target_would_reverse:
-                        reason = "重新偵測到靶面，但修正方向會往回，定位完成"
-                    elif center_only:
-                        reason = "遮擋後前方障礙已解除"
-                    else:
-                        reason = "已置中且抵達目標距離"
-                    print(f"[Auto Drive] {distance_text}，{reason}，底盤已送出停止，等待釋放 ZED", flush=True)
+                    print(
+                        f"[Auto Drive] {distance_text}，{completion_reason}，底盤已送出停止，等待釋放 ZED",
+                        flush=True,
+                    )
                     camera_released = vision.stop()
                     vision = None
                     if not camera_released:
@@ -391,27 +400,14 @@ def main():
                 if not auto_complete and now >= next_auto_status_at:
                     next_auto_status_at = now + AUTO_STATUS_INTERVAL_SECONDS
 
-                    if vision_warming_up:
-                        remaining = vision_ready_at - now
-                        vision_status = f"初始化等待中，剩 {remaining:.0f} 秒"
-                    elif holding_vy:
-                        remaining = vy_hold_until - now
-                        vision_status = f"暫失目標，延續橫移（vy={held_vy}，剩 {remaining:.1f} 秒）"
-                    elif not detected:
-                        vision_status = "未偵測到目標"
-                    elif centered:
-                        vision_status = f"已置中（vy={raw_vy}）"
+                    if locked_vy is None:
+                        vision_status = "等待首次偵測靶面" if vision_wait_until is not None else "尚未偵測到靶面"
                     else:
-                        move_left = (raw_vy > 0) == POSITIVE_VY_IS_LEFT
-                        direction = "左" if move_left else "右"
-                        vision_status = f"偵測到目標，需往{direction}修正（vy={raw_vy}）"
-
-                    if center_only:
-                        vision_status += "，遮擋逾時，依最後靶面方向避障"
+                        vision_status = f"已鎖定 vy={locked_vy}"
 
                     print(
                         f"[LiDAR] {distance_text}，{lidar_status} | [鏡頭] {vision_status} | "
-                        f"[送出] vx={tx_vx} vy={final_vy} wz={final_wz}",
+                        f"[送出] vx={tx_vx} vy={tx_vy} wz={final_wz}",
                         flush=True,
                     )
 

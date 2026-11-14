@@ -20,9 +20,9 @@ AUTO_STRAFE_SIGN = 1            # +1: 正 vy 向右，實車方向相反時設�
 # MID-360 正前方障礙偵測，依遮擋範圍和安裝位置校正
 DISTANCE_PLATE_CM = 260.0       # 車頭到正前方定位面的目標距離
 DETECTION_RADIUS_M = 10.0      # LiDAR 前向距離上限（公尺）
-FRONT_LIDAR_HALF_ANGLE_DEG = 20.0
+FRONT_LIDAR_HALF_ANGLE_DEG = 10.0
 FRONT_LIDAR_HALF_WIDTH_M = 0.55
-FRONT_LIDAR_MIN_Z_M = -0.2
+FRONT_LIDAR_MIN_Z_M = -0.10
 FRONT_LIDAR_MAX_Z_M = 0.8
 FRONT_LIDAR_MAX_AGE_S = 0.25
 LIDAR_TO_FRONT_M = 0.0           # 實測 LiDAR 到車體前緣的前向距離
