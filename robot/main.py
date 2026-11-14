@@ -82,6 +82,7 @@ def main():
         next_auto_status_at = 0.0
         last_received_mode = None
         auto_complete = False
+        auto_started = False
         center_only = False
         vision_detected_once = False
         last_target_side = 0
@@ -139,6 +140,7 @@ def main():
                         )
                     )
                     auto_complete = False
+                    auto_started = False
                     awaiting_phase = False
                     center_only = False
                     vision_detected_once = False
@@ -169,6 +171,9 @@ def main():
                     )
                     print("[Mode Switch] 手動控制器交接完成", flush=True)
                     if new_mode == "A":
+                        uart.send_packet(
+                            mode="A", vx=0, vy=0, wz=0, yaw=50, pitch=50, fire=0, speed=0
+                        )
                         vision = VisionTracker()
                         vision.start()
                         vision.set_active(True)
@@ -188,6 +193,27 @@ def main():
 
             else:
                 uart.report_if_silent()
+
+            if current_mode == "A" and not auto_started:
+                # 僅使用暖機完成後讀到的 A 模式封包。
+                if (
+                    time.monotonic() >= vision_ready_at
+                    and packet is not None
+                    and packet.get("mode") == "A"
+                    and packet.get("auto_start", 0) > 0
+                ):
+                    auto_started = True
+                    print("[Auto Drive] 收到 VRA 啟動，開始自動定位", flush=True)
+                else:
+                    uart.send_packet(
+                        mode="A", vx=0, vy=0, wz=0, yaw=50, pitch=50, fire=0, speed=0
+                    )
+                    now = time.monotonic()
+                    if now >= vision_ready_at and now >= next_auto_status_at:
+                        next_auto_status_at = now + AUTO_STATUS_INTERVAL_SECONDS
+                        print("[Auto Drive] 相機暖機完成，等待 VRA 啟動", flush=True)
+                    time.sleep(0.02)
+                    continue
 
             if awaiting_phase and packet is not None and packet.get("mode") == "A":
                 awaiting_phase = False

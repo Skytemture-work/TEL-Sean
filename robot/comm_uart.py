@@ -62,10 +62,10 @@ class UARTController:
                         continue
 
                 parts = line.split(',')
-                # ESP32 -> Xavier: E,MODE,VX,VY,WZ,YAW,PITCH,FIRE,SPEED,RELOAD
-                if len(parts) != 10 or parts[0] != 'E' or parts[1] not in ('M', 'A'):
+                # ESP32 -> Xavier: E,MODE,VX,VY,WZ,YAW,PITCH,FIRE,SPEED,RELOAD[,AUTO_START]
+                if len(parts) not in (10, 11) or parts[0] != 'E' or parts[1] not in ('M', 'A'):
                     print(
-                        "[UART RX INVALID] expected E,MODE,VX,VY,WZ,YAW,PITCH,FIRE,SPEED,RELOAD; got={!r}".format(line),
+                        "[UART RX INVALID] expected E,MODE,VX,VY,WZ,YAW,PITCH,FIRE,SPEED,RELOAD[,AUTO_START]; got={!r}".format(line),
                         flush=True,
                     )
                     continue
@@ -82,6 +82,7 @@ class UARTController:
                         'fire': int(parts[7]),
                         'speed': int(parts[8]),
                         'reload': int(parts[9]),
+                        'auto_start': int(parts[10]) if len(parts) == 11 else 0,
                     }
                 except ValueError:
                     print("[UART RX INVALID] non-numeric ESP32 packet: {!r}".format(line), flush=True)
