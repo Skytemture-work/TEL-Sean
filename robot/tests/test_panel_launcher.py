@@ -111,6 +111,18 @@ class PanelLauncherTests(unittest.TestCase):
         self.tick()
         self.controller.request_shot.assert_called_once_with()
 
+    def test_reload_rotation_uses_the_remote_reload_and_waits_for_it(self):
+        def reload():
+            self.controller.busy = True
+        self.controller.request_reload.side_effect = reload
+        self.assertTrue(self.launcher.start_reload_rotation())
+        self.controller.request_reload.assert_called_once_with()
+        self.assertTrue(self.launcher.mechanism_busy)  # no shot until the turn is done
+        self.assertFalse(self.launcher.start_reload_rotation())  # busy: not twice
+        self.controller.busy = False
+        self.controller.shot_error = 'jam'
+        self.assertFalse(self.launcher.start_reload_rotation())
+
     def test_reload_hold_keeps_turret_still_and_blocks_the_click(self):
         self.click()
         status = real._update_panel_engagement(

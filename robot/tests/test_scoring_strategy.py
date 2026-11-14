@@ -35,14 +35,16 @@ def _board_plan() -> EngagementPlan:
 
 
 class ScoringStrategyTests(unittest.TestCase):
-    def test_upper_is_nine_bonus_then_grid_pairs_in_numeric_order(self):
+    def test_upper_is_nine_bonus_then_serpentine_grid_pairs(self):
         strategy = build_max_score_strategy(_board_plan(), "H11", "upper")
 
         self.assertEqual(len(strategy.plan), 27)
         self.assertEqual(strategy.hole_ids[:9], ("H11",) * 9)
         self.assertEqual(strategy.hole_ids[9:], (
-            "H01", "H01", "H02", "H02", "H03", "H03", "H04", "H04", "H05",
-            "H05", "H06", "H06", "H07", "H07", "H08", "H08", "H09", "H09"))
+            "H01", "H01", "H02", "H02", "H03", "H03", "H06", "H06", "H05",
+            "H05", "H04", "H04", "H07", "H07", "H08", "H08", "H09", "H09"))
+        self.assertEqual(strategy.hole_ids[9:],
+                         build_max_score_strategy(_board_plan(), None, "lower").hole_ids)
         self.assertEqual(strategy.hole_ids[9:], UPPER_GRID_IDS)
 
     def test_lower_skips_bonus_and_shoots_each_cell_twice_in_serpentine(self):

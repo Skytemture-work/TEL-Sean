@@ -98,6 +98,18 @@ class PanelLauncher:
         """
         return bool(self.controller.busy)
 
+    def start_reload_rotation(self):
+        """After a manual magazine refill: home ID1 and turn the magazine
+        ``RELOAD_SLOTS`` (2) slots, the same as the remote's RELOAD.
+
+        Returns True once the rotation has started; firing then waits on
+        ``mechanism_busy`` until it is finished.
+        """
+        if self.pending or self.controller.busy or self.controller.shot_error is not None:
+            return False
+        self.controller.request_reload()
+        return bool(self.controller.busy)
+
     def shot_released(self):
         """The pending stage has released its ball (ID1 done); complete it now."""
         return self.pending and self._pending_shot_released()

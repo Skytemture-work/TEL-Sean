@@ -597,6 +597,10 @@ def main(
         help="切換一般模式",
     )
     parser.add_argument(
+        "--light-wait", type=float, default=5.0,
+        help="上半場：開賽後等待確認亮燈的秒數，逾時先射 H11（之後確認亮燈即改射亮燈孔）；預設 5，範圍 0～55",
+    )
+    parser.add_argument(
         "--match-phase",
         choices=MATCH_PHASES,
         default="upper",
@@ -648,6 +652,8 @@ def main(
             parser.error(f"{flag} 必須在 {low}～{high} 之間")
     if not 1 <= args.balls_loaded <= 18:
         parser.error("--balls-loaded 必須在 1～18 之間")
+    if not math.isfinite(args.light_wait) or not 0.0 <= args.light_wait <= 55.0:
+        parser.error("--light-wait 必須在 0～55 秒之間")
     if not math.isfinite(args.match_duration) or not 30.0 <= args.match_duration <= 300.0:
         parser.error("--match-duration 必須在 30～300 秒之間")
     for flag, value in (("--fire-tolerance-deg", args.fire_tolerance_deg),
@@ -729,7 +735,9 @@ def main(
     if args.match_fire:
         print(
             f"比賽全自動模式（{args.match_phase}）：辨識到靶板即開賽並開始射擊"
-            + ("，偵測到亮燈後插入 3 顆加分球" if args.match_phase == "upper" else "，不射加分孔")
+            + (f"，先射亮燈加分孔 9 顆（{args.light_wait:g} 秒內未確認亮燈先射 H11；限開賽後 60 秒內），"
+               "再照蛇形順序射九宮格，射完 18 顆後等待裝填" if args.match_phase == "upper"
+               else "，不射加分孔")
             + f"；已裝 {args.balls_loaded} 顆，時限 {args.match_duration:g} 秒（自建立計畫起算）；"
             f"到位容許誤差 大孔 {args.fire_tolerance_deg:g}°／小孔 {args.small_fire_tolerance_deg:g}°。",
             flush=True,
@@ -961,9 +969,11 @@ def main(
     restore_completed = args.restore_completed_aim
     auto_fire = None
     previous_status = None
-    match = (MatchSequencer(args.match_phase, args.match_duration, args.balls_loaded,
-                            lambda new_plan: driver.set_plan(new_plan))
-             if args.match_fire else None)
+    match = (MatchSequencer(
+        args.match_phase, args.match_duration, args.balls_loaded,
+        lambda new_plan: driver.set_plan(new_plan), light_wait_s=args.light_wait,
+        start_reload_rotation=lambda: bool(launcher is not None and launcher.start_reload_rotation()))
+        if args.match_fire else None)
 
     def begin_home():
         nonlocal home_active, home_error

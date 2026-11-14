@@ -75,13 +75,15 @@ def _targets_by_id(plan: EngagementPlan) -> Dict[str, BoardTarget]:
 
 
 # Team decision (2026-11-14): upper half = 9 balls into the lit bonus hole
-# (only within the first 60 s, while the light is on), then two balls per grid
-# cell in numeric order.  The first magazine (18) runs out after H05 #1; the
-# team reloads and the plan continues.
+# (only within the first 60 s, while the light is on; H11 when the light is not
+# confirmed in time), then the same serpentine grid pairs as the lower half.
+# The first magazine (18) runs out after H05 #1; the team reloads and the plan
+# continues.
 UPPER_BONUS_BALLS = 9
 UPPER_BONUS_WINDOW_S = 60.0
+UPPER_FALLBACK_BONUS_ID = "H11"
 UPPER_GRID_IDS: Tuple[str, ...] = tuple(
-    f"H{n:02d}" for n in range(1, 10) for _ in range(2))
+    hole_id for hole_id in LOWER_SERPENTINE_IDS for _ in range(2))
 
 
 def build_max_score_strategy(
