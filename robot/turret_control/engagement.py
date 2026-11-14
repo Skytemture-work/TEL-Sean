@@ -7,7 +7,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import json
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from .aiming import AimCommand
 from .board import BoardTarget, EngagementPlan
@@ -81,6 +81,9 @@ class BoardEngagement:
         self.config = config
         # Per-hole empirical elevation trim (physical radians, + = muzzle up).
         self.pitch_trim_rad: Dict[str, float] = dict(pitch_trim_rad or {})
+        # Per-hole correction measured by the muzzle camera, physical radians
+        # (yaw + = right, pitch + = up); added on top of the configured trim.
+        self.muzzle_correction_rad: Dict[str, Tuple[float, float]] = {}
         # Per-hole arrival tolerance (radians); can only tighten the default.
         self.fire_tolerance_rad: Dict[str, float] = dict(fire_tolerance_rad or {})
         self.turret = turret
@@ -113,6 +116,13 @@ class BoardEngagement:
         if self.event_log_path is not None:
             self.event_log_path.parent.mkdir(parents=True, exist_ok=True)
             self._event_log = self.event_log_path.open("a", encoding="utf-8")
+
+    def set_muzzle_correction(self, hole_id: str, yaw_rad: float, pitch_rad: float) -> None:
+        """Set (or with zeros clear) the muzzle-camera correction for a hole."""
+        if yaw_rad or pitch_rad:
+            self.muzzle_correction_rad[hole_id] = (float(yaw_rad), float(pitch_rad))
+        else:
+            self.muzzle_correction_rad.pop(hole_id, None)
 
     def set_plan(self, plan: EngagementPlan) -> None:
         self.plan = plan
@@ -209,8 +219,9 @@ class BoardEngagement:
 
         pixel = target.to_pixel()
         trim = self.pitch_trim_rad.get(target.hole_id or "", 0.0)
-        if trim:
-            pixel = replace(pixel, pitch_trim_rad=trim)
+        yaw_fix, pitch_fix = self.muzzle_correction_rad.get(target.hole_id or "", (0.0, 0.0))
+        if trim or pitch_fix or yaw_fix:
+            pixel = replace(pixel, pitch_trim_rad=trim + pitch_fix, yaw_trim_rad=yaw_fix)
         tolerance = self.fire_tolerance_rad.get(target.hole_id or "")
         if tolerance is not None:
             pixel = replace(pixel, aim_tolerance_rad=tolerance)

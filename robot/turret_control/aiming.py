@@ -29,6 +29,8 @@ class TargetPixel:
     # Empirical elevation correction for this target, physical radians,
     # positive = raise the muzzle.  Applied before limit/workspace checks.
     pitch_trim_rad: float = 0.0
+    # Same for azimuth, physical radians, positive = turn the muzzle right.
+    yaw_trim_rad: float = 0.0
     # Per-target "arrived" tolerance on the servo error; None uses
     # config.aim_tolerance_rad.  Only ever tightens what may fire.
     aim_tolerance_rad: Optional[float] = None
@@ -226,6 +228,8 @@ class AimingController:
             # Base-fixed camera: pitch_error is a motor offset from zero, and
             # motor = zero + pitch_sign * physical elevation.
             pitch_error += self.config.pitch_sign * target.pitch_trim_rad
+        if target.yaw_trim_rad and not self.config.camera_on_turret:
+            yaw_error += self.config.yaw_sign * target.yaw_trim_rad
 
         if self.config.camera_on_turret:
             # The error is relative to where the turret already points.

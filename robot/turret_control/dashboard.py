@@ -24,8 +24,9 @@ class DashboardState:
     """Thread-safe frame and JSON snapshot shared with the HTTP server."""
 
     def __init__(self):
-        self._frame: Optional[bytes] = None
-        self._frame_version = 0
+        # One JPEG per camera channel: "main" (chassis) and "muzzle".
+        self._frames: Dict[str, Optional[bytes]] = {}
+        self._frame_versions: Dict[str, int] = {}
         self._telemetry: Dict[str, Any] = {
             "generated_at_ms": 0,
             "system": {"online": False},
@@ -39,28 +40,31 @@ class DashboardState:
         self._fire_action = None
         self._fire_nonce = 0
 
-    def update_frame(self, frame: bytes) -> None:
+    def update_frame(self, frame: bytes, channel: str = "main") -> None:
         with self._lock:
-            self._frame = frame
-            self._frame_version += 1
+            self._frames[channel] = frame
+            self._frame_versions[channel] = self._frame_versions.get(channel, 0) + 1
             self._frame_cond.notify_all()
 
-    def wait_frame(self, last_version: int, timeout: float):
+    def update_muzzle_frame(self, frame: bytes) -> None:
+        self.update_frame(frame, "muzzle")
+
+    def wait_frame(self, last_version: int, timeout: float, channel: str = "main"):
         """Return ``(frame, version)`` as soon as a newer frame is published."""
         with self._lock:
             self._frame_cond.wait_for(
-                lambda: self._frame_version != last_version or not self._running,
+                lambda: self._frame_versions.get(channel, 0) != last_version or not self._running,
                 timeout=timeout,
             )
-            return self._frame, self._frame_version
+            return self._frames.get(channel), self._frame_versions.get(channel, 0)
 
     def update_telemetry(self, telemetry: Dict[str, Any]) -> None:
         with self._lock:
             self._telemetry = telemetry
 
-    def frame_snapshot(self) -> Optional[bytes]:
+    def frame_snapshot(self, channel: str = "main") -> Optional[bytes]:
         with self._lock:
-            return self._frame
+            return self._frames.get(channel)
 
     def telemetry_snapshot(self) -> Dict[str, Any]:
         with self._lock:
@@ -601,9 +605,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if path == "/health":
             self._send_bytes(b"ok", "text/plain; charset=utf-8")
             return
-        if path != "/stream":
+        streams = {"/stream": "main", "/stream/muzzle": "muzzle"}
+        if path not in streams:
             self.send_error(404)
             return
+        channel = streams[path]
 
         self.send_response(200)
         self.send_header(
@@ -625,7 +631,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             while self.state.running:
                 # Push each new frame immediately (no fixed 50 ms polling);
                 # resend after 1 s idle to keep the connection alive.
-                frame, new_version = self.state.wait_frame(version, timeout=1.0)
+                frame, new_version = self.state.wait_frame(version, timeout=1.0, channel=channel)
                 version = new_version
                 if frame:
                     self.wfile.write(

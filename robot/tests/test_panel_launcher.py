@@ -98,6 +98,19 @@ class PanelLauncherTests(unittest.TestCase):
         self.motors.close.assert_not_called()
         self.controller.request_shot.assert_not_called()
 
+    def test_muzzle_hold_blocks_the_click_until_released(self):
+        self.click()
+        status = real._update_panel_engagement(
+            self.driver, self.launcher, self.dashboard, self.driver.plan, True, None,
+            fire_hold='砲口相機確認中')
+        self.assertFalse(status.fired)
+        self.assertFalse(status.command.fire_allowed)
+        self.assertEqual(status.command.blocked_reason, '砲口相機確認中')
+        self.controller.request_shot.assert_not_called()
+        self.click()
+        self.tick()
+        self.controller.request_shot.assert_called_once_with()
+
     def test_no_click_never_fires_or_consumes_cooldown_or_advances(self):
         for _ in range(20):
             self.assertFalse(self.tick().fired)
@@ -750,6 +763,7 @@ class PanelEntryTests(unittest.TestCase):
                      patch.object(real, 'SharedMotorBackend', return_value=motors), \
                      patch.object(real, 'BoardVision'), \
                      patch.object(real, 'start_dashboard_server', return_value=server), \
+                     patch.object(real, '_start_muzzle_preview') as muzzle, \
                      patch('turret_control.panel_launcher.PanelLauncher', return_value=launcher,
                            side_effect=RuntimeError('VESC init failed') if startup_error else None) as factory:
                     args = ['--panel-fire', '--no-score-mode', '--headless', '--opencv-camera']
@@ -761,6 +775,7 @@ class PanelEntryTests(unittest.TestCase):
                         launcher.close.assert_called_once()
                     factory.assert_called_once_with(motors, push_rpm=None, push_acceleration=None,
                                                 push_home_rpm=None)
+                    muzzle.assert_not_called()  # OpenCV camera: never open the muzzle ZED
                 motors.enable.assert_called_once()
                 motors.close.assert_called_once()
                 camera.release.assert_called_once()

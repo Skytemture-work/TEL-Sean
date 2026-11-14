@@ -158,6 +158,18 @@ class TurretConfig:
     # muzzle camera.  The SDK must open the chassis camera by serial number.
     chassis_zed_serial: int = 21947470
     muzzle_zed_serial: int = 20681321
+    # Barrel axis position in the upright muzzle-camera frame (x right, y
+    # down, metres), assuming the optical axis is parallel to the barrel:
+    # 66.5 mm left of the lens pair, level with their midpoint = 60 mm below
+    # the upper (SDK left / reference) lens.
+    muzzle_barrel_offset_x_m: float = -0.0665
+    muzzle_barrel_offset_y_m: float = 0.060
+    # Range used for the parallax shift until a target distance is known.
+    muzzle_fallback_distance_m: float = 5.0
+    # Measured camera-vs-barrel misalignment (deg, + = camera axis right of /
+    # above the barrel).  0 = assumed parallel until shot data says otherwise.
+    muzzle_boresight_yaw_deg: float = 0.0
+    muzzle_boresight_pitch_deg: float = 0.0
 
     # Live metric pose (PnP) of the 300 x 340 cm target board.  The pose is
     # solved every frame, so moving the robot changes the projected hole

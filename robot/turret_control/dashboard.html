@@ -215,6 +215,28 @@
 
     .video-corner.left { left: 12px; bottom: 12px; }
     .video-corner.right { right: 12px; bottom: 12px; }
+    .video-corner.top { left: 12px; top: 12px; bottom: auto; }
+
+    /* Chassis camera (16:9) beside the upright muzzle camera (9:16); the
+       column ratio keeps both pictures the same height. */
+    .video-pair {
+      display: grid;
+      grid-template-columns: minmax(0, 16fr) minmax(0, 5.0625fr);
+      gap: 2px;
+      background: var(--line);
+    }
+    .video-pair .video-wrap { min-height: 0; }
+    .video-wrap.muzzle { aspect-ratio: 9 / 16; }
+    /* Once frames arrive the picture covers the "waiting" placeholder. */
+    .video-wrap.muzzle img { position: relative; z-index: 1; }
+    .video-wrap.muzzle .video-empty {
+      position: absolute;
+      color: var(--muted);
+      font-size: 11px;
+      letter-spacing: .08em;
+      text-align: center;
+      padding: 0 8px;
+    }
 
     .vision-strip {
       display: grid;
@@ -469,6 +491,8 @@
       .summary { min-height: 68px; }
       .lower-grid { grid-template-columns: 1fr; }
       .video-wrap { min-height: 240px; }
+      .video-pair { grid-template-columns: 1fr; }
+      .video-wrap.muzzle { width: min(100%, 360px); justify-self: center; }
       .vision-strip { grid-template-columns: repeat(2, 1fr); }
       .vision-stat:nth-child(2) { border-right: 0; }
       .vision-stat:nth-child(-n+2) { border-bottom: 1px solid var(--line); }
@@ -519,10 +543,18 @@
           <div class="panel-title">影像辨識畫面</div>
           <div class="panel-meta" id="visionMeta">YOLO — / 靶面 —</div>
         </div>
-        <div class="video-wrap">
-          <img src="/stream" alt="機器人即時辨識影像">
-          <div class="video-corner left" id="videoTarget">TARGET —</div>
-          <div class="video-corner right" id="videoPose">POSE —</div>
+        <div class="video-pair">
+          <div class="video-wrap">
+            <img src="/stream" alt="車體相機即時辨識影像">
+            <div class="video-corner top">車體相機</div>
+            <div class="video-corner left" id="videoTarget">TARGET —</div>
+            <div class="video-corner right" id="videoPose">POSE —</div>
+          </div>
+          <div class="video-wrap muzzle">
+            <span class="video-empty">等待砲口相機</span>
+            <img src="/stream/muzzle" alt="砲口相機即時影像（已轉正，黃圈為砲管指向）">
+            <div class="video-corner top">砲口相機</div>
+          </div>
         </div>
         <div class="vision-strip">
           <div class="vision-stat"><span class="eyebrow">原始候選</span><b id="rawDetections">—</b></div>

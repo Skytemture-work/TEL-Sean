@@ -263,7 +263,7 @@ def _auto_fire_ready(driver, launcher, plan, pose_ready, previous_status):
 
 
 def _update_panel_engagement(driver, launcher, dashboard, plan, pose_ready, blocked_reason,
-                             auto_fire=None, previous_status=None):
+                             auto_fire=None, previous_status=None, fire_hold=None):
     """Validate a click on this frame; never retain an unexecuted authorization.
 
     With ``auto_fire`` the click comes from ``AutoFireTrigger`` instead of the
@@ -277,7 +277,8 @@ def _update_panel_engagement(driver, launcher, dashboard, plan, pose_ready, bloc
         pose_ready and not launcher.busy,
         "發射階段執行中，砲口保持位置" if launcher.busy else blocked_reason,
     )
-    driver.set_firing_enabled(pose_ready, blocked_reason)
+    driver.set_firing_enabled(pose_ready and fire_hold is None,
+                              blocked_reason if not pose_ready else fire_hold)
     action = dashboard.take_panel_fire()
     if auto_fire is not None:
         action = auto_fire.take(
@@ -289,6 +290,93 @@ def _update_panel_engagement(driver, launcher, dashboard, plan, pose_ready, bloc
         return driver.update()
     finally:
         launcher.finish_tick()
+
+
+def _make_muzzle_corrector(mode, model, config, muzzle_preview, driver, args):
+    """Pre-shot muzzle check sharing the chassis YOLO model (one call per shot)."""
+    from .muzzle_correction import MuzzleCorrectionSettings, MuzzleShotCorrector, locate_hole
+
+    intrinsics = muzzle_preview.intrinsics
+    # Same BoardVision entry point, configured for the upright muzzle image.
+    muzzle_config = replace(
+        config, image_width_px=intrinsics.width_px, image_height_px=intrinsics.height_px,
+        focal_length_x_px=intrinsics.fx, focal_length_y_px=intrinsics.fy,
+        camera_principal_x_px=intrinsics.cx, camera_principal_y_px=intrinsics.cy,
+        camera_distortion_coeffs=(0.0, 0.0, 0.0, 0.0, 0.0))
+    muzzle_vision = BoardVision(model, muzzle_config, confidence=args.conf, imgsz=args.imgsz,
+                                device=args.device)
+
+    def measure(hole_id, captured_after):
+        frame, captured_at = muzzle_preview.latest_frame()
+        if frame is None or captured_at < captured_after:
+            return None
+        result = muzzle_vision.process(frame, now=captured_at)
+        measured = locate_hole(result.plan, result.targets, hole_id)
+        return measured is not None, measured
+
+    settings = MuzzleCorrectionSettings(
+        offset_x_m=config.muzzle_barrel_offset_x_m,
+        offset_y_m=config.muzzle_barrel_offset_y_m,
+        boresight_yaw_rad=math.radians(config.muzzle_boresight_yaw_deg),
+        boresight_pitch_rad=math.radians(config.muzzle_boresight_pitch_deg),
+    )
+    print(f"砲口相機發射前確認：{mode}"
+          + ("（只量測記錄，不改變瞄準與發射時機）" if mode == "measure"
+             else "（誤差超過 0.12° 時修正瞄準並重新到位，最多 2 次、上限 1°）"), flush=True)
+    return MuzzleShotCorrector(mode, intrinsics, settings, measure, driver.set_muzzle_correction)
+
+
+def _step_muzzle_corrector(corrector, muzzle_preview, driver, plan, previous_status,
+                           pitch_trim_deg, now):
+    """Advance the muzzle check for the current shot; return a fire hold or None."""
+    current = plan.current() if plan is not None else None
+    hole_id = current.hole_id if current is not None else None
+    command = previous_status.command if previous_status is not None else None
+    same_target = (previous_status is not None and previous_status.target is not None
+                   and previous_status.target.hole_id == hole_id)
+    stable = bool(same_target and command is not None and command.stable)
+    distance = command.distance_m if same_target and command is not None else None
+    elevation = None
+    if same_target and command is not None:
+        elevation = ((command.ballistic_correction_rad or 0.0)
+                     + math.radians(pitch_trim_deg.get(hole_id or "", 0.0)))
+    key = (driver.plan_revision, plan.index if plan is not None else None, hole_id)
+    hold = corrector.step(now, key, hole_id, stable, distance, elevation)
+    record = corrector.record_for(key)
+    if record is not None and record.measurements:
+        if record.error_yaw_rad is not None:
+            text = (f"{hole_id} {record.verdict}  err yaw {math.degrees(record.error_yaw_rad):+.2f} "
+                    f"pitch {math.degrees(record.error_pitch_rad):+.2f} deg")
+        else:
+            text = f"{hole_id} {record.verdict}"
+        muzzle_preview.set_measurement((record.expected_px, record.measured_px, text))
+    return hold
+
+
+def _start_muzzle_preview(config, dashboard, args):
+    """Open the muzzle ZED for the dashboard; any failure only disables it."""
+    from .muzzle_camera import MuzzlePreview, MuzzleZedCamera
+
+    camera = None
+    try:
+        camera = MuzzleZedCamera(config.muzzle_zed_serial)
+        preview = MuzzlePreview(
+            camera, dashboard.update_muzzle_frame,
+            offset_x_m=config.muzzle_barrel_offset_x_m,
+            offset_y_m=config.muzzle_barrel_offset_y_m,
+            fallback_distance_m=config.muzzle_fallback_distance_m,
+            fps=min(args.preview_fps, 10.0), scale=args.preview_scale,
+            jpeg_quality=args.preview_quality,
+        )
+    except Exception as exc:
+        if camera is not None:
+            camera.release()
+        print(f"砲口相機未啟用（不影響主流程）：{exc}", flush=True)
+        return None, None
+    print(f"砲口相機 S/N {config.muzzle_zed_serial}：畫面已轉正，黃圈為砲管指向點"
+          f"（假設與砲管平行，偏移 x={config.muzzle_barrel_offset_x_m * 1000:+.1f} mm、"
+          f"y={config.muzzle_barrel_offset_y_m * 1000:+.1f} mm）。", flush=True)
+    return camera, preview
 
 
 def main(
@@ -445,6 +533,15 @@ def main(
         "--camera-pitch-deg", type=float, default=DEFAULT_CAMERA_PITCH_DEG,
         help=f"相機安裝仰角（度；預設 {DEFAULT_CAMERA_PITCH_DEG}，由垂直靶面的傾斜量校正；"
              "儀表板 board_lean_avg_deg 應接近 0）",
+    )
+    parser.add_argument(
+        "--no-muzzle-camera", action="store_true",
+        help="不開啟砲口 ZED 相機（儀表板只顯示車體相機）",
+    )
+    parser.add_argument(
+        "--muzzle-correction", choices=("off", "measure", "apply"), default="measure",
+        help="砲口相機發射前確認：measure＝只量測並記錄誤差（預設，不影響瞄準與發射）；"
+             "apply＝量到誤差就修正瞄準、重新到位後才發射；off＝不使用",
     )
     parser.add_argument(
         "--no-pose-lock", action="store_true",
@@ -717,9 +814,13 @@ def main(
     web_server = None
     grabber = None
     preview = None
+    muzzle_camera = None
+    muzzle_preview = None
 
     def _stop_early_services():
-        for stop in ((preview.stop if preview is not None else None),
+        for stop in ((muzzle_preview.stop if muzzle_preview is not None else None),
+                     (muzzle_camera.release if muzzle_camera is not None else None),
+                     (preview.stop if preview is not None else None),
                      (grabber.stop if grabber is not None else None),
                      (web_server.shutdown if web_server is not None else None),
                      (web_server.server_close if web_server is not None else None)):
@@ -750,6 +851,10 @@ def main(
                 print(f"即時預覽：{args.preview_fps:g} FPS、{args.preview_scale:g} 倍尺寸、"
                       f"JPEG 品質 {args.preview_quality}（辨識結果以最新一次 YOLO 疊圖顯示）。",
                       flush=True)
+            # The muzzle camera needs the ZED SDK; UVC/OpenCV runs (and tests
+            # with a mocked camera) never touch it.
+            if use_zed_sdk and not args.no_muzzle_camera and not args.virtual_board:
+                muzzle_camera, muzzle_preview = _start_muzzle_preview(config, dashboard, args)
     except BaseException:
         _stop_early_services()
         camera.release()
@@ -789,6 +894,9 @@ def main(
     pose_tracker = BoardPoseTracker(config)
     pose_lock = None if args.no_pose_lock or args.virtual_board else BoardPoseLock(config)
     pose_locked_previous = False
+    muzzle_corrector = None
+    muzzle_plan_revision = None
+    muzzle_release_seen = None
     vision = None
     plan = None
     board_plan = None
@@ -968,6 +1076,9 @@ def main(
             raise model_box.get("error") or RuntimeError("YOLO 模型載入失敗")
         vision = BoardVision(model_box["model"], config, confidence=args.conf, imgsz=args.imgsz,
                              device=args.device, virtual_board=args.virtual_board)
+        if muzzle_preview is not None and args.muzzle_correction != "off" and launcher is not None:
+            muzzle_corrector = _make_muzzle_corrector(
+                args.muzzle_correction, model_box["model"], config, muzzle_preview, driver, args)
         print(
             f"YOLO 模型載入與預熱完成（啟動後 {time.monotonic() - model_started_at:.1f} s）"
             + (f"；預熱失敗：{model_box['warmup_error']}" if "warmup_error" in model_box else "。"),
@@ -1285,10 +1396,23 @@ def main(
                         home_error = None
                     elif _all_holes_confirmed(plan, manual_confirmed_holes):
                         begin_home()
+            muzzle_hold = None
+            if muzzle_corrector is not None:
+                if driver.plan_revision != muzzle_plan_revision or (
+                        pose_lock is not None and pose_lock.release_reason
+                        and pose_lock.release_reason != muzzle_release_seen):
+                    # New plan or the chassis moved: per-hole corrections are stale.
+                    muzzle_corrector.reset()
+                    muzzle_plan_revision = driver.plan_revision
+                    muzzle_release_seen = pose_lock.release_reason if pose_lock is not None else None
+                muzzle_hold = _step_muzzle_corrector(
+                    muzzle_corrector, muzzle_preview, driver, plan, previous_status,
+                    pitch_trim_deg, time.monotonic())
             if launcher is not None:
                 status = _update_panel_engagement(
                     driver, launcher, dashboard, plan, pose_ready, pose_blocked_reason,
-                    auto_fire=auto_fire, previous_status=previous_status)
+                    auto_fire=auto_fire, previous_status=previous_status,
+                    fire_hold=muzzle_hold)
             else:
                 status = driver.update()
             if launcher is not None:
@@ -1317,6 +1441,9 @@ def main(
                     if pose is not None and pose.source == "pnp" else None,
                 )
                 record["pose_locked"] = pose_locked
+                muzzle_record = muzzle_corrector.last if muzzle_corrector is not None else None
+                if muzzle_record is not None and muzzle_record.hole_id == hole:
+                    record.update(muzzle_record.as_log())
                 if last_latency:
                     record["vision_ms"] = {key: round(value, 1) for key, value in last_latency.items()
                                            if key.endswith("_ms") and isinstance(value, (int, float))}
@@ -1335,7 +1462,10 @@ def main(
                 print(
                     f"[SHOT {logged_shots}] {record['hole_id']} 彈倉第 {record['slot']} 格第 "
                     f"{record['stage']} 顆；飛輪 L/R {record['rpm_left']}/{record['rpm_right']} RPM；"
-                    f"仰角 目標 {record['muzzle_pitch_target_deg']}° 實際 {record['muzzle_pitch_current_deg']}°",
+                    f"仰角 目標 {record['muzzle_pitch_target_deg']}° 實際 {record['muzzle_pitch_current_deg']}°"
+                    + (f"；砲口相機 {record['muzzle_verdict']} 誤差 yaw "
+                       f"{record['muzzle_error_yaw_deg']}° pitch {record['muzzle_error_pitch_deg']}°"
+                       if "muzzle_verdict" in record else ""),
                     flush=True,
                 )
             previous_status = status
@@ -1485,6 +1615,10 @@ def main(
             render_done_at = time.perf_counter()
             jpeg_encode_ms = None
             preview_stats = {}
+            if muzzle_preview is not None:
+                # Parallax of the barrel point depends on the target range.
+                muzzle_preview.set_distance(
+                    status.target.distance_m if status.target is not None else None)
             if preview is not None:
                 preview.set_overlay(display, vision_frame)
                 preview_stats = preview.stats()
@@ -1662,6 +1796,10 @@ def main(
                 cleanup.callback(grabber.stop)
             if preview is not None:
                 cleanup.callback(preview.stop)
+            if muzzle_camera is not None:
+                cleanup.callback(muzzle_camera.release)
+            if muzzle_preview is not None:
+                cleanup.callback(muzzle_preview.stop)
             cleanup.callback(driver.close)
             cleanup.callback(shutdown_to_home)
             if shot_log is not None:
