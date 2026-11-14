@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from collections import deque
 import math
 import time
 from typing import Dict, Optional, Sequence, Tuple
@@ -405,6 +406,156 @@ class BoardPoseTracker:
         )
         self._pose = pose
         return pose
+
+
+def quaternion_angle_deg(first, second) -> float:
+    """Rotation angle between two (x, y, z, w) unit quaternions, in degrees."""
+    a = np.asarray(first, dtype=np.float64).reshape(4)
+    b = np.asarray(second, dtype=np.float64).reshape(4)
+    norm = float(np.linalg.norm(a) * np.linalg.norm(b))
+    if not math.isfinite(norm) or norm <= 0.0:
+        return math.inf
+    dot = abs(float(np.dot(a, b))) / norm
+    return math.degrees(2.0 * math.acos(min(1.0, dot)))
+
+
+@dataclass(frozen=True)
+class PoseLockDecision:
+    """Whether the locked pose may stand in for a missing live pose."""
+
+    usable: bool
+    reason: Optional[str] = None
+
+
+def _quat_multiply(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    ax, ay, az, aw = a
+    bx, by, bz, bw = b
+    return np.array([
+        aw * bx + ax * bw + ay * bz - az * by,
+        aw * by - ax * bz + ay * bw + az * bx,
+        aw * bz + ax * by - ay * bx + az * bw,
+        aw * bw - ax * bx - ay * by - az * bz,
+    ])
+
+
+def _relative_rotvec(first, second) -> np.ndarray:
+    """Rotation vector (rad) taking ``first`` to ``second``, both (x, y, z, w)."""
+    a = np.asarray(first, dtype=np.float64).reshape(4)
+    b = np.asarray(second, dtype=np.float64).reshape(4)
+    a = a / np.linalg.norm(a)
+    b = b / np.linalg.norm(b)
+    relative = _quat_multiply(np.array([-a[0], -a[1], -a[2], a[3]]), b)
+    if relative[3] < 0.0:
+        relative = -relative
+    vector = relative[:3]
+    sine = float(np.linalg.norm(vector))
+    if sine < 1e-12:
+        return np.zeros(3)
+    angle = 2.0 * math.atan2(sine, float(relative[3]))
+    return vector / sine * angle
+
+
+class BoardPoseLock:
+    """Hold the last stable PnP pose through occlusion while the chassis is still.
+
+    The board never moves and the camera is fixed to the chassis, so the hole
+    pixels/ranges from the last stable PnP remain correct until the chassis
+    moves.  The lock is dropped as soon as there is evidence of motion:
+
+    * the ZED IMU orientation turns more than its expected drift since lock
+      time (the fused yaw drifts steadily, ~0.07 deg/s measured on the robot,
+      so the drift rate is learned while stable PnP proves the chassis still);
+    * a fresh (possibly unstable) PnP pose disagrees with the locked pose;
+    * without a usable IMU drift estimate, after
+      ``pose_lock_max_blind_s_without_imu``.
+
+    Partial poses never refresh the lock: only a stable full PnP does.
+    """
+
+    def __init__(self, config: TurretConfig):
+        self.config = config
+        self._pose: Optional[BoardPose] = None
+        self._locked_at: Optional[float] = None
+        self._imu_reference = None
+        self._imu_rate = None
+        self._still_samples = deque()
+        self.release_reason: Optional[str] = None
+
+    @property
+    def pose(self) -> Optional[BoardPose]:
+        return self._pose
+
+    def release(self, reason: str) -> None:
+        if self._pose is not None:
+            self.release_reason = reason
+        self._pose = None
+        self._locked_at = None
+        self._imu_reference = None
+        self._imu_rate = None
+        # Samples before a motion must never feed the next drift estimate.
+        self._still_samples.clear()
+
+    def _learn_imu_drift(self, now: float, imu_orientation) -> None:
+        samples = self._still_samples
+        if imu_orientation is None:
+            samples.clear()
+            self._imu_rate = None
+            return
+        samples.append((now, imu_orientation))
+        while samples and now - samples[0][0] > self.config.pose_lock_imu_drift_window_s:
+            samples.popleft()
+        first_at, first = samples[0]
+        span = now - first_at
+        self._imu_rate = (
+            _relative_rotvec(first, imu_orientation) / span
+            if span >= self.config.pose_lock_imu_min_drift_span_s else None
+        )
+
+    def update(
+        self,
+        live_pose: Optional[BoardPose],
+        live_ready: bool,
+        now: float,
+        imu_orientation=None,
+    ) -> PoseLockDecision:
+        """Call once per frame after the live pose gate.
+
+        ``imu_orientation`` is the chassis/camera (x, y, z, w) quaternion from
+        the same camera, or None when no IMU reading is available.
+        """
+        if live_ready and live_pose is not None and live_pose.source == "pnp":
+            self._learn_imu_drift(now, imu_orientation)
+            self._pose = live_pose
+            self._locked_at = now
+            self._imu_reference = imu_orientation if self._imu_rate is not None else None
+            self.release_reason = None
+            return PoseLockDecision(False)
+        if self._pose is None:
+            return PoseLockDecision(False, self.release_reason)
+
+        if self._imu_reference is not None:
+            if imu_orientation is None:
+                self.release("IMU 讀值中斷，無法確認車體未移動")
+                return PoseLockDecision(False, self.release_reason)
+            expected = self._imu_rate * (now - self._locked_at)
+            turned = math.degrees(float(np.linalg.norm(
+                _relative_rotvec(self._imu_reference, imu_orientation) - expected)))
+            if turned > self.config.pose_lock_max_imu_rotation_deg:
+                self.release(f"IMU 偵測車體轉動 {turned:.2f}°，解除姿態鎖定")
+                return PoseLockDecision(False, self.release_reason)
+        elif now - self._locked_at > self.config.pose_lock_max_blind_s_without_imu:
+            self.release("無 IMU 漂移估計且遮蔽過久，解除姿態鎖定")
+            return PoseLockDecision(False, self.release_reason)
+
+        if live_pose is not None and live_pose.source == "pnp":
+            shift = float(np.linalg.norm(live_pose.tvec - self._pose.tvec))
+            turned = math.degrees(_rotation_delta_rad(self._pose.rvec, live_pose.rvec))
+            if (shift > self.config.pose_lock_max_shift_m
+                    or turned > self.config.pose_lock_max_rotation_deg):
+                self.release(
+                    f"新觀測與鎖定姿態相差 {shift * 100:.1f} cm / {turned:.2f}°，解除姿態鎖定")
+                return PoseLockDecision(False, self.release_reason)
+        return PoseLockDecision(True)
 
 
 def project_targets_from_pose(

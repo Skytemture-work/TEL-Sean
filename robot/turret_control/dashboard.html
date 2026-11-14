@@ -834,7 +834,7 @@
       text("sumRemaining", integer(plan.remaining_shots || 0));
       text("sumTotal", `共 ${plan.total_shots || 0} ${confirmationMode ? "孔" : "球"}`);
       text("sumCapacity", system.ammo_capacity === null || system.ammo_capacity === undefined ? "—" : `${system.ammo_capacity}`);
-      text("sumPose", pose.source === "partial" && pose.state === "ready" ? "單孔／少孔追蹤" : (({ ready: "穩定", settling: "收斂中", invalid: "無效", virtual: "虛擬" })[pose.state] || "—"));
+      text("sumPose", pose.source === "locked" && pose.state === "ready" ? "遮蔽鎖定" : pose.source === "partial" && pose.state === "ready" ? "單孔／少孔追蹤" : (({ ready: "穩定", settling: "收斂中", invalid: "無效", virtual: "虛擬" })[pose.state] || "—"));
       text("sumPoseMeta", pose.reprojection_error_px === null || pose.reprojection_error_px === undefined ? "等待 PnP" : `${pose.source === "partial" ? "平移殘差" : "重投影誤差"} ${pose.reprojection_error_px.toFixed(2)} px`);
       text("sumGate", firing.allowed ? "就緒" : "鎖定");
       text("sumGateMeta", firing.allowed ? "可接受操作確認" : "安全條件未成立");

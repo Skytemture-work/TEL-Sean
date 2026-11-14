@@ -33,6 +33,7 @@ from .board import BoardTarget, EngagementPlan
 from .board_vision import BoardVision, DEFAULT_MODEL, DEFAULT_CONFIDENCE
 from .board_depth_plane import apply_board_depth_plane, fit_board_depth_plane
 from .board_pose import (
+    BoardPoseLock,
     BoardPoseTracker,
     board_lean_deg,
     prefer_observed_depth,
@@ -446,6 +447,10 @@ def main(
              "儀表板 board_lean_avg_deg 應接近 0）",
     )
     parser.add_argument(
+        "--no-pose-lock", action="store_true",
+        help="停用遮蔽姿態鎖定：靶板被擋住時立即停止瞄準／發射（舊行為）",
+    )
+    parser.add_argument(
         "--range-source", choices=("pnp", "zed"), default="pnp",
         help="孔的距離來源：pnp = 整片靶的 PnP 位置（預設）；zed = ZED 深度（舊行為，孔內深度會偏遠）",
     )
@@ -782,6 +787,8 @@ def main(
               + "，".join(f"{hole} {deg:+.2f}" for hole, deg in sorted(pitch_trim_deg.items())),
               flush=True)
     pose_tracker = BoardPoseTracker(config)
+    pose_lock = None if args.no_pose_lock or args.virtual_board else BoardPoseLock(config)
+    pose_locked_previous = False
     vision = None
     plan = None
     board_plan = None
@@ -1036,6 +1043,7 @@ def main(
                         print(f"已保存固定靶板版面：{args.calibrate_layout}", flush=True)
 
             pose = None
+            pose_locked = False
             depth_plane = None
             range_compare = {}
             pose_ready = args.virtual_board and frame_size_ok
@@ -1100,6 +1108,23 @@ def main(
                 elif not partial_shot_gate.allows(pose):
                     pose_ready = False
                     pose_blocked_reason = "partial pose shot used; waiting for stable PnP"
+                if pose_lock is not None:
+                    lock_decision = pose_lock.update(
+                        pose, pose_ready, now, getattr(camera, "imu_orientation", None))
+                    if not pose_ready and lock_decision.usable:
+                        # Vision blocked or settling, chassis unmoved: keep the
+                        # geometry from the last stable PnP and stay ready.
+                        pose = replace(pose_lock.pose, source="locked")
+                        pose_ready = True
+                        pose_blocked_reason = None
+                    elif not pose_ready and lock_decision.reason:
+                        pose_blocked_reason = f"{pose_blocked_reason}; {lock_decision.reason}"
+                pose_locked = pose is not None and pose.source == "locked"
+                if pose_locked != pose_locked_previous:
+                    print("視覺遮蔽：沿用最後穩定靶板姿態繼續瞄準／發射。" if pose_locked
+                          else "靶板姿態鎖定結束："
+                          + (pose_lock.release_reason or "已恢復即時 PnP。"), flush=True)
+                    pose_locked_previous = pose_locked
 
             # An operator confirmation belongs to the exact stable pose in
             # which it was given.  Never keep it latched across robot motion or
@@ -1291,6 +1316,7 @@ def main(
                     lean_deg=board_lean_deg(pose, config.camera_to_yaw_pitch_rad)
                     if pose is not None and pose.source == "pnp" else None,
                 )
+                record["pose_locked"] = pose_locked
                 if last_latency:
                     record["vision_ms"] = {key: round(value, 1) for key, value in last_latency.items()
                                            if key.endswith("_ms") and isinstance(value, (int, float))}

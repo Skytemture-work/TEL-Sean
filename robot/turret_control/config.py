@@ -154,6 +154,11 @@ class TurretConfig:
     board_dark_value_threshold: int = 105
     board_min_area_fraction: float = 0.04
 
+    # Two ZED 2 units are connected: the chassis (board) camera and the
+    # muzzle camera.  The SDK must open the chassis camera by serial number.
+    chassis_zed_serial: int = 21947470
+    muzzle_zed_serial: int = 20681321
+
     # Live metric pose (PnP) of the 300 x 340 cm target board.  The pose is
     # solved every frame, so moving the robot changes the projected hole
     # pixels and range without resetting the current firing plan.
@@ -172,6 +177,19 @@ class TurretConfig:
     board_pose_fire_rotation_rad_s: float = math.radians(8.0)
     board_pose_max_plausible_translation_m_s: float = 4.0
     board_pose_max_plausible_rotation_rad_s: float = math.radians(180.0)
+    # Occlusion lock: the board is fixed and the camera is bolted to the
+    # chassis, so the last stable PnP pose stays valid while the chassis has
+    # not moved.  Keep aiming/firing on it when vision is blocked; drop it
+    # when a fresh observation or the ZED IMU says the chassis moved.
+    pose_lock_max_shift_m: float = 0.03
+    pose_lock_max_rotation_deg: float = 1.0
+    pose_lock_max_imu_rotation_deg: float = 0.5
+    # The fused ZED yaw drifts steadily (~0.07 deg/s measured); the drift
+    # rate is learned over this window of stable-PnP frames and subtracted.
+    pose_lock_imu_drift_window_s: float = 10.0
+    pose_lock_imu_min_drift_span_s: float = 2.0
+    # Without an IMU (UVC camera) a push cannot be detected while blind.
+    pose_lock_max_blind_s_without_imu: float = 10.0
 
     # Special scoring lights around the three top (small) holes.  The hole is
     # Ø20 cm and the rule puts the strip's inner edge 5 cm beyond the circular
@@ -305,6 +323,12 @@ class TurretConfig:
             raise ValueError("board_pose_partial_max_age_s must be positive")
         if not 0.0 <= self.board_pose_partial_min_confidence <= 1.0:
             raise ValueError("board_pose_partial_min_confidence must be in 0..1")
+        for name in ("pose_lock_max_shift_m", "pose_lock_max_rotation_deg",
+                     "pose_lock_max_imu_rotation_deg", "pose_lock_max_blind_s_without_imu",
+                     "pose_lock_imu_drift_window_s", "pose_lock_imu_min_drift_span_s"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be positive")
         pose_speed_values = (
             self.board_pose_fire_translation_m_s,
             self.board_pose_fire_rotation_rad_s,

@@ -86,12 +86,119 @@ class ZedDepthTests(unittest.TestCase):
             self.assertEqual(depth[0, 0], 5.)
             self.assertEqual(camera.config.focal_length_x_px, 528.)
             self.assertEqual(camera.config.camera_distortion_coeffs, (0.,) * 5)
+            self.assertIsNone(camera.imu_orientation)  # this fake SDK has no IMU
             camera.camera.depth_failure = True
             ok, _, missing_depth = camera.read()
             self.assertTrue(ok)
             self.assertIsNone(missing_depth)  # Never reuse the preceding frame's depth.
             camera.release()
             self.assertTrue(camera.camera.closed)
+
+    def test_opens_the_chassis_camera_by_serial_and_rejects_another(self):
+        class Init:
+            def set_from_serial_number(self, serial):
+                self.serial = serial
+
+        class Camera:
+            reported_serial = None
+
+            def open(self, init):
+                Camera.requested = init.serial
+                return 0
+
+            def get_camera_information(self):
+                left = SimpleNamespace(fx=528., fy=529., cx=639., cy=361.)
+                return SimpleNamespace(serial_number=Camera.reported_serial, camera_configuration=SimpleNamespace(
+                    calibration_parameters=SimpleNamespace(left_cam=left)))
+
+            def close(self):
+                Camera.closed = True
+
+        sl = SimpleNamespace(Camera=Camera, Mat=SimpleNamespace, InitParameters=Init,
+                             RuntimeParameters=SimpleNamespace,
+                             RESOLUTION=SimpleNamespace(HD720=1), UNIT=SimpleNamespace(METER=1),
+                             DEPTH_MODE=SimpleNamespace(ULTRA=1), ERROR_CODE=SimpleNamespace(SUCCESS=0))
+        config = TurretConfig()
+        with patch.dict("sys.modules", {"pyzed": SimpleNamespace(sl=sl), "pyzed.sl": sl}):
+            Camera.reported_serial = config.chassis_zed_serial
+            ZedDepthCamera(config)
+            self.assertEqual(Camera.requested, config.chassis_zed_serial)
+            Camera.reported_serial = config.muzzle_zed_serial
+            Camera.closed = False
+            with self.assertRaisesRegex(ValueError, "不是車體相機"):
+                ZedDepthCamera(config)
+            self.assertTrue(Camera.closed)
+
+    def test_imu_orientation_follows_each_grab(self):
+        class Mat:
+            def get_data(self):
+                return self.data
+
+        class Imu:
+            def __init__(self, quaternion, available=True):
+                self.is_available = available
+                self._quaternion = quaternion
+
+            def get_pose(self):
+                orientation = SimpleNamespace(get=lambda: np.array(self._quaternion))
+                return SimpleNamespace(get_orientation=lambda: orientation)
+
+        class Sensors:
+            imu = None
+
+            def get_imu_data(self):
+                return Sensors.imu
+
+        class Camera:
+            sensors_status = 0
+            grab_status = 0
+
+            def open(self, init):
+                return 0
+
+            def get_camera_information(self):
+                left = SimpleNamespace(fx=528., fy=529., cx=639., cy=361.)
+                return SimpleNamespace(camera_configuration=SimpleNamespace(
+                    calibration_parameters=SimpleNamespace(left_cam=left)))
+
+            def grab(self, runtime):
+                return self.grab_status
+
+            def retrieve_image(self, image, view):
+                image.data = np.zeros((720, 1280, 4), dtype=np.uint8)
+                return 0
+
+            def get_sensors_data(self, sensors, reference):
+                return self.sensors_status
+
+            def close(self):
+                pass
+
+        sl = SimpleNamespace(Camera=Camera, Mat=Mat, InitParameters=SimpleNamespace,
+                             RuntimeParameters=SimpleNamespace, SensorsData=Sensors,
+                             TIME_REFERENCE=SimpleNamespace(IMAGE=0),
+                             RESOLUTION=SimpleNamespace(HD720=1), UNIT=SimpleNamespace(METER=1),
+                             DEPTH_MODE=SimpleNamespace(ULTRA=1), ERROR_CODE=SimpleNamespace(SUCCESS=0),
+                             VIEW=SimpleNamespace(LEFT=1), MEASURE=SimpleNamespace(DEPTH=1))
+        with patch.dict("sys.modules", {"pyzed": SimpleNamespace(sl=sl), "pyzed.sl": sl}):
+            camera = ZedDepthCamera(TurretConfig())
+            Sensors.imu = Imu((0.0, 0.0, 0.1, 0.995))
+            self.assertTrue(camera.read(want_depth=False)[0])
+            self.assertEqual(camera.imu_orientation, (0.0, 0.0, 0.1, 0.995))
+            for broken in (Imu((0.0, 0.0, 0.1, 0.995), available=False),
+                           Imu((float("nan"), 0.0, 0.0, 1.0)), Imu((0.0, 0.0, 0.0, 0.0))):
+                Sensors.imu = broken
+                camera.read(want_depth=False)
+                self.assertIsNone(camera.imu_orientation)
+            Sensors.imu = Imu((0.0, 0.0, 0.0, 1.0))
+            camera.camera.sensors_status = 1
+            camera.read(want_depth=False)
+            self.assertIsNone(camera.imu_orientation)
+            camera.camera.sensors_status = 0
+            camera.read(want_depth=False)
+            camera.camera.grab_status = 1
+            self.assertFalse(camera.read(want_depth=False)[0])
+            self.assertIsNone(camera.imu_orientation)  # no stale reading after a failed grab
 
 
 if __name__ == "__main__":
