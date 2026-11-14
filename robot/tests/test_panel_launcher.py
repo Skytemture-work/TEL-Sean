@@ -111,6 +111,15 @@ class PanelLauncherTests(unittest.TestCase):
         self.tick()
         self.controller.request_shot.assert_called_once_with()
 
+    def test_reload_hold_keeps_turret_still_and_blocks_the_click(self):
+        self.click()
+        status = real._update_panel_engagement(
+            self.driver, self.launcher, self.dashboard, self.driver.plan, True, None,
+            hold_reason='等待裝填')
+        self.assertFalse(status.fired)
+        self.assertIsNone(self.turret.targets[-1])  # held: no aiming target
+        self.controller.request_shot.assert_not_called()
+
     def test_no_click_never_fires_or_consumes_cooldown_or_advances(self):
         for _ in range(20):
             self.assertFalse(self.tick().fired)

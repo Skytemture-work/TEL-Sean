@@ -39,6 +39,7 @@ class DashboardState:
         self._panel_fire_enabled = False
         self._fire_action = None
         self._fire_nonce = 0
+        self._reload_done = False
 
     def update_frame(self, frame: bytes, channel: str = "main") -> None:
         with self._lock:
@@ -135,6 +136,21 @@ class DashboardState:
             # Replaying an old HTTP request must never authorize another shot.
             self._fire_nonce += 1
             return True, "射擊請求已送出，等待本幀瞄準條件確認"
+
+    def request_reload_done(self):
+        """Operator confirms the magazine was refilled during a match."""
+        with self._lock:
+            match = self._telemetry.get("match") or {}
+            age_ms = time.time() * 1000 - self._telemetry.get("generated_at_ms", 0)
+            if not self._running or not match.get("reload_wait") or not 0 <= age_ms < 3000:
+                return False, "目前不需要裝填"
+            self._reload_done = True
+            return True, "已收到裝填完成，下一幀恢復射擊"
+
+    def take_reload_done(self) -> bool:
+        with self._lock:
+            done, self._reload_done = self._reload_done, False
+            return done
 
     def take_panel_fire(self):
         with self._lock:
@@ -648,7 +664,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):  # noqa: N802
         path = urlsplit(self.path).path
-        if path not in ("/api/confirm", "/api/reset", "/api/fire"):
+        if path not in ("/api/confirm", "/api/reset", "/api/fire", "/api/reload"):
             self.send_error(404)
             return
         origin = self.headers.get("Origin")
@@ -665,7 +681,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
         except (ValueError, UnicodeDecodeError):
             self.send_error(400)
             return
-        if path == "/api/fire":
+        if path == "/api/reload":
+            ok, message = self.state.request_reload_done()
+        elif path == "/api/fire":
             ok, message = self.state.request_panel_fire(
                 payload.get("plan_index"), payload.get("hole_id"), payload.get("nonce"),
                 payload.get("plan_revision"))

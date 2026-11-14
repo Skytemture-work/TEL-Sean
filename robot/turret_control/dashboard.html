@@ -590,6 +590,7 @@
 
         <div class="manual-controls" id="panelControls" hidden>
           <button id="fireShot" class="fire" type="button" disabled title="每次點擊僅執行一個 FIRE 階段">射擊</button>
+          <button id="reloadDone" class="fire" type="button" hidden title="彈倉補滿後按下，比賽繼續射擊">裝填完成</button>
         </div>
         <div class="manual-status" id="launcherStatus" hidden>等待發射器狀態</div>
 
@@ -691,6 +692,7 @@
     let manualPending = false;
     let panelState = {};
     let panelPending = false;
+    let reloadPending = false;
     const $ = id => document.getElementById(id);
 
     function text(id, value) { $(id).textContent = value; }
@@ -851,11 +853,17 @@
         : launcher.pending ? "發射階段執行中…" : panelState.ready ? `射擊 ${panelState.hole_id || ""}` : "等待瞄準到位");
       const match = data.match || null;
       const matchText = !match ? "" : (match.elapsed_s == null
-        ? `【比賽 ${match.phase}】等待亮燈開賽｜已裝 ${match.balls_remaining} 顆。`
-        : `【比賽 ${match.phase}】${match.stopped || `剩 ${match.remaining_s}s`}｜加分格 ${match.bonus_hole_id || "—"}（${match.round_phase}）｜剩 ${match.balls_remaining} 顆。`);
+        ? `【比賽 ${match.phase}】等待辨識靶板｜已裝 ${match.balls_remaining} 顆。`
+        : match.reload_wait
+          ? `【比賽 ${match.phase}】剩 ${match.remaining_s}s｜彈倉已射完：請裝填 ${match.reload_balls} 顆後按「裝填完成」。`
+          : `【比賽 ${match.phase}】${match.stopped || `剩 ${match.remaining_s}s`}｜${match.waiting_light ? "尋找亮燈加分孔…" : `加分格 ${match.bonus_hole_id || "—"}`}｜剩 ${match.balls_remaining} 顆。`);
+      const reloadButton = $("reloadDone");
+      reloadButton.hidden = !(match && match.reload_wait);
+      reloadButton.disabled = !(match && match.reload_wait) || reloadPending;
+      if (match && match.reload_wait) text("reloadDone", `裝填完成（${match.reload_balls} 顆）`);
       text("launcherStatus", `${matchText}雙飛輪 speed=${launcher.speed ?? "—"}／目標 ${launcher.target_rpm ?? "—"} RPM ｜ 格位 ${launcher.slot ?? "—"} ｜ 下一階段 ${launcher.next_stage ?? "—"}/3。${launcher.message || ""}`);
       const confirmationMode = detectionOnly || aimOnly;
-      text("modeSubtitle", panelMode ? (data.match ? "比賽全自動：亮燈開賽、規則配球、自動發射（Ctrl+C 停止）" : panelState.auto_fire ? "全自動：自動瞄準＋自動發射（Ctrl+C 停止）" : "自動瞄準／面板點擊發射") : detectionOnly ? "純偵測／唯讀：下一孔位、位置、距離與角度" : (aimOnly ? "實機僅瞄準：人工切換孔位，不發射" : "實機瞄準與射擊狀態"));
+      text("modeSubtitle", panelMode ? (data.match ? "比賽全自動：切自動即開賽、規則配球、自動發射（Ctrl+C 停止）" : panelState.auto_fire ? "全自動：自動瞄準＋自動發射（Ctrl+C 停止）" : "自動瞄準／面板點擊發射") : detectionOnly ? "純偵測／唯讀：下一孔位、位置、距離與角度" : (aimOnly ? "實機僅瞄準：人工切換孔位，不發射" : "實機瞄準與射擊狀態"));
       text("targetTitle", detectionOnly ? "下一個孔位（唯讀計算）" : (aimOnly ? "下一個孔位（僅瞄準）" : "下一個孔位"));
 
       text("sumNext", target.hole_id || "—");
@@ -975,6 +983,21 @@
 
     $("confirmNext").addEventListener("click", () => manualPost("/api/confirm"));
     $("resetPlan").addEventListener("click", () => manualPost("/api/reset"));
+
+    $("reloadDone").addEventListener("click", async () => {
+      if (reloadPending || $("reloadDone").disabled) return;
+      reloadPending = true;
+      $("reloadDone").disabled = true;
+      try {
+        const response = await fetch("/api/reload", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+        const result = await response.json();
+        text("launcherStatus", result.message || "裝填確認未完成");
+      } catch (error) {
+        text("launcherStatus", "無法確認裝填結果，請查看狀態後再按一次");
+      } finally {
+        reloadPending = false;
+      }
+    });
 
     $("fireShot").addEventListener("click", async () => {
       if (panelPending || !panelState.enabled || !panelState.ready || $("fireShot").disabled) return;

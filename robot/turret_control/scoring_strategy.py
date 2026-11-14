@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from .board import BoardTarget, EngagementPlan
 from .scoring_light import SCORE_HOLE_IDS
@@ -74,108 +74,61 @@ def _targets_by_id(plan: EngagementPlan) -> Dict[str, BoardTarget]:
     return result
 
 
-def _nearest_neighbor_order(
-    targets: Iterable[BoardTarget], start: Optional[BoardTarget]
-) -> List[BoardTarget]:
-    """Greedily reduce turret travel without changing shot allocation."""
-
-    remaining = list(targets)
-    ordered: List[BoardTarget] = []
-    current = start
-    while remaining:
-        if current is None:
-            index = min(
-                range(len(remaining)),
-                key=lambda i: remaining[i].hole_id or "",
-            )
-        else:
-            index = min(
-                range(len(remaining)),
-                key=lambda i: (
-                    math.hypot(
-                        remaining[i].u_px - current.u_px,
-                        remaining[i].v_px - current.v_px,
-                    ),
-                    remaining[i].hole_id or "",
-                ),
-            )
-        current = remaining.pop(index)
-        ordered.append(current)
-    return ordered
-
-
-def _most_reliable_targets(
-    targets: Sequence[BoardTarget], count: int
-) -> List[BoardTarget]:
-    """Choose repeat-shot cells with the strongest visual geometry."""
-
-    if count <= 0:
-        return []
-    center_u = sum(target.u_px for target in targets) / len(targets)
-    center_v = sum(target.v_px for target in targets) / len(targets)
-    return sorted(
-        targets,
-        key=lambda target: (
-            -target.confidence,
-            -target.size_px,
-            math.hypot(target.u_px - center_u, target.v_px - center_v),
-            target.hole_id or "",
-        ),
-    )[:count]
+# Team decision (2026-11-14): upper half = 9 balls into the lit bonus hole
+# (only within the first 60 s, while the light is on), then two balls per grid
+# cell in numeric order.  The first magazine (18) runs out after H05 #1; the
+# team reloads and the plan continues.
+UPPER_BONUS_BALLS = 9
+UPPER_BONUS_WINDOW_S = 60.0
+UPPER_GRID_IDS: Tuple[str, ...] = tuple(
+    f"H{n:02d}" for n in range(1, 10) for _ in range(2))
 
 
 def build_max_score_strategy(
     board_plan: EngagementPlan,
-    active_bonus_hole_id: str,
+    active_bonus_hole_id: Optional[str],
     phase: str,
 ) -> FiringStrategy:
-    """Build a legal maximum-score plan for one upper/lower-half match.
+    """Build the firing plan for one upper/lower-half match.
 
-    Rule source: ``2026_rule_0903.pdf`` pages 5, 7, 9, 11, 12 and 14.
-
-    Upper half: 27 balls.  Put three into the active 4-point bonus hole, then
-    use all 24 remaining balls in the nine 2-point grid holes.  Every grid is
-    attempted before repeats because distinct hit cells are the second
-    tie-breaker.  The theoretical maximum is 60 points.
+    Upper half (27 balls, reload after 18): ``UPPER_BONUS_BALLS`` into the
+    lit bonus hole, then ``UPPER_GRID_IDS``.  ``active_bonus_hole_id=None``
+    (no light seen within the bonus window) gives the grid part only.
 
     Lower half: 18 balls, no bonus shots (team decision).  Two consecutive
     balls per grid cell, cells visited in ``LOWER_SERPENTINE_IDS`` order to
-    minimise muzzle travel.  The scoring light only starts the match here.
+    minimise muzzle travel.  The scoring light is not used.
     The theoretical maximum is 36 + 34 = 70 points.
     """
 
     if phase not in MATCH_PHASES:
         raise ValueError(f"unknown match phase: {phase}")
-    if active_bonus_hole_id not in SCORE_HOLE_IDS:
+    if active_bonus_hole_id is not None and active_bonus_hole_id not in SCORE_HOLE_IDS:
         raise ValueError(f"not a scoring-light hole: {active_bonus_hole_id}")
 
     by_id = _targets_by_id(board_plan)
-    required_ids = {active_bonus_hole_id} | {
-        f"H{number:02d}" for number in range(1, 10)
-    }
+    required_ids = {f"H{number:02d}" for number in range(1, 10)}
+    if active_bonus_hole_id is not None and phase == UPPER_PHASE:
+        required_ids.add(active_bonus_hole_id)
     missing = sorted(required_ids - set(by_id))
     if missing:
         raise ValueError(f"board plan is missing holes: {', '.join(missing)}")
 
-    bonus_target = by_id[active_bonus_hole_id]
-    large_targets = [by_id[f"H{number:02d}"] for number in range(1, 10)]
-
     if phase == UPPER_PHASE:
-        first_pass = _nearest_neighbor_order(large_targets, bonus_target)
-        second_pass = _nearest_neighbor_order(large_targets, first_pass[-1])
-        six_best = _most_reliable_targets(large_targets, 6)
-        third_pass = _nearest_neighbor_order(six_best, second_pass[-1])
-        shots = [bonus_target] * 3 + first_pass + second_pass + third_pass
+        bonus = UPPER_BONUS_BALLS if active_bonus_hole_id is not None else 0
+        shots = ([by_id[active_bonus_hole_id]] * bonus if bonus else [])
+        shots += [by_id[hole_id] for hole_id in UPPER_GRID_IDS]
+        grid = len(UPPER_GRID_IDS)
         return FiringStrategy(
             phase=phase,
             plan=EngagementPlan(shots),
-            total_balls=27,
-            bonus_balls=3,
-            grid_balls=24,
-            base_points=48,
-            bonus_points=12,
+            total_balls=bonus + grid,
+            bonus_balls=bonus,
+            grid_balls=grid,
+            base_points=2 * grid,
+            bonus_points=4 * bonus,
             line_points=0,
-            theoretical_max_points=60,
+            theoretical_max_points=2 * grid + 4 * bonus,
         )
 
     shots = [by_id[hole_id] for hole_id in LOWER_SERPENTINE_IDS

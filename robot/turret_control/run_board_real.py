@@ -63,6 +63,7 @@ from .shared_motor_backend import (
 )
 from .run_yolo_demo import _inference_frame
 from .live_preview import LatestFrameGrabber, LivePreviewPublisher
+from .match_sequencer import MatchSequencer
 from .scoring_light import ScoreRoundController, draw_score_light_overlay
 from .scoring_strategy import (
     MATCH_PHASES,
@@ -268,7 +269,8 @@ def _auto_fire_ready(driver, launcher, plan, pose_ready, previous_status):
 
 
 def _update_panel_engagement(driver, launcher, dashboard, plan, pose_ready, blocked_reason,
-                             auto_fire=None, previous_status=None, fire_hold=None):
+                             auto_fire=None, previous_status=None, fire_hold=None,
+                             hold_reason=None):
     """Validate a click on this frame; never retain an unexecuted authorization.
 
     With ``auto_fire`` the click comes from ``AutoFireTrigger`` instead of the
@@ -278,12 +280,14 @@ def _update_panel_engagement(driver, launcher, dashboard, plan, pose_ready, bloc
     launcher.check_health()
     if launcher.busy and not pose_ready:
         raise RuntimeError("發射期間靶板姿態失效，停止發射控制")
+    # hold_reason (e.g. waiting for a reload) keeps the turret still and
+    # blocks firing; fire_hold only blocks firing.
     driver.set_aiming_enabled(
-        pose_ready and not launcher.busy,
-        "發射階段執行中，砲口保持位置" if launcher.busy else blocked_reason,
+        pose_ready and not launcher.busy and hold_reason is None,
+        "發射階段執行中，砲口保持位置" if launcher.busy else (hold_reason or blocked_reason),
     )
-    driver.set_firing_enabled(pose_ready and fire_hold is None,
-                              blocked_reason if not pose_ready else fire_hold)
+    driver.set_firing_enabled(pose_ready and fire_hold is None and hold_reason is None,
+                              blocked_reason if not pose_ready else (hold_reason or fire_hold))
     action = dashboard.take_panel_fire()
     if auto_fire is not None:
         action = auto_fire.take(
@@ -464,8 +468,8 @@ def main(
         help="比賽模式：彈藥倉已裝球數（預設 18＝6 格 × 3 顆；範圍 1～18）",
     )
     parser.add_argument(
-        "--match-duration", type=float, default=180.0,
-        help="比賽模式：從開賽起算的發射時限秒數（預設 180；範圍 30～300）",
+        "--match-duration", type=float, default=240.0,
+        help="比賽模式：從開賽（辨識到靶板）起算的發射時限秒數（預設 240，預留時間避免中途停機；範圍 30～300）",
     )
     parser.add_argument(
         "--fire-tolerance-deg", type=float, default=None,
@@ -724,10 +728,10 @@ def main(
         )
     if args.match_fire:
         print(
-            f"比賽全自動模式（{args.match_phase}）：保持不動等待指定得分格亮燈即開賽；"
-            f"已裝 {args.balls_loaded} 顆，時限 {args.match_duration:g} 秒；"
-            f"到位容許誤差 大孔 {args.fire_tolerance_deg:g}°／小孔 {args.small_fire_tolerance_deg:g}°。"
-            "無法偵測燈號時，可在 OpenCV 視窗（不加 --headless）按 G 手動開賽。",
+            f"比賽全自動模式（{args.match_phase}）：辨識到靶板即開賽並開始射擊"
+            + ("，偵測到亮燈後插入 3 顆加分球" if args.match_phase == "upper" else "，不射加分孔")
+            + f"；已裝 {args.balls_loaded} 顆，時限 {args.match_duration:g} 秒（自建立計畫起算）；"
+            f"到位容許誤差 大孔 {args.fire_tolerance_deg:g}°／小孔 {args.small_fire_tolerance_deg:g}°。",
             flush=True,
         )
     elif args.score_mode:
@@ -920,7 +924,9 @@ def main(
         min_value=config.score_light_min_value,
     )
     if args.match_fire:
-        # Stay still until the scoring light (= whistle) is confirmed.
+        # The remote switches to auto mode at the whistle, so firing starts as
+        # soon as the board is seen.  The light is still watched: the upper
+        # half inserts its bonus balls once the lit hole is confirmed.
         score_round.arm_auto_start()
     strategy_round_id = None
     expiry_processed_round_id = None
@@ -955,9 +961,9 @@ def main(
     restore_completed = args.restore_completed_aim
     auto_fire = None
     previous_status = None
-    match_started_at = None
-    match_stop_reason = None
-    balls_remaining = args.balls_loaded
+    match = (MatchSequencer(args.match_phase, args.match_duration, args.balls_loaded,
+                            lambda new_plan: driver.set_plan(new_plan))
+             if args.match_fire else None)
 
     def begin_home():
         nonlocal home_active, home_error
@@ -1302,23 +1308,18 @@ def main(
                 else None
             )
             score_state = score_probe_state if args.score_mode else None
-            if args.match_fire:
-                if match_started_at is None and score_state.started_at is not None:
-                    match_started_at = score_state.started_at
-                    print(f"開賽：{score_state.active_hole_id or '手動開始'}；"
-                          f"時限 {args.match_duration:g} 秒。", flush=True)
-                stop_reason = None
-                if match_started_at is not None and now - match_started_at >= args.match_duration:
-                    stop_reason = "比賽時間到，停止發射"
-                elif balls_remaining <= 0:
-                    stop_reason = "已裝彈藥全部射出，停止發射"
-                if (stop_reason is not None and match_stop_reason is None
-                        and not (launcher is not None and launcher.pending)):
-                    match_stop_reason = stop_reason
-                    plan = EngagementPlan([])
-                    driver.set_plan(plan)
-                    print(f"{stop_reason}（剩餘 {balls_remaining} 顆）。", flush=True)
-            if args.score_mode and match_stop_reason is None:
+            if match is not None:
+                match.step(
+                    now, board_plan,
+                    score_state.active_hole_id if score_state.phase == "active" else None,
+                    launcher_idle=not (launcher is not None and launcher.pending),
+                    mechanism_busy=bool(launcher is not None and launcher.mechanism_busy),
+                    reload_confirmed=bool(dashboard is not None and dashboard.take_reload_done()),
+                )
+                plan = match.plan if match.plan is not None else plan
+                if match.bonus_hole_id is not None:
+                    last_bonus_hole_id = match.bonus_hole_id
+            if args.score_mode and not args.match_fire:
                 if (
                     score_state.phase == "active"
                     and score_state.active_hole_id is not None
@@ -1417,7 +1418,8 @@ def main(
                 status = _update_panel_engagement(
                     driver, launcher, dashboard, plan, pose_ready, pose_blocked_reason,
                     auto_fire=auto_fire, previous_status=previous_status,
-                    fire_hold=muzzle_hold)
+                    fire_hold=muzzle_hold,
+                    hold_reason=match.hold_reason if match is not None else None)
             else:
                 status = driver.update()
             if launcher is not None:
@@ -1474,8 +1476,8 @@ def main(
                     flush=True,
                 )
             previous_status = status
-            if args.match_fire and status.fired:
-                balls_remaining -= 1
+            if match is not None and status.fired:
+                match.record_fired()
             partial_shot_gate.record(pose, status.fired)
             control_done_at = time.perf_counter()
             yaw_motor_state = motors.get_state(config.yaw_motor_id)
@@ -1690,17 +1692,8 @@ def main(
                     telemetry["system"]["panel_fire"] = True
                     telemetry["system"]["auto_fire"] = auto_fire is not None
                     if args.match_fire:
-                        telemetry["match"] = {
-                            "phase": args.match_phase,
-                            "round_phase": score_state.phase if score_state is not None else None,
-                            "bonus_hole_id": last_bonus_hole_id,
-                            "elapsed_s": (round(now - match_started_at, 1)
-                                          if match_started_at is not None else None),
-                            "remaining_s": (round(max(0.0, args.match_duration - (now - match_started_at)), 1)
-                                            if match_started_at is not None else None),
-                            "balls_remaining": balls_remaining,
-                            "stopped": match_stop_reason,
-                        }
+                        telemetry["match"] = match.telemetry(
+                            now, score_state.phase if score_state is not None else None)
                     telemetry["launcher"] = launcher.snapshot()
                     telemetry["panel_control"] = {
                         "enabled": True,
@@ -1773,7 +1766,7 @@ def main(
                 else:
                     fire_requested = False
                     print("姿態尚未穩定，已拒絕 F 發射確認。", flush=True)
-            elif key == ord("g") and args.score_mode:
+            elif key == ord("g") and args.score_mode and not args.match_fire:
                 score_round.start_round()
                 strategy_round_id = None
                 expiry_processed_round_id = None

@@ -321,6 +321,40 @@ class DashboardTelemetryTests(unittest.TestCase):
         self.assertEqual(health, b"ok")
 
 
+class ReloadConfirmTest(unittest.TestCase):
+    def _state(self, reload_wait, age_ms=0):
+        state = DashboardState()
+        state.update_telemetry({"generated_at_ms": int(time.time() * 1000) - age_ms,
+                                "system": {"online": True},
+                                "match": {"reload_wait": reload_wait}})
+        return state
+
+    def test_reload_only_accepted_while_waiting_and_consumed_once(self):
+        state = self._state(False)
+        self.assertFalse(state.request_reload_done()[0])
+        self.assertFalse(state.take_reload_done())
+        state = self._state(True)
+        self.assertTrue(state.request_reload_done()[0])
+        self.assertTrue(state.take_reload_done())
+        self.assertFalse(state.take_reload_done())
+        self.assertFalse(self._state(True, age_ms=10000).request_reload_done()[0])
+
+    def test_reload_endpoint(self):
+        state = self._state(True)
+        server = start_dashboard_server(state, 0, host="127.0.0.1")
+        try:
+            port = server.server_address[1]
+            request = Request(f"http://127.0.0.1:{port}/api/reload", data=b"{}", method="POST",
+                              headers={"Content-Type": "application/json"})
+            with urlopen(request, timeout=2) as response:
+                self.assertTrue(json.loads(response.read())["ok"])
+            self.assertTrue(state.take_reload_done())
+        finally:
+            state.stop()
+            server.shutdown()
+            server.server_close()
+
+
 class DashboardFrameWaitTest(unittest.TestCase):
     def test_wait_frame_returns_new_frame_immediately(self):
         import threading

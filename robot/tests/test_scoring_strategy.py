@@ -4,6 +4,7 @@ from turret_control.board import BoardTarget, EngagementPlan
 from turret_control.official_board import hole_id_for_cell
 from turret_control.scoring_strategy import (
     LOWER_LINE_FIRST_IDS,
+    UPPER_GRID_IDS,
     append_reallocated_grid_shots,
     build_max_score_strategy,
 )
@@ -34,18 +35,15 @@ def _board_plan() -> EngagementPlan:
 
 
 class ScoringStrategyTests(unittest.TestCase):
-    def test_upper_uses_27_balls_without_exceeding_cell_caps(self):
+    def test_upper_is_nine_bonus_then_grid_pairs_in_numeric_order(self):
         strategy = build_max_score_strategy(_board_plan(), "H11", "upper")
 
         self.assertEqual(len(strategy.plan), 27)
-        self.assertEqual(strategy.hole_ids[:3], ("H11", "H11", "H11"))
-        self.assertEqual(strategy.theoretical_max_points, 60)
-        counts = {
-            hole_id: strategy.hole_ids.count(hole_id)
-            for hole_id in (f"H{number:02d}" for number in range(1, 10))
-        }
-        self.assertEqual(sum(counts.values()), 24)
-        self.assertTrue(all(2 <= count <= 3 for count in counts.values()))
+        self.assertEqual(strategy.hole_ids[:9], ("H11",) * 9)
+        self.assertEqual(strategy.hole_ids[9:], (
+            "H01", "H01", "H02", "H02", "H03", "H03", "H04", "H04", "H05",
+            "H05", "H06", "H06", "H07", "H07", "H08", "H08", "H09", "H09"))
+        self.assertEqual(strategy.hole_ids[9:], UPPER_GRID_IDS)
 
     def test_lower_skips_bonus_and_shoots_each_cell_twice_in_serpentine(self):
         strategy = build_max_score_strategy(_board_plan(), "H12", "lower")
@@ -67,10 +65,10 @@ class ScoringStrategyTests(unittest.TestCase):
         strategy = build_max_score_strategy(board, "H10", "upper")
 
         replacements = append_reallocated_grid_shots(
-            strategy.plan, board, "upper", 3
+            strategy.plan, board, "upper", 9
         )
 
-        self.assertEqual(len(replacements), 3)
+        self.assertEqual(len(replacements), 9)
         counts = {
             hole_id: sum(
                 target.hole_id == hole_id for target in strategy.plan.targets
@@ -90,6 +88,17 @@ class ScoringStrategyTests(unittest.TestCase):
         self.assertEqual(replacements, ())
         self.assertEqual(len(strategy.plan), 18)
 
+
+
+class NoLightTests(unittest.TestCase):
+    def test_upper_without_light_is_grid_only(self):
+        strategy = build_max_score_strategy(_board_plan(), None, "upper")
+        self.assertEqual(strategy.hole_ids, UPPER_GRID_IDS)
+        self.assertEqual(strategy.bonus_balls, 0)
+
+    def test_lower_ignores_the_light(self):
+        self.assertEqual(build_max_score_strategy(_board_plan(), None, "lower").hole_ids,
+                         build_max_score_strategy(_board_plan(), "H11", "lower").hole_ids)
 
 if __name__ == "__main__":
     unittest.main()
