@@ -83,6 +83,12 @@ VESC_RUNTIME_RETRY_DELAY = 0.1
 VESC_MAX_MOTOR_CURRENT_A = 50.0
 VESC_MAX_INPUT_VOLTAGE_V = 30.0
 VESC_MIN_INPUT_VOLTAGE_V = 10.5
+# 飛輪上下排列：LEFT = 上飛輪、RIGHT = 下飛輪。
+# 下輪比上輪快會讓球產生下旋（backspin），升力使彈道較平。
+# 目標轉速 target 為兩輪平均：上輪 = target*(1-k)、下輪 = target*(1+k)。
+# 0.05 → speed=100 時上 3800 / 下 4200 RPM（總差 10%）。設 0 恢復同轉速。
+# 修改此值後須重新標定彈道補償。
+FLYWHEEL_BACKSPIN_RATIO = 0.05
 VESC_MAX_TRIM_ERPM = 100.0
 VESC_MAX_SYNC_CORRECTION_ERPM = 50.0
 VESC_SPEED_KP = 0.10
@@ -281,6 +287,14 @@ def format_vesc_motor_temp(values):
     return "{:.1f}°C".format(values["motor_temp"])
 
 
+def flywheel_wheel_targets(target_rpm):
+    """平均目標轉速 → (LEFT 上輪, RIGHT 下輪) 目標 RPM；下輪較快產生下旋。"""
+    return (
+        target_rpm * (1.0 - FLYWHEEL_BACKSPIN_RATIO),
+        target_rpm * (1.0 + FLYWHEEL_BACKSPIN_RATIO),
+    )
+
+
 class VESCDualMotorController:
     """
     背景控制左右 VESC 馬達。
@@ -328,13 +342,17 @@ class VESCDualMotorController:
             previous = self._speed_value
             self._speed_value = speed_value
         if speed_value != previous:
-            target_rpm = (
-                "STOP" if speed_value is None
-                else int(VESC_MIN_RPM + speed_value * VESC_RPM_PER_SPEED_UNIT)
-            )
+            if speed_value is None:
+                target_text = "STOP"
+            else:
+                target_rpm = VESC_MIN_RPM + speed_value * VESC_RPM_PER_SPEED_UNIT
+                top, bottom = flywheel_wheel_targets(target_rpm)
+                target_text = "{:.0f} RPM（上 {:.0f} / 下 {:.0f}）".format(
+                    target_rpm, top, bottom
+                )
             print(
-                "[VESC CMD] speed={} -> target={} RPM".format(
-                    "STOP" if speed_value is None else speed_value, target_rpm
+                "[VESC CMD] speed={} -> target={}".format(
+                    "STOP" if speed_value is None else speed_value, target_text
                 ),
                 flush=True,
             )
@@ -501,11 +519,12 @@ class VESCDualMotorController:
                 else:
                     rpm_left = left["erpm"] / VESC_LEFT_POLE_PAIRS
                     rpm_right = right["erpm"] / VESC_RIGHT_POLE_PAIRS
-                    base_left = target_rpm * VESC_LEFT_POLE_PAIRS
-                    base_right = target_rpm * VESC_RIGHT_POLE_PAIRS
+                    goal_left, goal_right = flywheel_wheel_targets(target_rpm)
+                    base_left = goal_left * VESC_LEFT_POLE_PAIRS
+                    base_right = goal_right * VESC_RIGHT_POLE_PAIRS
 
-                    error_left = target_rpm - rpm_left
-                    error_right = target_rpm - rpm_right
+                    error_left = goal_left - rpm_left
+                    error_right = goal_right - rpm_right
                     pi_left_integral += error_left * dt
                     pi_right_integral += error_right * dt
                     trim_left = self._clamp(
@@ -516,8 +535,9 @@ class VESCDualMotorController:
                         VESC_SPEED_KP * error_right + VESC_SPEED_KI * pi_right_integral,
                         -VESC_MAX_TRIM_ERPM, VESC_MAX_TRIM_ERPM,
                     )
+                    # 同步修正維持「設定的轉速差」，而不是把兩輪拉成同速。
                     sync = self._clamp(
-                        VESC_SYNC_KP * (rpm_left - rpm_right),
+                        VESC_SYNC_KP * (error_right - error_left),
                         -VESC_MAX_SYNC_CORRECTION_ERPM,
                         VESC_MAX_SYNC_CORRECTION_ERPM,
                     )

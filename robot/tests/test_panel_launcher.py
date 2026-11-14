@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import manual
+from manual import flywheel_wheel_targets
 from turret_control.aiming import AimCommand
 from turret_control.board import BoardTarget, EngagementPlan
 from turret_control.board_pose import update_plan_geometry
@@ -624,7 +625,7 @@ class ShotToolTests(unittest.TestCase):
         now = [10.0]
         controller = Mock(busy=False, shot_error=None, current_slot=2, shot_stage=1,
                           shot_request_seq=0, shot_released_seq=0)
-        controller.vesc_controller.last_rpm = (3990.0, 4010.0, time.monotonic())
+        controller.vesc_controller.last_rpm = (3790.0, 4210.0, time.monotonic())
         controller.request_shot.return_value = True
         launcher = PanelLauncher(Mock(), controller_factory=Mock(return_value=controller),
                                  clock=lambda: now[0])
@@ -633,7 +634,7 @@ class ShotToolTests(unittest.TestCase):
         self.assertFalse(launcher.fire(plan.current()))
         self.assertEqual(launcher.shots_started, 1)
         shot = dict(launcher.last_shot)
-        self.assertEqual(shot.pop('rpm')[:2], (3990.0, 4010.0))
+        self.assertEqual(shot.pop('rpm')[:2], (3790.0, 4210.0))
         self.assertEqual(shot, {
             'prev_mechanism_s': None, 'wait_after_release_s': None,
             'started_at': 10.0, 'hole_id': 'H05', 'plan_index': 0, 'slot': 2, 'stage': 2})
@@ -670,9 +671,11 @@ class FlywheelGateTests(unittest.TestCase):
 
     def test_click_is_refused_until_both_flywheels_are_at_speed(self):
         now = time.monotonic()
-        for rpm, ready in (((4000.0, 4000.0, now), True), ((4100.0, 3900.0, now), True),
-                           ((4000.0, 3500.0, now), False), ((1200.0, 1100.0, now), False),
-                           ((4000.0, 4000.0, now - 2.0), False), (None, False)):
+        top, bottom = flywheel_wheel_targets(4000.0)
+        for rpm, ready in (((top, bottom, now), True), ((top + 100.0, bottom - 100.0, now), True),
+                           ((top, 3500.0, now), False), ((bottom, top, now), False),
+                           ((1200.0, 1100.0, now), False),
+                           ((top, bottom, now - 2.0), False), (None, False)):
             with self.subTest(rpm=rpm):
                 launcher, controller = self._launcher(rpm)
                 self.assertEqual(launcher.flywheel_ready, ready)
@@ -689,7 +692,8 @@ class FlywheelGateTests(unittest.TestCase):
                                    command=SimpleNamespace(fire_allowed=True))
         driver = SimpleNamespace(fire_cooldown_ready=True)
         self.assertFalse(real._auto_fire_ready(driver, launcher, plan, True, previous))
-        launcher.controller.vesc_controller.last_rpm = (4000.0, 4000.0, time.monotonic())
+        launcher.controller.vesc_controller.last_rpm = (
+            *flywheel_wheel_targets(4000.0), time.monotonic())
         self.assertTrue(real._auto_fire_ready(driver, launcher, plan, True, previous))
 
 

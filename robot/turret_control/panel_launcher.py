@@ -122,8 +122,11 @@ class PanelLauncher:
         rpm = self.flywheel_rpm()
         if rpm is None:
             return False
-        limit = FLYWHEEL_READY_FRACTION * self.target_rpm
-        return all(abs(value - self.target_rpm) <= limit for value in rpm)
+        from manual import flywheel_wheel_targets
+
+        # 上下輪各自有目標（下旋轉速差），分別檢查是否到位。
+        return all(abs(value - goal) <= FLYWHEEL_READY_FRACTION * goal
+                   for value, goal in zip(rpm, flywheel_wheel_targets(self.target_rpm)))
 
     def _pending_shot_released(self):
         released = getattr(self.controller, "shot_released_seq", None)
