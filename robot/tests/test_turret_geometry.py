@@ -84,13 +84,14 @@ class TurretGeometryTests(unittest.TestCase):
     def test_measured_row_misses_are_reproduced_by_the_default_model(self):
         # 2026-11-13: pitch axis 5.49 m from the board, 0.315 m high; barrel
         # angles from the dashboard (inclinometer-verified); observed misses.
+        # Both wheels at 4000 RPM then (no backspin): the equal-speed fit.
         from turret_control import run_board_real as real
         config = with_competition_geometry(TurretConfig())
         for hole_height, barrel_deg, miss_m in ((1.20, 10.79, 0.08), (1.80, 16.77, 0.11),
                                                 (2.40, 22.43, 0.15), (2.90, 26.82, 0.20)):
             with self.subTest(height=hole_height):
                 impact = 0.315 + ballistics.rotating_exit_impact_height(
-                    math.radians(barrel_deg), 5.49, real.DEFAULT_MUZZLE_SPEED_M_S, 9.81,
+                    math.radians(barrel_deg), 5.49, real.EQUAL_SPEED_MUZZLE_SPEED_M_S, 9.81,
                     config.pitch_exit_offset_y_m, config.pitch_exit_offset_z_m,
                     real.DEFAULT_LAUNCH_ANGLE_RATIO)
                 self.assertAlmostEqual(impact, hole_height - miss_m, delta=0.01)

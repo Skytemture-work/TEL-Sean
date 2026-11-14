@@ -100,8 +100,13 @@ _MAX_PITCH_TRIM_DEG = 3.0
 # * the four row misses (8/11/15/20 cm low) at the inclinometer-verified barrel
 #   angles fit a drag-free arc of 32 m/s launched at 0.942 x barrel elevation
 #   within +-0.7 cm.  Re-fit after changing the flywheel speed.
+# * 2026-11-14: with backspin (top 3800 / bottom 4200 RPM) the lift made 32 m/s
+#   land 10-15 cm high on the whole grid at ~6 m and 43 m/s 10-15 cm low;
+#   35 m/s tested most accurate.  The parameter only scales the modelled
+#   drop (an effective speed), the flywheels are unchanged.
 DEFAULT_CAMERA_PITCH_DEG = 19.2
-DEFAULT_MUZZLE_SPEED_M_S = 32.0
+EQUAL_SPEED_MUZZLE_SPEED_M_S = 32.0  # 2026-11-13 fit, both wheels 4000 RPM
+DEFAULT_MUZZLE_SPEED_M_S = 35.0
 DEFAULT_LAUNCH_ANGLE_RATIO = 0.942
 
 
