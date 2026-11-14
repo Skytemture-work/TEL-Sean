@@ -47,19 +47,16 @@ class ScoringStrategyTests(unittest.TestCase):
         self.assertEqual(sum(counts.values()), 24)
         self.assertTrue(all(2 <= count <= 3 for count in counts.values()))
 
-    def test_lower_completes_high_value_lines_before_repeat_shots(self):
+    def test_lower_skips_bonus_and_shoots_each_cell_twice_in_serpentine(self):
         strategy = build_max_score_strategy(_board_plan(), "H12", "lower")
 
         self.assertEqual(len(strategy.plan), 18)
-        self.assertEqual(strategy.hole_ids[:2], ("H12", "H12"))
-        self.assertEqual(strategy.hole_ids[2:11], LOWER_LINE_FIRST_IDS)
-        self.assertEqual(strategy.theoretical_max_points, 74)
-        counts = {
-            hole_id: strategy.hole_ids.count(hole_id)
-            for hole_id in (f"H{number:02d}" for number in range(1, 10))
-        }
-        self.assertEqual(sum(counts.values()), 16)
-        self.assertTrue(all(1 <= count <= 2 for count in counts.values()))
+        self.assertNotIn("H12", strategy.hole_ids)
+        self.assertEqual(strategy.bonus_balls, 0)
+        self.assertEqual(strategy.hole_ids, (
+            "H01", "H01", "H02", "H02", "H03", "H03", "H06", "H06", "H05",
+            "H05", "H04", "H04", "H07", "H07", "H08", "H08", "H09", "H09"))
+        self.assertEqual(strategy.theoretical_max_points, 70)
 
     def test_rejects_non_scoring_top_hole(self):
         with self.assertRaises(ValueError):
@@ -82,7 +79,7 @@ class ScoringStrategyTests(unittest.TestCase):
         }
         self.assertTrue(all(count == 3 for count in counts.values()))
 
-    def test_unused_lower_bonus_balls_fill_the_two_single_grid_cells(self):
+    def test_lower_grid_is_already_at_the_two_ball_cap(self):
         board = _board_plan()
         strategy = build_max_score_strategy(board, "H12", "lower")
 
@@ -90,14 +87,8 @@ class ScoringStrategyTests(unittest.TestCase):
             strategy.plan, board, "lower", 2
         )
 
-        self.assertEqual(len(replacements), 2)
-        counts = {
-            hole_id: sum(
-                target.hole_id == hole_id for target in strategy.plan.targets
-            )
-            for hole_id in (f"H{number:02d}" for number in range(1, 10))
-        }
-        self.assertTrue(all(count == 2 for count in counts.values()))
+        self.assertEqual(replacements, ())
+        self.assertEqual(len(strategy.plan), 18)
 
 
 if __name__ == "__main__":

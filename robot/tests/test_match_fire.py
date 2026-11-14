@@ -52,15 +52,17 @@ class LightAutoStartTests(unittest.TestCase):
             self.assertEqual(self.step(scores).phase, "armed")
 
 
-class LowerRepeatPriorityTests(unittest.TestCase):
-    def test_second_balls_go_to_centre_then_corners_then_two_edges(self):
+class LowerSerpentineTests(unittest.TestCase):
+    def test_each_cell_gets_two_consecutive_balls_and_moves_to_a_neighbour(self):
         strategy = build_max_score_strategy(_board_plan(), "H10", "lower")
-        repeats = strategy.hole_ids[11:]
-        self.assertEqual(len(repeats), 7)
-        self.assertEqual(repeats[0], "H05")
-        self.assertEqual(set(repeats[1:5]), {"H01", "H03", "H07", "H09"})
-        self.assertTrue(set(repeats[5:]) <= {"H02", "H04", "H06", "H08"})
-        self.assertEqual(len(set(repeats)), 7)
+        ids = strategy.hole_ids
+        self.assertEqual(len(ids), 18)
+        self.assertTrue(all(ids[i] == ids[i + 1] for i in range(0, 18, 2)))
+        self.assertEqual(set(ids), {f"H{n:02d}" for n in range(1, 10)})
+        # Grid numbering: column = (n-1)//3, row = (n-1)%3; every move is one step.
+        cells = [int(h[1:]) - 1 for h in ids[::2]]
+        for a, b in zip(cells, cells[1:]):
+            self.assertEqual(abs(a // 3 - b // 3) + abs(a % 3 - b % 3), 1, (a, b))
 
 
 class PerHoleToleranceTests(unittest.TestCase):

@@ -35,13 +35,16 @@ LOWER_LINE_FIRST_IDS: Tuple[str, ...] = (
     "H08",
 )
 
-
-# Line-insurance value of a second ball per lower-half cell: the sum of the
-# line bonuses that cell belongs to (diagonal 8, vertical 4, horizontal 2).
-# A repeat shot keeps those lines alive when the first ball missed.
-LOWER_CENTER_ID = "H05"
-LOWER_CORNER_IDS: Tuple[str, ...] = ("H01", "H03", "H07", "H09")   # 14 each
-LOWER_EDGE_IDS: Tuple[str, ...] = ("H02", "H04", "H06", "H08")     # 6 each
+# Team decision (2026-11-14): the lower half skips the small top bonus holes
+# and puts two consecutive balls into each grid cell (9 x 2 = 18), walking
+# the grid in a serpentine so the muzzle only ever moves to a neighbour:
+# bottom-left column up, centre column down, right column up.
+LOWER_SERPENTINE_IDS: Tuple[str, ...] = (
+    "H01", "H02", "H03",
+    "H06", "H05", "H04",
+    "H07", "H08", "H09",
+)
+LOWER_BALLS_PER_GRID_CELL = 2
 
 
 @dataclass(frozen=True)
@@ -135,10 +138,10 @@ def build_max_score_strategy(
     attempted before repeats because distinct hit cells are the second
     tie-breaker.  The theoretical maximum is 60 points.
 
-    Lower half: 18 balls.  Put two into the active 4-point bonus hole, then
-    put at least one into every 3x3 grid cell to obtain all 34 line points.
-    Seven legal second shots consume the remaining balls.  The theoretical
-    maximum is 74 points.
+    Lower half: 18 balls, no bonus shots (team decision).  Two consecutive
+    balls per grid cell, cells visited in ``LOWER_SERPENTINE_IDS`` order to
+    minimise muzzle travel.  The scoring light only starts the match here.
+    The theoretical maximum is 36 + 34 = 70 points.
     """
 
     if phase not in MATCH_PHASES:
@@ -175,25 +178,18 @@ def build_max_score_strategy(
             theoretical_max_points=60,
         )
 
-    line_first = [by_id[hole_id] for hole_id in LOWER_LINE_FIRST_IDS]
-    # Seven second balls, highest line-insurance value first: centre (22),
-    # the four corners (14 each), then the two most reliable edges (6 each).
-    center = by_id[LOWER_CENTER_ID]
-    corners = _nearest_neighbor_order([by_id[h] for h in LOWER_CORNER_IDS], center)
-    edges = _nearest_neighbor_order(
-        _most_reliable_targets([by_id[h] for h in LOWER_EDGE_IDS], 2), corners[-1])
-    repeat_pass = [center] + corners + edges
-    shots = [bonus_target] * 2 + line_first + repeat_pass
+    shots = [by_id[hole_id] for hole_id in LOWER_SERPENTINE_IDS
+             for _ in range(LOWER_BALLS_PER_GRID_CELL)]
     return FiringStrategy(
         phase=phase,
         plan=EngagementPlan(shots),
         total_balls=18,
-        bonus_balls=2,
-        grid_balls=16,
-        base_points=32,
-        bonus_points=8,
+        bonus_balls=0,
+        grid_balls=18,
+        base_points=36,
+        bonus_points=0,
         line_points=34,
-        theoretical_max_points=74,
+        theoretical_max_points=70,
     )
 
 

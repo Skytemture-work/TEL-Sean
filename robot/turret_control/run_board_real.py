@@ -1200,8 +1200,10 @@ def main(
                         expiry_processed_round_id = None
                         last_bonus_hole_id = score_state.active_hole_id
                         print(
-                            f"指定得分孔鎖定：{last_bonus_hole_id}；"
-                            f"{strategy.total_balls} 球最佳計畫，"
+                            (f"指定得分孔鎖定：{last_bonus_hole_id}；"
+                             if strategy.bonus_balls else
+                             f"亮燈 {last_bonus_hole_id} 開賽（不射加分孔）；")
+                            + f"{strategy.total_balls} 球計畫，"
                             f"理論最高 {strategy.theoretical_max_points} 分。",
                             flush=True,
                         )
