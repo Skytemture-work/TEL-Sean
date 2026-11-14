@@ -14,6 +14,8 @@ import argparse
 import json
 import math
 import os
+import signal
+import sys
 import time
 from collections import deque
 from contextlib import ExitStack
@@ -360,6 +362,36 @@ def _step_muzzle_corrector(corrector, muzzle_preview, driver, plan, previous_sta
             text = f"{hole_id} {record.verdict}"
         muzzle_preview.set_measurement((record.expected_px, record.measured_px, text))
     return hold
+
+
+def _shutdown_on_exit_signals():
+    """Turn SIGTERM / SIGHUP (kill, SSH hang-up) into a KeyboardInterrupt.
+
+    The normal shutdown (flywheels off, pusher and turret home, both ZED
+    cameras released) then runs instead of the process dying with the
+    hardware still claimed.  On a hang-up the terminal is gone, so output is
+    redirected to /dev/null first: a failing print must not abort shutdown.
+    Returns the previous handlers for ``_restore_signals``; a no-op outside
+    the main thread (signal handlers can only be set there).
+    """
+    if threading.current_thread() is not threading.main_thread():
+        return {}
+    watched = [signal.SIGTERM] + ([signal.SIGHUP] if hasattr(signal, "SIGHUP") else [])
+
+    def handler(signum, _frame):
+        for sig in watched:  # one shutdown only; let it finish
+            signal.signal(sig, signal.SIG_IGN)
+        if signum == getattr(signal, "SIGHUP", None):
+            devnull = open(os.devnull, "w")
+            sys.stdout = sys.stderr = devnull
+        raise KeyboardInterrupt(f"received signal {signum}")
+
+    return {sig: signal.signal(sig, handler) for sig in watched}
+
+
+def _restore_signals(previous):
+    for sig, old in previous.items():
+        signal.signal(sig, old)
 
 
 def _start_muzzle_preview(config, dashboard, args):
@@ -972,7 +1004,9 @@ def main(
     match = (MatchSequencer(
         args.match_phase, args.match_duration, args.balls_loaded,
         lambda new_plan: driver.set_plan(new_plan), light_wait_s=args.light_wait,
-        start_reload_rotation=lambda: bool(launcher is not None and launcher.start_reload_rotation()))
+        start_reload_rotation=lambda: bool(launcher is not None and launcher.start_reload_rotation()),
+        stop_flywheels=lambda: launcher.stop_flywheels() if launcher is not None else None,
+        start_flywheels=lambda: launcher.start_flywheels() if launcher is not None else None)
         if args.match_fire else None)
 
     def begin_home():
@@ -1045,6 +1079,7 @@ def main(
         plan = EngagementPlan([])
         driver.set_plan(plan)
 
+    previous_signals = _shutdown_on_exit_signals()
     try:
         motors.enable()
         if args.panel_fire:
@@ -1329,6 +1364,14 @@ def main(
                 plan = match.plan if match.plan is not None else plan
                 if match.bonus_hole_id is not None:
                     last_bonus_hole_id = match.bonus_hole_id
+                if (match.stopped is not None and not (
+                        launcher is not None and (launcher.pending or launcher.mechanism_busy))):
+                    # Match over and the mechanism is at rest: leave the loop so
+                    # the normal shutdown stops the flywheels, homes the pusher
+                    # and the turret, and releases both ZED cameras.
+                    print(f"比賽流程結束（{match.stopped}）：停止飛輪、推球回原點、砲台回 home、"
+                          "釋放相機。", flush=True)
+                    break
             if args.score_mode and not args.match_fire:
                 if (
                     score_state.phase == "active"
@@ -1793,6 +1836,9 @@ def main(
         # Run every cleanup even if one device fails to close. Stop new panel
         # requests and unwind the launcher before disabling the aiming worker.
         with ExitStack() as cleanup:
+            # LIFO: registered first so the handlers are restored only after
+            # every device has been shut down.
+            cleanup.callback(_restore_signals, previous_signals)
             if web_server is not None:
                 cleanup.callback(web_server.server_close)
                 cleanup.callback(web_server.shutdown)

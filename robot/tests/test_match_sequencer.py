@@ -13,13 +13,16 @@ class Harness:
         self.logs = []
         self.rotations = 0
         self.rotation_ok = rotation_ok
+        self.flywheels = []
 
         def rotate():
             self.rotations += 1
             return self.rotation_ok
 
         self.match = MatchSequencer(phase, duration, balls, self.plans.append, self.logs.append,
-                                    light_wait_s=light_wait, start_reload_rotation=rotate)
+                                    light_wait_s=light_wait, start_reload_rotation=rotate,
+                                    stop_flywheels=lambda: self.flywheels.append("off"),
+                                    start_flywheels=lambda: self.flywheels.append("on"))
         self.board = _board_plan()
         self.now = 0.0
 
@@ -74,9 +77,11 @@ class UpperHalfTests(unittest.TestCase):
         h.tick(reload=True, busy=True)    # magazine still rotating: refused
         self.assertTrue(h.match.reload_wait)
         self.assertEqual(h.rotations, 0)
+        self.assertEqual(h.flywheels, ["off"])  # flywheels stopped while reloading
         h.tick(reload=True)
         self.assertFalse(h.match.reload_wait)
         self.assertEqual(h.rotations, 1)  # magazine turned 2 slots before shooting on
+        self.assertEqual(h.flywheels, ["off", "on"])
         self.assertEqual(h.match.balls_remaining, 9)
         second = h.fire(30)
         self.assertEqual(second, ["H05", "H04", "H04", "H07", "H07", "H08", "H08", "H09", "H09"])
@@ -137,6 +142,17 @@ class UpperHalfTests(unittest.TestCase):
         self.assertTrue(h.match.reload_wait)
         self.assertEqual(h.rotations, 1)
         self.assertTrue(any("無法開始裝填轉格" in line for line in h.logs))
+
+    def test_plan_done_with_balls_left_ends_the_match(self):
+        h = Harness("lower", balls=18)
+        h.tick()
+        plan = h.match.plan
+        for _ in range(3):
+            plan.skip()  # e.g. targets that timed out
+        h.fire(30)
+        h.tick()
+        self.assertEqual(h.match.stopped, "射擊計畫完成")
+        self.assertEqual(h.match.balls_remaining, 3)
 
     def test_match_time_ends_the_match(self):
         h = Harness("upper", duration=100.0)

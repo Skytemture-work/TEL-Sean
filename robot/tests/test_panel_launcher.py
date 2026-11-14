@@ -111,6 +111,27 @@ class PanelLauncherTests(unittest.TestCase):
         self.tick()
         self.controller.request_shot.assert_called_once_with()
 
+    def test_flywheels_stop_and_restart_for_a_reload(self):
+        vesc = self.controller.vesc_controller
+        self.launcher.stop_flywheels()
+        self.assertIsNone(vesc.set_speed.call_args.args[0])
+        self.launcher.start_flywheels()
+        self.assertEqual(vesc.set_speed.call_args.args[0], 100)
+
+    def test_exit_signals_run_the_normal_shutdown(self):
+        import os
+        import signal as sig
+        before = sig.getsignal(sig.SIGTERM)
+        previous = real._shutdown_on_exit_signals()
+        try:
+            with self.assertRaises(KeyboardInterrupt):
+                os.kill(os.getpid(), sig.SIGTERM)
+                time.sleep(1)
+            self.assertIs(sig.getsignal(sig.SIGTERM), sig.SIG_IGN)  # one shutdown only
+        finally:
+            real._restore_signals(previous)
+        self.assertIs(sig.getsignal(sig.SIGTERM), before)
+
     def test_reload_rotation_uses_the_remote_reload_and_waits_for_it(self):
         def reload():
             self.controller.busy = True

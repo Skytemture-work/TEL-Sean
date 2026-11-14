@@ -38,7 +38,9 @@ class MatchSequencer:
                  set_plan: Callable[[EngagementPlan], None],
                  log: Callable[[str], None] = lambda message: print(message, flush=True),
                  *, light_wait_s: float = 5.0,
-                 start_reload_rotation: Callable[[], bool] = lambda: True):
+                 start_reload_rotation: Callable[[], bool] = lambda: True,
+                 stop_flywheels: Callable[[], None] = lambda: None,
+                 start_flywheels: Callable[[], None] = lambda: None):
         self.phase = phase
         self.duration_s = duration_s
         self.magazine_size = balls_loaded
@@ -52,6 +54,8 @@ class MatchSequencer:
         self.bonus_is_fallback = False
         self.light_wait_s = light_wait_s
         self._start_reload_rotation = start_reload_rotation
+        self._stop_flywheels = stop_flywheels
+        self._start_flywheels = start_flywheels
         self.bonus_closed = phase != UPPER_PHASE
         self.reload_wait = False
         self.reload_balls = 0
@@ -121,6 +125,11 @@ class MatchSequencer:
             self._stop("比賽時間到，停止發射", launcher_idle)
             return
 
+        if (self.plan is not None and self.plan.finished and not self.waiting_light
+                and not self.reload_wait and self.balls_remaining > 0):
+            self._stop("射擊計畫完成", launcher_idle)
+            return
+
         if self.balls_remaining <= 0 and not self.reload_wait:
             plan_goes_on = self.plan is not None and not self.plan.finished and not self.waiting_light
             if not plan_goes_on:
@@ -129,8 +138,9 @@ class MatchSequencer:
             if launcher_idle:
                 self.reload_wait = True
                 self.reload_balls = min(self.magazine_size, self.plan.remaining)
-                self._log(f"彈倉已射完：請裝填 {self.reload_balls} 顆，完成後在儀表板按「裝填完成」。"
-                          "接下來：" + " ".join(self.remaining_ids()))
+                self._stop_flywheels()  # hands near the launcher while reloading
+                self._log(f"彈倉已射完：飛輪已停止。請裝填 {self.reload_balls} 顆，完成後在儀表板按"
+                          "「裝填完成」。接下來：" + " ".join(self.remaining_ids()))
 
         if self.reload_wait and reload_confirmed:
             if mechanism_busy or not launcher_idle:
@@ -140,7 +150,9 @@ class MatchSequencer:
             else:
                 self.reload_wait = False
                 self.balls_remaining = self.reload_balls
-                self._log(f"裝填完成：已裝 {self.balls_remaining} 顆；彈倉轉 2 格後繼續射擊。")
+                self._start_flywheels()  # spins up while the magazine turns
+                self._log(f"裝填完成：已裝 {self.balls_remaining} 顆；飛輪重新啟動，"
+                          "彈倉轉 2 格且飛輪到速後繼續射擊。")
 
     def remaining_ids(self) -> List[str]:
         if self.plan is None:

@@ -98,6 +98,14 @@ class PanelLauncher:
         """
         return bool(self.controller.busy)
 
+    def stop_flywheels(self):
+        """Spin the flywheels down (e.g. while the team reloads by hand)."""
+        self.controller.vesc_controller.set_speed(None)
+
+    def start_flywheels(self):
+        """Spin back up; ``flywheel_ready`` blocks shots until at speed."""
+        self.controller.vesc_controller.set_speed(PANEL_FLYWHEEL_SPEED)
+
     def start_reload_rotation(self):
         """After a manual magazine refill: home ID1 and turn the magazine
         ``RELOAD_SLOTS`` (2) slots, the same as the remote's RELOAD.
