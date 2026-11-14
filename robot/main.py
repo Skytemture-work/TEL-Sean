@@ -19,7 +19,7 @@ from manual import (
 AUTO_STATUS_INTERVAL_SECONDS = 1.0
 AUTO_TARGET_DISTANCE_M = 2.60
 AUTO_FORWARD_VX = 40
-OCCLUSION_STRAFE_VY = 5
+OCCLUSION_STRAFE_VY = 15
 MAX_STRAFE_SECONDS = 1.0
 VISION_WAIT_SECONDS = 10.0
 NORMAL_STRAFE_DURATION_SCALE = 1.5
@@ -298,21 +298,23 @@ def main():
 
                 if brake_until is not None:
                     lidar_status = "遮擋後緊急停止"
-                    if not vy_recorded_before_release:
-                        if now >= brake_until:
+                    if now >= brake_until:
+                        if not vy_recorded_before_release or not locked_vy:
                             auto_complete = True
-                            completion_reason = "遮擋後停止，放行前未記錄 vy，跳過橫移"
-                    elif not valid_distance:
-                        avoid_until = None
-                    elif now >= brake_until:
-                        if avoid_until is not None and now >= avoid_until:
+                            completion_reason = "遮擋後停止，放行前沒有有效橫移方向"
+                        elif not valid_distance:
+                            # 距離不明時停車，等待下一筆有效回波。
+                            lidar_status = "遮擋後等待有效 LiDAR 距離"
+                        elif not blocked:
                             auto_complete = True
-                            completion_reason = "遮擋後短距離橫移完成"
+                            completion_reason = "LiDAR 前方已清空，停止避障橫移"
+                        elif avoid_until is not None and now >= avoid_until:
+                            lidar_status = "避障橫移達時限，停車等待前方清空"
                         else:
                             if avoid_until is None:
                                 avoid_until = now + MAX_STRAFE_SECONDS
-                            final_vy = -OCCLUSION_STRAFE_VY if (locked_vy or 0) < 0 else OCCLUSION_STRAFE_VY
-                            lidar_status = "遮擋後短距離橫移"
+                            final_vy = -OCCLUSION_STRAFE_VY if locked_vy < 0 else OCCLUSION_STRAFE_VY
+                            lidar_status = "遮擋後橫移，等待 LiDAR 前方清空"
                 elif (
                     vision_wait_until is not None
                     and locked_vy is None
@@ -370,6 +372,8 @@ def main():
                 # 自動模式的底盤前後方向與 Xavier 的正負號相反。
                 tx_vx = -final_vx
                 tx_vy = final_vy
+                if vy_recorded_before_release and brake_until is None:
+                    tx_vy = max(-100, min(100, round(final_vy * 1.5)))
                 uart.send_packet(
                     mode="A",
                     vx=tx_vx,
