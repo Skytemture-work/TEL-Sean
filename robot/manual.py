@@ -1758,7 +1758,24 @@ class ManualController:
         except Exception as exc:
             print("[Manual] {}緊急停止失敗：{}".format(label, exc))
 
-    def close(self):
+    def _home_pusher_before_close(self):
+        """關閉前 ID1 回原點；失敗只回報並緊急停止，不阻止其餘關閉流程。"""
+        if getattr(self, "shoot_servo", None) is None:
+            return
+        try:
+            self._go_home(self.shoot_servo, HOME_DIRECTION, "關閉前 ID1 推球機構回原點")
+        except Exception as exc:
+            print("[Manual] 關閉前推球機構回原點失敗：{}".format(exc), flush=True)
+            self._emergency_stop(self.shoot_servo, "射擊機構")
+        finally:
+            self._shoot_home_encoder = None
+
+    def close(self, home_pusher=False):
+        """停止全部機構並釋放 CAN。
+
+        ``home_pusher=True``（自動射擊流程結束時）：工作執行緒結束後、
+        CAN 關閉前，讓 ID1 推球機構回到原點，避免停在推出位置。
+        """
         with self.lock:
             self.current_mode = "A"
             self._shot_cancel.set()
@@ -1782,6 +1799,8 @@ class ManualController:
         if shot_was_active:
             with self.lock:
                 self.shot_error = "發射機構已關閉，射擊已取消"
+        if home_pusher:
+            self._home_pusher_before_close()
 
         try:
             if getattr(self, "dm_controller", None) is not None:

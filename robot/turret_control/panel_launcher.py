@@ -248,7 +248,8 @@ class PanelLauncher:
 
     def close(self):
         self._authorization = None
-        self.controller.close()
+        # Leave the pusher retracted: a run may end after stage 1 or 2 of 3.
+        self.controller.close(home_pusher=True)
 
 
 class AutoFireTrigger:

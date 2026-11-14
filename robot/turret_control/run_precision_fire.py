@@ -189,7 +189,7 @@ def main(argv=None):
         raise SystemExit(1) from exc
     finally:
         if controller is not None:
-            controller.close()
+            controller.close(home_pusher=True)
 
 
 if __name__ == '__main__':

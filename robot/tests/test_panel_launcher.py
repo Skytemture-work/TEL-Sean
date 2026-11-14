@@ -257,6 +257,45 @@ class SharedLauncherLifecycleTests(unittest.TestCase):
         vesc.close.assert_called_once()
 
 
+class PusherHomeOnCloseTests(unittest.TestCase):
+    def _controller(self):
+        with patch.object(manual, 'VESCDualMotorController', return_value=Mock()), \
+             patch.object(manual, 'validate_mks_can_interfaces'), \
+             patch.object(manual.ManualController, '_initialize_can'):
+            controller = manual.ManualController(None, dm_controller=Mock())
+        controller.shoot_servo, controller.ammo_servo = Mock(name='ID1'), Mock(name='ID2')
+        controller.ammo_notifier = controller.shoot_notifier = Mock()
+        controller.ammo_bus = controller.shoot_bus = Mock()
+        return controller
+
+    @patch('builtins.print')
+    def test_launcher_close_homes_pusher_before_can_shutdown(self, _):
+        controller = self._controller()
+        order = []
+        controller._go_home = lambda servo, direction, label, speed_rpm=None: order.append(
+            ('home', servo, direction))
+        controller.shoot_bus.shutdown.side_effect = lambda: order.append(('bus',))
+        launcher = PanelLauncher(Mock(), controller_factory=Mock(return_value=controller))
+        launcher.close()
+        self.assertEqual(order[0], ('home', controller.shoot_servo, manual.HOME_DIRECTION))
+        self.assertEqual(order[-1], ('bus',))
+
+    @patch('builtins.print')
+    def test_plain_close_does_not_move_the_pusher(self, _):
+        controller = self._controller()
+        controller._go_home = Mock()
+        controller.close()
+        controller._go_home.assert_not_called()
+
+    @patch('builtins.print')
+    def test_home_failure_stops_motor_and_still_releases_can(self, _):
+        controller = self._controller()
+        controller._go_home = Mock(side_effect=TimeoutError('no reply'))
+        controller.close(home_pusher=True)
+        self.assertGreaterEqual(controller.shoot_servo.emergency_stop_motor.call_count, 2)
+        controller.shoot_bus.shutdown.assert_called_once()
+
+
 class MagazineRotationOverlapTests(unittest.TestCase):
     """Shot 3: once ID1 is home the turret may aim at the next hole while ID2
     rotates, but no new shot can start until the rotation is finished."""
