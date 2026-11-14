@@ -12,7 +12,12 @@ class UARTController:
         self._last_valid_packet_at = None
         self._last_status_at = 0.0
         try:
-            self.ser = serial.Serial(port, baudrate, timeout=0.05)
+            self.ser = serial.Serial(
+                port, baudrate, bytesize=serial.EIGHTBITS,
+                parity=serial.PARITY_NONE, stopbits=serial.STOPBITS_ONE,
+                timeout=0.05, write_timeout=0.10,
+                xonxoff=False, rtscts=False, dsrdtr=False,
+            )
             self.ser.reset_input_buffer()
             print(f"[UART] 成功開啟通訊埠: {port} @ {baudrate}", flush=True)
         except Exception as e:
@@ -110,7 +115,7 @@ class UARTController:
                 flush=True,
             )
 
-    def send_packet(self, mode='A', vx=0, vy=0, wz=0, yaw=50, pitch=50, fire=0, speed=0):
+    def send_packet(self, mode='A', vx=0, vy=0, wz=0, yaw=50, pitch=50, fire=0, speed=0, *, trace=False):
         """發送 Xavier -> ESP32 封包"""
         if self.ser is None or not self.ser.is_open:
             return
@@ -126,7 +131,12 @@ class UARTController:
 
         packet = f"X,{mode},{vx},{vy},{wz},{yaw},{pitch},{fire},{speed}\n"
         try:
-            self.ser.write(packet.encode('utf-8'))
+            payload = packet.encode('ascii')
+            written = self.ser.write(payload)
+            if trace and written == len(payload):
+                print(f"[ESP32 TX] {packet.rstrip()}", flush=True)
+            elif written != len(payload):
+                print(f"[UART Error] ESP32 TX short write: {written}/{len(payload)} bytes", flush=True)
         except Exception as e:
             print(f"[UART Error] 發送失敗: {e}")
 

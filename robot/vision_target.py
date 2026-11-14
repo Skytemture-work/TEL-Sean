@@ -1,12 +1,4 @@
-"""Legacy main.py adapter backed by the dashboard's board-vision pipeline.
-
-The old UART interface is intentionally preserved:
-``((vx, vy, wz), (yaw, pitch), detected)``.
-Detection, board filtering, hole-plan inference, ZED depth and TensorRT model
-selection are shared with ``turret_control.run_board_real``.  The legacy
-caller still receives a board-centering command because its UART protocol does
-not carry the dashboard's absolute motor-radian targets or firing plan.
-"""
+"""Expose fresh board range, center and observed-hole count to main.py."""
 
 from __future__ import annotations
 
@@ -14,6 +6,7 @@ import math
 import os
 import threading
 import time
+from dataclasses import dataclass
 
 import cv2
 import numpy as np
@@ -25,9 +18,14 @@ from turret_control.board_depth_plane import (
 )
 from turret_control.board_pose import (
     BoardPoseTracker,
+    _match_observations,
+    camera_matrix,
+    distortion_coefficients,
     prefer_observed_depth,
     project_targets_from_pose,
 )
+from turret_control.board import EngagementPlan
+from turret_control.official_board import BOARD_HEIGHT_CM, BOARD_WIDTH_CM
 from turret_control.board_vision import (
     BoardVision,
     DEFAULT_CONFIDENCE,
@@ -43,20 +41,35 @@ except ImportError:
     YOLO = None
 
 
+@dataclass(frozen=True)
+class BoardObservation:
+    captured_at: float
+    distance_cm: float | None
+    center_error_px: float
+    observed_holes: int
+    outline_in_frame: bool
+
+    @property
+    def complete(self):
+        return self.outline_in_frame and self.observed_holes == 12
+
+
 class VisionTracker(threading.Thread):
     """Use BoardVision while retaining main.py's old shared-data interface."""
 
     def __init__(self):
         super().__init__(daemon=True)
         self.lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self.camera_released = False
 
-        self.chassis_cmd = (0.0, 0.0, 0.0)
-        self.turret_cmd = (50, 50)
-        self.target_detected = False
         # main.py starts in manual mode.  Do not consume camera/GPU until the
         # ESP32 actually switches to automatic mode.
         self.is_active = False
         self.current_frame = None
+        self._observation = None
+        self._activation = 0
+        self._tracker_activation = None
 
         self.model_path = DEFAULT_MODEL
         self.device = os.environ.get("VISION_DEVICE", "0")
@@ -86,32 +99,36 @@ class VisionTracker(threading.Thread):
 
             camera = ZedDepthCamera(self.config)
             self.config = camera.config
-            self.board_vision = BoardVision(
-                self.model,
-                self.config,
-                confidence=DEFAULT_CONFIDENCE,
-                imgsz=640,
-                device=self.device,
-                virtual_board=False,
-            )
-            self.pose_tracker = BoardPoseTracker(self.config)
             print(
                 "[Vision] 已切換至儀表板 BoardVision：ZED 深度、靶面篩選、"
                 "孔位推算、PnP 姿態與 TensorRT/YOLO 模型。",
                 flush=True,
             )
 
-            while True:
-                if not self.is_active:
-                    time.sleep(0.1)
+            while not self._stop_event.is_set():
+                with self.lock:
+                    active, activation = self.is_active, self._activation
+                if not active:
+                    self._stop_event.wait(0.1)
                     continue
+                if activation != self._tracker_activation:
+                    self.board_vision = BoardVision(
+                        self.model, self.config, confidence=DEFAULT_CONFIDENCE,
+                        imgsz=640, device=self.device, virtual_board=False,
+                    )
+                    self.pose_tracker = BoardPoseTracker(self.config)
+                    self._reference_plan = None
+                    self._tracker_activation = activation
 
+                now = time.monotonic()
                 ok, frame, depth_data = camera.read()
+                if self._stop_event.is_set():
+                    break
                 if not ok:
+                    self._publish(activation, None, None)
                     time.sleep(0.02)
                     continue
 
-                now = time.monotonic()
                 result = self.board_vision.process(
                     frame, now=now, depth_data=depth_data
                 )
@@ -177,66 +194,94 @@ class VisionTracker(threading.Thread):
                     cv2.LINE_AA,
                 )
 
+                observation = None
                 if pose_ready:
-                    targets = list(live_targets.values())
-                    center_u = float(np.median([target.u_px for target in targets]))
-                    center_v = float(np.median([target.v_px for target in targets]))
-                    ranges = [
-                        target.distance_m
-                        for target in targets
-                        if target.distance_m is not None
-                        and math.isfinite(target.distance_m)
-                        and target.distance_m > 0.0
-                    ]
-                    distance_m = float(np.median(ranges)) if ranges else None
-                    fx = self.config.focal_length_x_px
-                    fy = self.config.focal_length_y_px
-                    cx = self.config.camera_center_x_px
-                    cy = self.config.camera_center_y_px
-                    if distance_m is not None:
-                        dx_cm = (center_u - cx) * distance_m / fx * 100.0
-                        dy_cm = -(center_v - cy) * distance_m / fy * 100.0
-                        vx = 1.2 * (distance_m * 100.0 - legacy_config.DISTANCE_PLATE_CM)
-                    else:
-                        dx_cm = (center_u - cx) / fx * 100.0
-                        dy_cm = -(center_v - cy) / fy * 100.0
-                        vx = 0.0
-                    yaw_deg = math.degrees(math.atan2(center_u - cx, fx))
-                    wz = -yaw_deg
-                    vy = -1.5 * dx_cm
-                    yaw = int(np.clip(50 + dx_cm * 0.5, 0, 100))
-                    pitch = int(np.clip(50 - dy_cm * 0.5, 0, 100))
-                    with self.lock:
-                        self.chassis_cmd = (vx, vy, wz)
-                        self.turret_cmd = (yaw, pitch)
-                        self.target_detected = True
-                        self.current_frame = display
-                else:
-                    with self.lock:
-                        self.chassis_cmd = (0.0, 0.0, 0.0)
-                        self.turret_cmd = (50, 50)
-                        self.target_detected = False
-                        self.current_frame = display
+                    observation = self._board_observation(
+                        pose, live_targets, result.targets, frame.shape, now
+                    )
+                self._publish(activation, observation, display)
 
                 time.sleep(0.001)
         except Exception as exc:
             print(f"[Vision Error] BoardVision 執行失敗：{exc}", flush=True)
             with self.lock:
-                self.chassis_cmd = (0.0, 0.0, 0.0)
-                self.turret_cmd = (50, 50)
-                self.target_detected = False
+                self._observation = None
         finally:
             if camera is not None:
                 camera.release()
                 print("[Vision] ZED 2 相機已安全關閉。", flush=True)
+            self.camera_released = True
+
+    def _board_observation(self, pose, live_targets, observed, frame_shape, now):
+        width, height = BOARD_WIDTH_CM / 100.0, BOARD_HEIGHT_CM / 100.0
+        board_points = np.array([
+            [0.0, 0.0, 0.0], [width, 0.0, 0.0],
+            [width, height, 0.0], [0.0, height, 0.0],
+            [width / 2.0, height / 2.0, 0.0],
+        ])
+        image_points, _ = cv2.projectPoints(
+            board_points, pose.rvec, pose.tvec, camera_matrix(self.config),
+            distortion_coefficients(self.config),
+        )
+        image_points = image_points.reshape(-1, 2)
+        if not np.all(np.isfinite(image_points)):
+            return None
+        outline = image_points[:4]
+        outline_in_frame = bool(
+            np.all(outline >= 0) and np.all(outline < [frame_shape[1], frame_shape[0]])
+        )
+        matched, _ = _match_observations(observed, EngagementPlan(list(live_targets.values())))
+        measured_depths = [
+            target.distance_m for target in live_targets.values()
+            if target.distance_source in ("zed_plane", "zed_depth")
+            and target.distance_m is not None and math.isfinite(target.distance_m)
+            and target.distance_m > 0
+        ]
+        distance_cm = None
+        if measured_depths:
+            distance_cm = (float(np.median(measured_depths)) - legacy_config.ZED_TO_FRONT_M) * 100.0
+        return BoardObservation(
+            now, distance_cm, float(image_points[-1, 0] - self.config.camera_center_x_px),
+            len(matched), outline_in_frame,
+        )
+
+    def _publish(self, activation, observation, display):
+        with self.lock:
+            if self.is_active and activation == self._activation:
+                self._observation = observation
+                self.current_frame = display
+
+    def get_board_observation(self):
+        with self.lock:
+            observation = self._observation
+        if (observation is None
+                or time.monotonic() - observation.captured_at > legacy_config.AUTO_VISION_MAX_AGE_S):
+            return None
+        return observation
 
     def get_vision_data(self):
-        with self.lock:
-            return self.chassis_cmd, self.turret_cmd, self.target_detected
+        """Compatibility snapshot for the standalone vision viewer."""
+        observation = self.get_board_observation()
+        if observation is None:
+            return (0, 0, 0), (50, 50), False
+        vy = legacy_config.AUTO_STRAFE_SIGN * int(np.clip(observation.center_error_px / 4, -15, 15))
+        return (0, vy, 0), (50, 50), True
 
     def get_annotated_frame(self):
         with self.lock:
             return self.current_frame.copy() if self.current_frame is not None else None
 
     def set_active(self, state: bool):
-        self.is_active = bool(state)
+        with self.lock:
+            self.is_active = bool(state)
+            self._activation += 1
+            self._observation = None
+            self.current_frame = None
+
+    def stop(self):
+        """Wait for capture to exit and confirm the ZED handle was released."""
+        self.set_active(False)
+        self._stop_event.set()
+        if self.ident is not None:
+            self.join()
+        return self.camera_released

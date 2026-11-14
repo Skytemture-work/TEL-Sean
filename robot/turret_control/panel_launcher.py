@@ -46,6 +46,7 @@ class PanelLauncher:
                  push_rpm=None, push_acceleration=None, push_home_rpm=None):
         from manual import ManualController, VESC_MIN_RPM, VESC_RPM_PER_SPEED_UNIT
 
+        self._vesc_paused = False
         self._clock = clock
         self._authorization = None
         self._pending_target = None
@@ -99,11 +100,37 @@ class PanelLauncher:
         return bool(self.controller.busy)
 
     def stop_flywheels(self):
-        """Spin the flywheels down (e.g. while the team reloads by hand)."""
-        self.controller.vesc_controller.set_speed(None)
+        """Confirm zero RPM, then release the USB connections during refill."""
+        if self._vesc_paused:
+            return
+        vesc = self.controller.vesc_controller
+        stopped_at = time.monotonic()
+        vesc.set_speed(None)
+        deadline = stopped_at + 5.0
+        while time.monotonic() < deadline:
+            self.check_health()
+            rpm = self.flywheel_rpm()
+            sample = vesc.last_rpm
+            if rpm == (0.0, 0.0) and sample is not None and sample[2] >= stopped_at:
+                break
+            time.sleep(0.05)
+        else:
+            raise RuntimeError("等待裝填前，未能確認雙飛輪已降至 0 RPM")
+
+        vesc.close()
+        if vesc._thread is not None and vesc._thread.is_alive():
+            raise RuntimeError("VESC 遙測執行緒尚未結束")
+        self._vesc_paused = True
+        print("[VESC] 已確認雙輪停轉，關閉序列埠等待裝填。", flush=True)
 
     def start_flywheels(self):
-        """Spin back up; ``flywheel_ready`` blocks shots until at speed."""
+        """Reopen both ports at zero before requesting operating speed."""
+        if self._vesc_paused:
+            vesc = type(self.controller.vesc_controller)()
+            self.controller.vesc_controller = vesc
+            vesc.start()
+            vesc.check_health()
+            self._vesc_paused = False
         self.controller.vesc_controller.set_speed(PANEL_FLYWHEEL_SPEED)
 
     def start_reload_rotation(self):
@@ -129,6 +156,8 @@ class PanelLauncher:
 
     def flywheel_rpm(self):
         """(left, right) RPM when the reading is fresh, else None."""
+        if self._vesc_paused:
+            return None
         rpm = getattr(getattr(self.controller, "vesc_controller", None), "last_rpm", None)
         if not (isinstance(rpm, tuple) and len(rpm) == 3):
             return None
@@ -154,7 +183,10 @@ class PanelLauncher:
                 and released >= self._pending_seq)
 
     def check_health(self):
-        self.controller.check_health()
+        if self._vesc_paused:
+            self.controller.dm_controller.check_health()
+        else:
+            self.controller.check_health()
         if self.controller.shot_error is not None:
             raise RuntimeError(self.controller.shot_error)
 
