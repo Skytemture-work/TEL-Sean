@@ -32,11 +32,11 @@ class ReadyTurret:
 
 
 class FreshFlywheels(Mock):
-    """VESC stand-in whose flywheels always read a fresh 4000 RPM."""
+    """VESC stand-in whose flywheels always read fresh, on-target RPM."""
 
     @property
     def last_rpm(self):
-        return (4000.0, 4000.0, time.monotonic())
+        return (*flywheel_wheel_targets(4000.0), time.monotonic())
 
 
 class PanelLauncherTests(unittest.TestCase):
