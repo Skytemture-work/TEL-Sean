@@ -12,6 +12,13 @@ Intended use from ``main.py`` (not wired in yet)::
     session.stop()                      # launcher off -> home -> disable -> camera released
     manual = ManualController(uart=uart)  # manual side takes over from home
 
+Match mode (``["--match-fire", "--match-phase", "upper"]``): when the upper
+half has fired its first magazine it holds and waits for a reload.  Call
+``session.confirm_reload()`` (e.g. on the remote's RELOAD button in auto mode)
+once the magazine is refilled -- same as the dashboard "裝填完成" button.
+``session.reload_waiting`` tells whether it is waiting.  The session also ends
+by itself when the match is over (``session.running`` becomes False).
+
 Hand-over rule: exactly one owner per device (ZED, DM USB-CAN port, can0,
 VESC ports).  Whoever releases the turret first returns to home; whoever takes
 over starts from home.  ``stop()`` only returns after the auto side has fully
@@ -40,6 +47,8 @@ class AutoAimSession:
         self.argv = argv
         self._telemetry_callback = telemetry_callback
         self._stop = threading.Event()
+        self._reload = threading.Event()
+        self._match_state: Optional[dict] = None
         self._thread: Optional[threading.Thread] = None
         self.error: Optional[BaseException] = None
 
@@ -51,6 +60,8 @@ class AutoAimSession:
         if self.running:
             raise RuntimeError("自動瞄準已在執行")
         self._stop.clear()
+        self._reload.clear()
+        self._match_state = None
         self.error = None
         self._thread = threading.Thread(target=self._run, name="auto-aim", daemon=False)
         self._thread.start()
@@ -59,12 +70,40 @@ class AutoAimSession:
         try:
             run_board_real.main(
                 self.argv,
-                telemetry_callback=self._telemetry_callback,
+                telemetry_callback=self._on_telemetry,
                 stop_event=self._stop,
+                reload_event=self._reload,
             )
         except BaseException as exc:  # includes SystemExit from argparse/startup checks
             self.error = exc
             print(f"自動瞄準結束（錯誤）：{exc!r}", flush=True)
+
+    def _on_telemetry(self, telemetry: dict) -> None:
+        self._match_state = telemetry.get("match")
+        if self._telemetry_callback is not None:
+            self._telemetry_callback(telemetry)
+
+    @property
+    def match_state(self) -> Optional[dict]:
+        """Latest match telemetry (phase, balls_remaining, reload_wait, ...)."""
+        return self._match_state
+
+    @property
+    def reload_waiting(self) -> bool:
+        """True while the match holds for the team to refill the magazine."""
+        state = self._match_state
+        return bool(self.running and state and state.get("reload_wait"))
+
+    def confirm_reload(self) -> bool:
+        """Magazine refilled: resume (flywheels on, 2-slot turn, then fire).
+
+        Returns False and does nothing when no reload is awaited -- an early
+        or accidental press is never remembered for later.
+        """
+        if not self.reload_waiting:
+            return False
+        self._reload.set()
+        return True
 
     def stop(self, timeout: float = 30.0) -> bool:
         """Request shutdown and wait for home + disable + device release.

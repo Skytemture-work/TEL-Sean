@@ -364,6 +364,23 @@ def _step_muzzle_corrector(corrector, muzzle_preview, driver, plan, previous_sta
     return hold
 
 
+def _take_external_reload(reload_event, waiting):
+    """Consume an external reload confirmation, only while a reload is awaited.
+
+    Outside the wait the event is cleared, so an early or accidental press is
+    never carried over into the next reload.
+    """
+    if reload_event is None:
+        return False
+    if not waiting:
+        reload_event.clear()
+        return False
+    if reload_event.is_set():
+        reload_event.clear()
+        return True
+    return False
+
+
 def _shutdown_on_exit_signals():
     """Turn SIGTERM / SIGHUP (kill, SSH hang-up) into a KeyboardInterrupt.
 
@@ -426,6 +443,7 @@ def main(
     fire_callback: Optional[FireCallback] = None,
     telemetry_callback: Optional[TelemetryCallback] = None,
     stop_event: Optional[threading.Event] = None,
+    reload_event: Optional[threading.Event] = None,
 ) -> None:
     """Run the real board pipeline.
 
@@ -438,6 +456,11 @@ def main(
     ``auto_session.AutoAimSession``) end the run: once set, the loop exits and
     the normal shutdown runs -- stop the launcher, return along the recorded
     safe path to home, disable the motors, release the camera.
+
+    ``reload_event`` is an external "magazine refilled" confirmation (e.g. the
+    remote's RELOAD button through ``AutoAimSession.confirm_reload``), the same
+    as the dashboard button.  It only counts while ``--match-fire`` is waiting
+    for a reload; a press at any other time is discarded, never stored.
 
     ``telemetry_callback`` receives the same dictionary exposed by
     ``GET /api/status`` once per processed camera frame.  Both callbacks run on
@@ -1359,7 +1382,9 @@ def main(
                     score_state.active_hole_id if score_state.phase == "active" else None,
                     launcher_idle=not (launcher is not None and launcher.pending),
                     mechanism_busy=bool(launcher is not None and launcher.mechanism_busy),
-                    reload_confirmed=bool(dashboard is not None and dashboard.take_reload_done()),
+                    reload_confirmed=(
+                        bool(dashboard is not None and dashboard.take_reload_done())
+                        | _take_external_reload(reload_event, match.reload_wait)),
                 )
                 plan = match.plan if match.plan is not None else plan
                 if match.bonus_hole_id is not None:
