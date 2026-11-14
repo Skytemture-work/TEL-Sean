@@ -174,7 +174,8 @@ class LidarAvoidance(threading.Thread):
         fan_slope = math.tan(math.radians(config.FRONT_LIDAR_HALF_ANGLE_DEG))
         return ((x > 0.0)
                 & (np.abs(y) <= x * fan_slope)
-                & (np.abs(y) <= config.FRONT_LIDAR_HALF_WIDTH_M)
+                & (y >= -config.FRONT_LIDAR_HALF_WIDTH_M)
+                & (y <= 0.25)
                 & (z > config.FRONT_LIDAR_MIN_Z_M)
                 & (z < config.FRONT_LIDAR_MAX_Z_M))
 
