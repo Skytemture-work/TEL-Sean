@@ -138,6 +138,9 @@ SLOTS_PER_MAGAZINE = 6
 MOVE_TIMEOUT = 30.0
 HOME_TIMEOUT = 30.0
 POLL_INTERVAL = 0.1
+# MKS 讀 Encoder 偶爾沒有回覆（函式庫等 1 秒後回傳 None）；重試幾次再判定失敗。
+ENCODER_READ_ATTEMPTS = 3
+ENCODER_READ_RETRY_DELAY = 0.05
 SETTLE_TIME = 0.2
 # 回零後與轉格前的位置穩定容許值；單位為編碼器 counts，不是命令 pulses。
 SHOOT_HOME_TOLERANCE_COUNTS = 20
@@ -1553,10 +1556,37 @@ class ManualController:
         else:
             raise RuntimeError("未知射擊階段：{}".format(self.shot_stage))
 
+    def _read_encoder(self, servo, attempts=ENCODER_READ_ATTEMPTS):
+        """讀取 MKS Encoder；CAN 偶發漏回（回傳 None）時重試，全部失敗才回傳 None。"""
+        for attempt in range(1, attempts + 1):
+            value = servo.read_encoder_value_addition()
+            if value is not None:
+                if attempt > 1:
+                    print("[Manual] CAN ID{} Encoder 第 {} 次讀取成功。".format(
+                        getattr(servo, "can_id", "?"), attempt), flush=True)
+                return value
+            if attempt < attempts:
+                print("[Manual] CAN ID{} Encoder 沒有回覆，重試 {}/{}".format(
+                    getattr(servo, "can_id", "?"), attempt, attempts - 1), flush=True)
+                time.sleep(ENCODER_READ_RETRY_DELAY)
+        return None
+
+    def _query_status(self, servo, attempts=ENCODER_READ_ATTEMPTS):
+        """查詢 MKS 運轉狀態；CAN 偶發漏回（回傳 None）時重試。"""
+        for attempt in range(1, attempts + 1):
+            status = servo.query_motor_status()
+            if status is not None:
+                return status
+            if attempt < attempts:
+                print("[Manual] CAN ID{} 狀態查詢沒有回覆，重試 {}/{}".format(
+                    getattr(servo, "can_id", "?"), attempt, attempts - 1), flush=True)
+                time.sleep(ENCODER_READ_RETRY_DELAY)
+        return None
+
     def _move_relative(self, servo, pulses, direction, speed):
         if servo is self.shoot_servo:
             self._shoot_home_encoder = None
-        before = servo.read_encoder_value_addition()
+        before = self._read_encoder(servo)
         if before is None:
             raise RuntimeError("移動前 Encoder 讀取失敗")
 
@@ -1599,7 +1629,7 @@ class ManualController:
 
             time.sleep(POLL_INTERVAL)
 
-        after = servo.read_encoder_value_addition()
+        after = self._read_encoder(servo)
         if after is None:
             raise RuntimeError("移動後 Encoder 讀取失敗")
         print("[Manual] Encoder 位移：{}".format(after - before))
@@ -1681,10 +1711,10 @@ class ManualController:
         stable_since = None
         samples = []
         while time.monotonic() < deadline:
-            status = servo.query_motor_status()
+            status = self._query_status(servo)
             if status is None or status == MotorStatus.Fail:
                 raise RuntimeError("{}無法確認馬達停止，禁止轉格".format(label))
-            encoder = servo.read_encoder_value_addition()
+            encoder = self._read_encoder(servo)
             if not isinstance(encoder, int) or isinstance(encoder, bool):
                 raise RuntimeError("{}編碼器讀取失敗，禁止轉格".format(label))
             if (expected_encoder is not None
@@ -1733,7 +1763,7 @@ class ManualController:
             ),
             flush=True,
         )
-        before = self.ammo_servo.read_encoder_value_addition()
+        before = self._read_encoder(self.ammo_servo)
         if before is None:
             raise RuntimeError("彈藥倉移動前 Encoder 讀取失敗")
 

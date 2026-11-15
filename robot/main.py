@@ -127,6 +127,7 @@ def main():
         positioning_moved = False
         brake_until = None
         avoid_until = None
+        aim_exit_reported = False
         print("[System] 已啟動，預設手動模式，等待 ESP32 遙控器封包...")
 
         while True:
@@ -216,6 +217,7 @@ def main():
                         )
                         try:
                             aim_process = start_aim_process()
+                            aim_exit_reported = False
                             print(f"[Aim] 開始背景預熱（PID={aim_process.pid}）", flush=True)
                         except OSError as exc:
                             print(f"[Aim] 無法啟動預熱子程序：{exc}", flush=True)
@@ -237,6 +239,31 @@ def main():
 
             else:
                 uart.report_if_silent()
+
+            # 自動瞄準子程序意外結束（例如機構故障）時，不要默默停在原地：
+            # 停止底盤與定位、釋放 ZED，並提示撥回手動模式。
+            if (current_mode == "A" and aim_process is not None and not aim_exit_reported
+                    and aim_process.poll() is not None):
+                aim_exit_reported = True
+                auto_complete = True
+                awaiting_phase = False
+                lidar.set_active(False)
+                uart.send_packet(
+                    mode="A", vx=0, vy=0, wz=0, yaw=50, pitch=50, fire=0, speed=0
+                )
+                if vision is not None:
+                    vision.stop()
+                    vision = None
+                if aim_process.returncode == 0:
+                    print("[Aim] 自動瞄準子程序已結束，底盤已送出停止；撥回手動模式即可繼續手動操作。",
+                          flush=True)
+                else:
+                    print(
+                        f"[Aim ERROR] 自動瞄準子程序異常結束（exit={aim_process.returncode}），"
+                        "自動定位與射擊已停止，底盤已送出停止。請看上方錯誤訊息；"
+                        "撥回手動模式即可繼續手動操作。",
+                        flush=True,
+                    )
 
             if current_mode == "A" and not auto_complete:
                 now = time.monotonic()
