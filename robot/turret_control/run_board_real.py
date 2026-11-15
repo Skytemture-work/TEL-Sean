@@ -38,6 +38,8 @@ from .board_pose import (
     BoardPoseLock,
     BoardPoseTracker,
     board_lean_deg,
+    camera_matrix,
+    distortion_coefficients,
     prefer_observed_depth,
     project_targets_from_pose,
     update_plan_geometry,
@@ -64,6 +66,7 @@ from .shared_motor_backend import (
     SharedMotorBackend,
 )
 from .run_yolo_demo import _inference_frame
+from .official_board import BOARD_HEIGHT_CM, BOARD_WIDTH_CM
 from .live_preview import LatestFrameGrabber, LivePreviewPublisher
 from .match_sequencer import MatchSequencer
 from .scoring_light import ScoreRoundController, draw_score_light_overlay
@@ -447,20 +450,22 @@ def main(
     telemetry_callback: Optional[TelemetryCallback] = None,
     stop_event: Optional[threading.Event] = None,
     reload_event: Optional[threading.Event] = None,
-    next_handoff_command: Optional[Callable[[], Optional[str]]] = None,
+    next_handoff_command: Optional[Callable[[Optional[float]], Optional[str]]] = None,
+    positioning_callback: Optional[Callable[[float, int], None]] = None,
 ) -> None:
     """Run the real board pipeline with cleanup for early motor handoff."""
     with ExitStack() as startup_cleanup:
         _run_board_real(
             argv, fire_callback=fire_callback, telemetry_callback=telemetry_callback,
             stop_event=stop_event, reload_event=reload_event,
-            next_handoff_command=next_handoff_command, startup_cleanup=startup_cleanup,
+            next_handoff_command=next_handoff_command, positioning_callback=positioning_callback,
+            startup_cleanup=startup_cleanup,
         )
 
 
 def _run_board_real(
     argv, *, fire_callback, telemetry_callback, stop_event, reload_event,
-    next_handoff_command, startup_cleanup,
+    next_handoff_command, positioning_callback, startup_cleanup,
 ):
     """Run the real board pipeline.
 
@@ -479,9 +484,8 @@ def _run_board_real(
     as the dashboard button.  It only counts while ``--match-fire`` is waiting
     for a reload; a press at any other time is discarded, never stored.
 
-    ``next_handoff_command`` is an optional blocking stdin adapter. Wait for
-    PREPARE_MOTORS after SWA and hardware handoff, ZED_READY before opening
-    the camera, and START upper/lower before running the match.
+    The optional stdin adapter returns an empty string on timeout and None
+    on EOF. Positioning samples are sent before START via positioning_callback.
 
     ``telemetry_callback`` receives the same dictionary exposed by
     ``GET /api/status`` once per processed camera frame.  Both callbacks run on
@@ -864,10 +868,8 @@ def _run_board_real(
     model_thread = threading.Thread(target=_load_model, name="yolo-load", daemon=True)
     model_thread.start()
 
-    # The muzzle ZED is not used by main.py's positioning vision (that one
-    # holds only the chassis ZED), so open it now while the robot is still
-    # driving instead of after ZED_READY.  A failure here only falls back to
-    # opening it at the usual time.
+    # Prepare the separate muzzle camera while the main camera is starting.
+    # If it fails, retry when the firing preview is started.
     muzzle_box: Dict[str, Any] = {"claimed": False}
     muzzle_thread = None
     if (next_handoff_command is not None and args.web_port
@@ -920,34 +922,6 @@ def _run_board_real(
             spin_up=spin_up,
         )
 
-    if next_handoff_command is not None:
-        # Do not make the release wait for the model: the motors and the
-        # flywheels must start the moment the chassis is released, while the
-        # model keeps loading in the background.
-        print("[Aim] 預熱中（模型背景載入），等待 SWA 放行", flush=True)
-        if next_handoff_command() != "PREPARE_MOTORS":
-            print("[Aim] 未收到 SWA 機構交接，結束預熱子程序", flush=True)
-            return
-        previous_signals = _shutdown_on_exit_signals()
-        startup_cleanup.callback(_restore_signals, previous_signals)
-        motors = create_motors()
-        startup_cleanup.callback(motors.close)
-        motors.enable()
-        # Spin the flywheels up while the chassis is still positioning, so the
-        # first shot can go as soon as the robot stops (3-minute match).
-        launcher = create_launcher(spin_up=True)
-        startup_cleanup.callback(launcher.close, home_pusher=False)
-        print("[Aim] DM 已使能，飛輪已開始起轉"
-              f"（子程序啟動後 {time.monotonic() - model_started_at:.1f} s）", flush=True)
-        model_thread.join()
-        if "model" not in model_box:
-            raise model_box.get("error") or RuntimeError("YOLO 模型載入失敗")
-        if "warmup_error" in model_box:
-            raise RuntimeError("YOLO 預熱失敗") from model_box["warmup_error"]
-        print(f"[Aim] PREWARM_READY（{time.monotonic() - model_started_at:.1f} s），等待 ZED_READY", flush=True)
-        if next_handoff_command() != "ZED_READY":
-            print("[Aim] 未收到 ZED 交接，結束預熱子程序", flush=True)
-            return
     use_zed_sdk = not (args.zed_uvc or args.opencv_camera)
     if use_zed_sdk:
         try:
@@ -966,8 +940,81 @@ def _run_board_real(
         if not args.virtual_board and config.camera_principal_x_px is None:
             print("提醒：相機內參仍為暫值，正式瞄準前請完成標定。", flush=True)
 
-    # Dashboard and live camera preview come up right after the camera, so
-    # the operator sees the image while the model and motors are starting.
+    startup_cleanup.callback(camera.release)
+
+    def create_vision():
+        return BoardVision(model_box["model"], config, confidence=args.conf, imgsz=args.imgsz,
+                           device=args.device, virtual_board=args.virtual_board)
+
+    if next_handoff_command is not None:
+        import config as drive_config
+
+        previous_signals = _shutdown_on_exit_signals()
+        startup_cleanup.callback(_restore_signals, previous_signals)
+        model_thread.join()
+        if "model" not in model_box:
+            raise model_box.get("error") or RuntimeError("YOLO 模型載入失敗")
+        if "warmup_error" in model_box:
+            raise RuntimeError("YOLO 預熱失敗") from model_box["warmup_error"]
+        print(f"[Aim] PREWARM_READY（{time.monotonic() - model_started_at:.1f} s），等待 SWA 放行", flush=True)
+        positioning = True
+        positioning_vision = create_vision()
+        positioning_pose = BoardPoseTracker(config)
+        reference_plan = None
+        board_center = np.array([[BOARD_WIDTH_CM / 200.0, BOARD_HEIGHT_CM / 200.0, 0.0]])
+        intrinsics = camera_matrix(config)
+        distortion = distortion_coefficients(config)
+        while stop_event is None or not stop_event.is_set():
+            command = next_handoff_command(0.2 if positioning or stop_event is not None else None)
+            if command is None:
+                return
+            if command == "PREPARE_MOTORS" and launcher is None:
+                motors = create_motors()
+                startup_cleanup.callback(motors.close)
+                motors.enable()
+                launcher = create_launcher(spin_up=True)
+                startup_cleanup.callback(launcher.close, home_pusher=False)
+                print("[Aim] DM 已使能，飛輪預轉中，等待定位完成", flush=True)
+            elif command == "VISION_ON" and not positioning:
+                positioning = True
+                positioning_vision = create_vision()
+                positioning_pose = BoardPoseTracker(config)
+                reference_plan = None
+            elif command == "VISION_OFF":
+                positioning = False
+            elif command in ("START upper", "START lower"):
+                if launcher is None:
+                    raise RuntimeError("未完成 SWA 機構交接，拒絕開始投球")
+                args.match_phase = command.split()[1]
+                break
+            elif command == "" and positioning:
+                captured_at = time.monotonic()
+                if use_zed_sdk:
+                    ok, frame, _ = camera.read(want_depth=False)
+                else:
+                    ok, frame = camera.read()
+                if not ok:
+                    continue
+                frame = _inference_frame(frame, args.zed_uvc)
+                result = positioning_vision.process(frame, now=captured_at)
+                plan = result.plan
+                if plan is not None and len(plan) == 12 and all(t.hole_id is not None for t in plan.targets):
+                    reference_plan = plan
+                if reference_plan is None:
+                    continue
+                pose = positioning_pose.update(result.targets, reference_plan, result.quad, now=captured_at)
+                if pose is None or not pose.stable or not positioning_pose.is_fresh(captured_at):
+                    continue
+                projected, _ = cv2.projectPoints(board_center, pose.rvec, pose.tvec, intrinsics, distortion)
+                error_px = float(projected[0, 0, 0] - config.camera_center_x_px)
+                if positioning_callback is not None and math.isfinite(error_px):
+                    vy = drive_config.AUTO_STRAFE_SIGN * int(np.clip(error_px / 4, -15, 15))
+                    positioning_callback(captured_at, vy)
+        else:
+            return
+
+    # The preview reader starts after positioning so it never competes for
+    # frames with the positioning loop and only sees post-START frames.
     dashboard = DashboardState() if args.web_port else None
     if dashboard is not None and args.aim_only and not args.score_mode:
         dashboard.enable_manual_aim()
@@ -992,74 +1039,56 @@ def _run_board_real(
                 except Exception as exc:
                     print(f"關閉儀表板／預覽時發生錯誤：{exc}", flush=True)
 
-    try:
-        if dashboard is not None:
-            web_server = start_dashboard_server(dashboard, args.web_port)
-            print(f"即時儀表板：http://<robot-ip>:{args.web_port}", flush=True)
-            if args.preview_fps > 0:
-                # Camera capture and dashboard preview run in background
-                # threads; the control loop makes one decision per inference
-                # on the newest frame.
-                grabber = LatestFrameGrabber(
-                    camera, has_depth=use_zed_sdk, depth_on_demand=use_zed_sdk)
-                preview = LivePreviewPublisher(
-                    grabber,
-                    dashboard.update_frame,
-                    fps=args.preview_fps,
-                    frame_transform=lambda f: _inference_frame(f, args.zed_uvc),
-                    scale=args.preview_scale,
-                    jpeg_quality=args.preview_quality,
-                )
-                print(f"即時預覽：{args.preview_fps:g} FPS、{args.preview_scale:g} 倍尺寸、"
-                      f"JPEG 品質 {args.preview_quality}（辨識結果以最新一次 YOLO 疊圖顯示）。",
-                      flush=True)
-            # The muzzle camera needs the ZED SDK; UVC/OpenCV runs (and tests
-            # with a mocked camera) never touch it.
-            if use_zed_sdk and not args.no_muzzle_camera and not args.virtual_board:
-                muzzle_camera, muzzle_preview = _start_muzzle_preview(
-                    config, dashboard, args, camera=take_early_muzzle_camera())
-    except BaseException:
-        _stop_early_services()
-        camera.release()
-        raise
+    startup_cleanup.callback(_stop_early_services)
+    if dashboard is not None:
+        web_server = start_dashboard_server(dashboard, args.web_port)
+        print(f"即時儀表板：http://<robot-ip>:{args.web_port}", flush=True)
+        if args.preview_fps > 0:
+            # Camera capture and dashboard preview run in background
+            # threads; the control loop makes one decision per inference
+            # on the newest frame.
+            grabber = LatestFrameGrabber(
+                camera, has_depth=use_zed_sdk, depth_on_demand=use_zed_sdk)
+            preview = LivePreviewPublisher(
+                grabber,
+                dashboard.update_frame,
+                fps=args.preview_fps,
+                frame_transform=lambda f: _inference_frame(f, args.zed_uvc),
+                scale=args.preview_scale,
+                jpeg_quality=args.preview_quality,
+            )
+            print(f"即時預覽：{args.preview_fps:g} FPS、{args.preview_scale:g} 倍尺寸、"
+                  f"JPEG 品質 {args.preview_quality}（辨識結果以最新一次 YOLO 疊圖顯示）。",
+                  flush=True)
+        # The muzzle camera needs the ZED SDK; UVC/OpenCV runs (and tests
+        # with a mocked camera) never touch it.
+        if use_zed_sdk and not args.no_muzzle_camera and not args.virtual_board:
+            muzzle_camera, muzzle_preview = _start_muzzle_preview(
+                config, dashboard, args, camera=take_early_muzzle_camera())
 
-    try:
-        if next_handoff_command is not None:
-            print("[Aim] 等待半場及正式投球指令（飛輪維持運轉）", flush=True)
-            command = next_handoff_command()
-            if command not in ("START upper", "START lower"):
-                print("[Aim] 未收到機構交接及半場設定，結束瞄準子程序", flush=True)
-                _stop_early_services()
-                camera.release()
-                return
-            args.match_phase = command.split()[1]
-        if args.match_fire:
-            print(
-                f"比賽全自動模式（{args.match_phase}）：辨識到靶板即開賽並開始射擊"
-                + (f"，先射亮燈加分孔 9 顆（{args.light_wait:g} 秒內未確認亮燈先射 H11；限開賽後 60 秒內），"
-                   "再照蛇形順序射九宮格，射完 18 顆後等待裝填" if args.match_phase == "upper"
-                   else "，不射加分孔")
-                + f"；已裝 {args.balls_loaded} 顆，時限 {args.match_duration:g} 秒（自建立計畫起算）；"
-                f"到位容許誤差 大孔 {args.fire_tolerance_deg:g}°／小孔 {args.small_fire_tolerance_deg:g}°。",
-                flush=True,
-            )
-        elif args.score_mode:
-            print(
-                f"特殊得分燈模式（{args.match_phase}）：比賽哨聲時按 G，"
-                "程式會鎖定紅燈孔 60 秒。",
-                flush=True,
-            )
-        if motors is None:
-            motors = create_motors()
+    if args.match_fire:
         print(
-            f"自動瞄準軌跡速度上限 {args.aim_speed:.3f} rad/s，"
-            f"加速度上限 {args.aim_acceleration:.3f} rad/s²。",
+            f"比賽全自動模式（{args.match_phase}）：辨識到靶板即開賽並開始射擊"
+            + (f"，先射亮燈加分孔 9 顆（{args.light_wait:g} 秒內未確認亮燈先射 H11；限開賽後 60 秒內），"
+               "再照蛇形順序射九宮格，射完 18 顆後等待裝填" if args.match_phase == "upper"
+               else "，不射加分孔")
+            + f"；已裝 {args.balls_loaded} 顆，時限 {args.match_duration:g} 秒（自建立計畫起算）；"
+            f"到位容許誤差 大孔 {args.fire_tolerance_deg:g}°／小孔 {args.small_fire_tolerance_deg:g}°。",
             flush=True,
         )
-    except BaseException:
-        _stop_early_services()
-        camera.release()
-        raise
+    elif args.score_mode:
+        print(
+            f"特殊得分燈模式（{args.match_phase}）：比賽哨聲時按 G，"
+            "程式會鎖定紅燈孔 60 秒。",
+            flush=True,
+        )
+    if motors is None:
+        motors = create_motors()
+    print(
+        f"自動瞄準軌跡速度上限 {args.aim_speed:.3f} rad/s，"
+        f"加速度上限 {args.aim_acceleration:.3f} rad/s²。",
+        flush=True,
+    )
     turret = TurretController(config, motors)
     driver = BoardEngagement(
         config,
@@ -1265,8 +1294,7 @@ def _run_board_real(
         model_thread.join()
         if "model" not in model_box:
             raise model_box.get("error") or RuntimeError("YOLO 模型載入失敗")
-        vision = BoardVision(model_box["model"], config, confidence=args.conf, imgsz=args.imgsz,
-                             device=args.device, virtual_board=args.virtual_board)
+        vision = create_vision()
         if muzzle_preview is not None and args.muzzle_correction != "off" and launcher is not None:
             muzzle_corrector = _make_muzzle_corrector(
                 args.muzzle_correction, model_box["model"], config, muzzle_preview, driver, args)
