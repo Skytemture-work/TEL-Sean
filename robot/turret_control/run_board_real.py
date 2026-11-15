@@ -1473,6 +1473,27 @@ def _run_board_real(
                     f"/{config.image_width_px}x{config.image_height_px}",
                     flush=True,
                 )
+                if launcher is not None and previous_status is not None:
+                    # Why no shot yet: every auto-fire gate on one line.
+                    command = previous_status.command
+
+                    def _deg(value):
+                        return "-" if value is None else f"{math.degrees(value):+.2f}°"
+
+                    print(
+                        "發射狀態："
+                        f"{auto_fire.state if auto_fire is not None else '手動'}｜"
+                        f"孔={previous_status.target.hole_id if previous_status.target else '-'}｜"
+                        f"到位={command.fire_allowed}｜"
+                        f"伺服誤差 yaw={_deg(command.yaw_servo_error_rad)} "
+                        f"pitch={_deg(command.pitch_servo_error_rad)}｜"
+                        f"可達={command.target_reachable}｜"
+                        f"阻擋={command.blocked_reason or '-'}｜"
+                        f"機構忙={launcher.mechanism_busy}｜待發={launcher.pending}｜"
+                        f"飛輪到速={launcher.flywheel_ready}｜"
+                        f"冷卻完成={driver.fire_cooldown_ready}",
+                        flush=True,
+                    )
                 last_report = now
 
             reference_plan = board_plan or plan

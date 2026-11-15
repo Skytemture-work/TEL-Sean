@@ -2,11 +2,12 @@
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 import config
 from comm_uart import UARTController
-from vision_target import VisionTracker
+from vision_target import VisionTracker, get_shared_model
 from lidar_avoid import LidarAvoidance
 from manual import (
     ManualController,
@@ -84,6 +85,18 @@ def send_aim_command(process, command):
         return False
 
 
+def prewarm_aim_process():
+    """Start the aim subprocess ahead of time: it loads YOLO and opens the
+    muzzle ZED, but touches no motor until PREPARE_MOTORS."""
+    try:
+        process = start_aim_process()
+    except OSError as exc:
+        print(f"[Aim] 無法啟動預熱子程序：{exc}", flush=True)
+        return None
+    print(f"[Aim] 開始背景預熱（PID={process.pid}，不碰馬達）", flush=True)
+    return process
+
+
 def stop_aim_process(process):
     if process is None or process.poll() is not None:
         return
@@ -128,6 +141,10 @@ def main():
         brake_until = None
         avoid_until = None
         aim_exit_reported = False
+        # Preload both models while still in manual mode, so a switch to auto
+        # finds the positioning model and the aim subprocess already warm.
+        threading.Thread(target=get_shared_model, name="vision-preload", daemon=True).start()
+        aim_process = prewarm_aim_process()
         print("[System] 已啟動，預設手動模式，等待 ESP32 遙控器封包...")
 
         while True:
@@ -215,12 +232,11 @@ def main():
                         uart.send_packet(
                             mode="A", vx=0, vy=0, wz=0, yaw=50, pitch=50, fire=0, speed=0
                         )
-                        try:
-                            aim_process = start_aim_process()
-                            aim_exit_reported = False
-                            print(f"[Aim] 開始背景預熱（PID={aim_process.pid}）", flush=True)
-                        except OSError as exc:
-                            print(f"[Aim] 無法啟動預熱子程序：{exc}", flush=True)
+                        if aim_process is not None and aim_process.poll() is None:
+                            print(f"[Aim] 使用已預熱的子程序（PID={aim_process.pid}）", flush=True)
+                        else:
+                            aim_process = prewarm_aim_process()
+                        aim_exit_reported = False
                         vision = VisionTracker()
                         vision.start()
                         vision.set_active(True)
@@ -229,6 +245,9 @@ def main():
                         next_auto_status_at = 0.0
                     current_mode = new_mode
                     print(f"[Mode Switch] 已切換至 {current_mode}", flush=True)
+                    if current_mode == "M" and aim_process is None:
+                        # Warm the next auto session up while driving manually.
+                        aim_process = prewarm_aim_process()
 
                 if current_mode == "M":
                     # 手動模式：使用遙控器 yaw/pitch 控制砲台方向，

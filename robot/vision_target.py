@@ -35,10 +35,53 @@ from turret_control.competition_geometry import with_competition_geometry
 from turret_control.config import TurretConfig
 from turret_control.zed_camera import ZedDepthCamera
 
+# Ultralytics re-runs a pip install of numpy==1.23.5 on every Jetson TensorRT
+# load (~4 s, never takes effect).  Must be set before ultralytics is imported.
+os.environ.setdefault("YOLO_AUTOINSTALL", "false")
+
 try:
     from ultralytics import YOLO
 except ImportError:
     YOLO = None
+
+
+_shared_model = None
+_shared_model_lock = threading.Lock()
+
+
+def get_shared_model():
+    """Load and warm up the positioning model once per process.
+
+    main.py calls this in a background thread at start-up (manual mode), so
+    the TensorRT engine is ready before the first switch to auto.  Every
+    VisionTracker reuses the same model; callers block only until the first
+    load finishes.
+    """
+    global _shared_model
+    with _shared_model_lock:
+        if _shared_model is not None:
+            return _shared_model
+        if YOLO is None:
+            print("[Vision Error] 缺少 ultralytics，無法啟動新版 BoardVision。", flush=True)
+            return None
+        if not DEFAULT_MODEL.is_file():
+            print(f"[Vision Error] 找不到模型檔案: {DEFAULT_MODEL}", flush=True)
+            return None
+        device = os.environ.get("VISION_DEVICE", "0")
+        started = time.monotonic()
+        print(f"[Vision] 預載定位模型: {DEFAULT_MODEL} (device={device})", flush=True)
+        model = YOLO(str(DEFAULT_MODEL), task="segment")
+        config = TurretConfig()
+        try:
+            model.predict(
+                np.zeros((config.image_height_px, config.image_width_px, 3), dtype=np.uint8),
+                imgsz=640, conf=DEFAULT_CONFIDENCE, device=device, verbose=False,
+            )
+        except Exception as exc:  # the first real frame will raise it properly
+            print(f"[Vision] 定位模型預熱失敗（第一張影像再試）：{exc}", flush=True)
+        _shared_model = model
+        print(f"[Vision] 定位模型已就緒（{time.monotonic() - started:.1f} s）", flush=True)
+        return _shared_model
 
 
 @dataclass(frozen=True)
@@ -73,18 +116,9 @@ class VisionTracker(threading.Thread):
 
         self.model_path = DEFAULT_MODEL
         self.device = os.environ.get("VISION_DEVICE", "0")
+        # The model is shared and preloaded (see get_shared_model); run()
+        # fetches it so constructing a tracker never blocks the caller.
         self.model = None
-        if YOLO is None:
-            print("[Vision Error] 缺少 ultralytics，無法啟動新版 BoardVision。", flush=True)
-        elif not self.model_path.is_file():
-            print(f"[Vision Error] 找不到模型檔案: {self.model_path}", flush=True)
-        else:
-            print(
-                f"[Vision] 使用儀表板同一模型: {self.model_path} "
-                f"(device={self.device})",
-                flush=True,
-            )
-            self.model = YOLO(str(self.model_path), task="segment")
 
         self.config = with_competition_geometry(TurretConfig())
         self.board_vision = None
@@ -94,6 +128,7 @@ class VisionTracker(threading.Thread):
     def run(self):
         camera = None
         try:
+            self.model = get_shared_model()
             if self.model is None:
                 return
 
