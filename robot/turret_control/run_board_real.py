@@ -921,12 +921,10 @@ def _run_board_real(
         )
 
     if next_handoff_command is not None:
-        model_thread.join()
-        if "model" not in model_box:
-            raise model_box.get("error") or RuntimeError("YOLO 模型載入失敗")
-        if "warmup_error" in model_box:
-            raise RuntimeError("YOLO 預熱失敗") from model_box["warmup_error"]
-        print(f"[Aim] PREWARM_READY（{time.monotonic() - model_started_at:.1f} s），等待 SWA 放行", flush=True)
+        # Do not make the release wait for the model: the motors and the
+        # flywheels must start the moment the chassis is released, while the
+        # model keeps loading in the background.
+        print("[Aim] 預熱中（模型背景載入），等待 SWA 放行", flush=True)
         if next_handoff_command() != "PREPARE_MOTORS":
             print("[Aim] 未收到 SWA 機構交接，結束預熱子程序", flush=True)
             return
@@ -939,7 +937,14 @@ def _run_board_real(
         # first shot can go as soon as the robot stops (3-minute match).
         launcher = create_launcher(spin_up=True)
         startup_cleanup.callback(launcher.close, home_pusher=False)
-        print("[Aim] DM 已使能，飛輪已開始起轉，等待 ZED_READY", flush=True)
+        print("[Aim] DM 已使能，飛輪已開始起轉"
+              f"（子程序啟動後 {time.monotonic() - model_started_at:.1f} s）", flush=True)
+        model_thread.join()
+        if "model" not in model_box:
+            raise model_box.get("error") or RuntimeError("YOLO 模型載入失敗")
+        if "warmup_error" in model_box:
+            raise RuntimeError("YOLO 預熱失敗") from model_box["warmup_error"]
+        print(f"[Aim] PREWARM_READY（{time.monotonic() - model_started_at:.1f} s），等待 ZED_READY", flush=True)
         if next_handoff_command() != "ZED_READY":
             print("[Aim] 未收到 ZED 交接，結束預熱子程序", flush=True)
             return
