@@ -384,6 +384,39 @@ def _take_external_reload(reload_event, waiting):
     return False
 
 
+def _home_turret_and_wait(motors, timeout_s=20.0):
+    """Send both DM axes home along the recorded safe path and wait.
+
+    Shared by the normal shutdown and by an early exit (before START), so a
+    Ctrl+C at any point leaves the turret at home.  Never raises; the caller
+    disables the motors afterwards.
+    """
+    try:
+        snapshot = motors.worker.snapshot()
+        if snapshot.closed or not snapshot.enabled:
+            print("馬達控制器已關閉或未使能，不執行回 home。", flush=True)
+            return
+        try:
+            motors.request_home()
+        except (ValueError, RuntimeError) as exc:
+            print(f"Ctrl+C 回 home 未執行：{exc}", flush=True)
+            return
+        print("Ctrl+C：雙軸沿安全路徑返回 home，等待到位。", flush=True)
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            state, message = motors.home_status()
+            if state == "arrived":
+                print("Ctrl+C：已回 home，準備失能。", flush=True)
+                return
+            if state == "error":
+                print(f"Ctrl+C 回 home 失敗：{message}", flush=True)
+                return
+            time.sleep(0.02)
+        print("Ctrl+C 回 home 逾時，現在停止並失能。", flush=True)
+    except Exception as exc:
+        print(f"Ctrl+C 回 home 流程發生錯誤：{exc}", flush=True)
+
+
 def _shutdown_on_exit_signals():
     """Turn SIGTERM / SIGHUP (kill, SSH hang-up) into a KeyboardInterrupt.
 
@@ -994,8 +1027,13 @@ def _run_board_real(
                 motors = create_motors()
                 startup_cleanup.callback(motors.close)
                 motors.enable()
+                # Early exit (Ctrl+C / main.py stopping us before START): the
+                # same shutdown as after a match -- flywheels off and pusher
+                # home (launcher.close), then the turret home, then disable.
+                # ExitStack is LIFO, so register in reverse order.
+                startup_cleanup.callback(_home_turret_and_wait, motors)
                 launcher = create_launcher(spin_up=True)
-                startup_cleanup.callback(launcher.close, home_pusher=False)
+                startup_cleanup.callback(launcher.close, home_pusher=True)
                 print("[Aim] DM 已使能，飛輪預轉中，等待定位完成"
                       f"（子程序啟動後 {time.monotonic() - model_started_at:.1f} s）", flush=True)
             elif command == "VISION_ON" and not positioning:
@@ -1215,29 +1253,7 @@ def _run_board_real(
             except Exception as exc:
                 print(f"停止發射器時發生錯誤：{exc}", flush=True)
         try:
-            snapshot = motors.worker.snapshot()
-            if snapshot.closed or not snapshot.enabled:
-                print("馬達控制器已關閉或未使能，不執行回 home。", flush=True)
-                return
-            try:
-                motors.request_home()
-            except (ValueError, RuntimeError) as exc:
-                print(f"Ctrl+C 回 home 未執行：{exc}", flush=True)
-                return
-            print("Ctrl+C：雙軸沿安全路徑返回 home，等待到位。", flush=True)
-            deadline = time.monotonic() + 20.0
-            while time.monotonic() < deadline:
-                state, message = motors.home_status()
-                if state == "arrived":
-                    print("Ctrl+C：已回 home，準備失能。", flush=True)
-                    return
-                if state == "error":
-                    print(f"Ctrl+C 回 home 失敗：{message}", flush=True)
-                    return
-                time.sleep(0.02)
-            print("Ctrl+C 回 home 逾時，現在停止並失能。", flush=True)
-        except Exception as exc:
-            print(f"Ctrl+C 回 home 流程發生錯誤：{exc}", flush=True)
+            _home_turret_and_wait(motors)
         finally:
             try:
                 turret.close()

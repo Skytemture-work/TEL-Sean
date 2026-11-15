@@ -30,12 +30,60 @@ AUTO_FIRE_WEB_PORT = 8765
 AIM_SCRIPT = Path(__file__).resolve().parent / "turret_control" / "run_board_real.py"
 
 
+class _SafeStream:
+    """stdout/stderr that never raises: with `| tee`, Ctrl+C also kills tee,
+    and a print hitting the broken pipe must not abort the homing shutdown."""
+
+    def __init__(self, stream):
+        self._stream = stream
+
+    def write(self, text):
+        try:
+            return self._stream.write(text)
+        except (BrokenPipeError, OSError, ValueError):
+            return len(text)
+
+    def flush(self):
+        try:
+            self._stream.flush()
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
 # Keep the existing stdin channel for handoff and reload commands.
 AIM_ENTRY = """
 import queue
 import socket
 import sys
 import threading
+
+
+class _SafeStream:
+    def __init__(self, stream):
+        self._stream = stream
+
+    def write(self, text):
+        try:
+            return self._stream.write(text)
+        except (BrokenPipeError, OSError, ValueError):
+            return len(text)
+
+    def flush(self):
+        try:
+            self._stream.flush()
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+# A dead `| tee` must not break the homing shutdown halfway.
+sys.stdout = _SafeStream(sys.stdout)
+sys.stderr = _SafeStream(sys.stderr)
 from turret_control.run_board_real import main
 
 reload_event = threading.Event()
@@ -142,14 +190,29 @@ def prewarm_aim_process():
     return process, vision_socket
 
 
+AIM_SHUTDOWN_TIMEOUT_S = 45.0  # pusher home + turret home (<= 20 s) + cameras
+
+
 def stop_aim_process(process):
+    """Ask the aim subprocess to shut down and wait for it to home everything.
+
+    SIGINT runs its normal shutdown: flywheels off, ID1 pusher home, both DM
+    axes home along the safe path, then disable.  Wait long enough for that.
+    """
     if process is None or process.poll() is not None:
         return
-    process.send_signal(signal.SIGINT)
-    process.wait(timeout=10)
+    if not getattr(process, "tel_stop_sent", False):
+        # Only once: a second SIGINT would interrupt the homing in progress.
+        print("[Aim] 通知自動瞄準子程序結束：停飛輪、推球回原點、雙軸回 home…", flush=True)
+        process.send_signal(signal.SIGINT)
+        process.tel_stop_sent = True
+    process.wait(timeout=AIM_SHUTDOWN_TIMEOUT_S)
+    print(f"[Aim] 子程序已結束（exit={process.returncode}）", flush=True)
 
 
 def main():
+    sys.stdout = _SafeStream(sys.stdout)
+    sys.stderr = _SafeStream(sys.stderr)
     print("====================================================")
     print("TEL-Sean 主控系統：手動 / 自動模式")
     print("====================================================")
@@ -355,7 +418,10 @@ def main():
                         brake_until = None
                         avoid_until = None
                     elif not auto_started:
-                        locked_vy = None if latest_vy is None else latest_vy[1]
+                        # Keep the last seen vy: a single stale sample at the
+                        # moment of release must not drop the strafe direction.
+                        if latest_vy is not None:
+                            locked_vy = latest_vy[1]
                         send_aim_command(aim_process, "VISION_OFF")
                         if not aim_prepared and aim_process is not None and aim_process.poll() is None:
                             if manual is not None:
@@ -373,7 +439,10 @@ def main():
                         )
 
                 if not auto_started:
-                    locked_vy = None if latest_vy is None else latest_vy[1]
+                    # Sticky like the old VisionTracker: only a fresh sample
+                    # updates it; SWA off / a mode switch clears it.
+                    if latest_vy is not None:
+                        locked_vy = latest_vy[1]
                     uart.send_packet(
                         mode="A", vx=0, vy=0, wz=0, yaw=50, pitch=50, fire=0, speed=0
                     )
