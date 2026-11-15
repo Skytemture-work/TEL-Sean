@@ -444,6 +444,7 @@ def main(
     telemetry_callback: Optional[TelemetryCallback] = None,
     stop_event: Optional[threading.Event] = None,
     reload_event: Optional[threading.Event] = None,
+    next_handoff_command: Optional[Callable[[], Optional[str]]] = None,
 ) -> None:
     """Run the real board pipeline.
 
@@ -461,6 +462,10 @@ def main(
     remote's RELOAD button through ``AutoAimSession.confirm_reload``), the same
     as the dashboard button.  It only counts while ``--match-fire`` is waiting
     for a reload; a press at any other time is discarded, never stored.
+
+    ``next_handoff_command`` is an optional blocking stdin adapter. Wait for
+    ZED_READY before opening the camera and START upper/lower before taking
+    motor ownership. None from the adapter means the parent closed the pipe.
 
     ``telemetry_callback`` receives the same dictionary exposed by
     ``GET /api/status`` once per processed camera frame.  Both callbacks run on
@@ -787,22 +792,6 @@ def main(
             "不會發射。",
             flush=True,
         )
-    if args.match_fire:
-        print(
-            f"比賽全自動模式（{args.match_phase}）：辨識到靶板即開賽並開始射擊"
-            + (f"，先射亮燈加分孔 9 顆（{args.light_wait:g} 秒內未確認亮燈先射 H11；限開賽後 60 秒內），"
-               "再照蛇形順序射九宮格，射完 18 顆後等待裝填" if args.match_phase == "upper"
-               else "，不射加分孔")
-            + f"；已裝 {args.balls_loaded} 顆，時限 {args.match_duration:g} 秒（自建立計畫起算）；"
-            f"到位容許誤差 大孔 {args.fire_tolerance_deg:g}°／小孔 {args.small_fire_tolerance_deg:g}°。",
-            flush=True,
-        )
-    elif args.score_mode:
-        print(
-            f"特殊得分燈模式（{args.match_phase}）：比賽哨聲時按 G，"
-            "程式會鎖定紅燈孔 60 秒。",
-            flush=True,
-        )
     if not args.virtual_board and (
         config.camera_principal_x_px is None
         or config.camera_principal_y_px is None
@@ -858,6 +847,16 @@ def main(
 
     model_thread = threading.Thread(target=_load_model, name="yolo-load", daemon=True)
     model_thread.start()
+    if next_handoff_command is not None:
+        model_thread.join()
+        if "model" not in model_box:
+            raise model_box.get("error") or RuntimeError("YOLO 模型載入失敗")
+        if "warmup_error" in model_box:
+            raise RuntimeError("YOLO 預熱失敗") from model_box["warmup_error"]
+        print(f"[Aim] PREWARM_READY（{time.monotonic() - model_started_at:.1f} s），等待 ZED_READY", flush=True)
+        if next_handoff_command() != "ZED_READY":
+            print("[Aim] 未收到 ZED 交接，結束預熱子程序", flush=True)
+            return
     use_zed_sdk = not (args.zed_uvc or args.opencv_camera)
     if use_zed_sdk:
         try:
@@ -933,6 +932,30 @@ def main(
         raise
 
     try:
+        if next_handoff_command is not None:
+            command = next_handoff_command()
+            if command not in ("START upper", "START lower"):
+                print("[Aim] 未收到機構交接及半場設定，結束瞄準子程序", flush=True)
+                _stop_early_services()
+                camera.release()
+                return
+            args.match_phase = command.split()[1]
+        if args.match_fire:
+            print(
+                f"比賽全自動模式（{args.match_phase}）：辨識到靶板即開賽並開始射擊"
+                + (f"，先射亮燈加分孔 9 顆（{args.light_wait:g} 秒內未確認亮燈先射 H11；限開賽後 60 秒內），"
+                   "再照蛇形順序射九宮格，射完 18 顆後等待裝填" if args.match_phase == "upper"
+                   else "，不射加分孔")
+                + f"；已裝 {args.balls_loaded} 顆，時限 {args.match_duration:g} 秒（自建立計畫起算）；"
+                f"到位容許誤差 大孔 {args.fire_tolerance_deg:g}°／小孔 {args.small_fire_tolerance_deg:g}°。",
+                flush=True,
+            )
+        elif args.score_mode:
+            print(
+                f"特殊得分燈模式（{args.match_phase}）：比賽哨聲時按 G，"
+                "程式會鎖定紅燈孔 60 秒。",
+                flush=True,
+            )
         motors = SharedMotorBackend(
             args.port,
             speed_rad_s=args.aim_speed,
