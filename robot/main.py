@@ -125,6 +125,23 @@ def send_aim_command(process, command):
         return False
 
 
+def prewarm_aim_process():
+    """Start the aim subprocess ahead of time (boot / back in manual).
+
+    It loads YOLO and opens both ZEDs, but touches no motor until
+    PREPARE_MOTORS.  Positioning inference stays off (VISION_OFF) until the
+    switch to auto sends VISION_ON, so manual mode does not load the GPU.
+    """
+    try:
+        process, vision_socket = start_aim_process()
+    except OSError as exc:
+        print(f"[Aim] 無法啟動預熱子程序：{exc}", flush=True)
+        return None, None
+    send_aim_command(process, "VISION_OFF")
+    print(f"[Aim] 開始背景預熱（PID={process.pid}，不碰馬達）", flush=True)
+    return process, vision_socket
+
+
 def stop_aim_process(process):
     if process is None or process.poll() is not None:
         return
@@ -169,6 +186,9 @@ def main():
         brake_until = None
         avoid_until = None
         aim_exit_reported = False
+        # Warm the aim subprocess up while still in manual mode, so the
+        # switch to auto finds the model loaded and both ZEDs open.
+        aim_process, vision_socket = prewarm_aim_process()
         print("[System] 已啟動，預設手動模式，等待 ESP32 遙控器封包...")
 
         while True:
@@ -259,13 +279,17 @@ def main():
                         uart.send_packet(
                             mode="A", vx=0, vy=0, wz=0, yaw=50, pitch=50, fire=0, speed=0
                         )
-                        try:
-                            aim_process, vision_socket = start_aim_process()
-                            aim_exit_reported = False
-                            print(f"[Aim] 開始背景預熱（PID={aim_process.pid}）", flush=True)
-                        except OSError as exc:
-                            print(f"[Aim] 無法啟動預熱子程序：{exc}", flush=True)
+                        if aim_process is not None and aim_process.poll() is None:
+                            print(f"[Aim] 使用已預熱的子程序（PID={aim_process.pid}）", flush=True)
+                        else:
+                            if vision_socket is not None:
+                                vision_socket.close()
+                            aim_process, vision_socket = prewarm_aim_process()
+                        aim_exit_reported = False
+                        if aim_process is None:
                             auto_complete = True
+                        else:
+                            send_aim_command(aim_process, "VISION_ON")
                         if not auto_complete:
                             if lidar is not None:
                                 lidar.join()
@@ -274,6 +298,9 @@ def main():
                         next_auto_status_at = 0.0
                     current_mode = new_mode
                     print(f"[Mode Switch] 已切換至 {current_mode}", flush=True)
+                    if current_mode == "M" and aim_process is None:
+                        # Warm the next auto session up while driving manually.
+                        aim_process, vision_socket = prewarm_aim_process()
 
                 if current_mode == "M":
                     # 手動模式：使用遙控器 yaw/pitch 控制砲台方向，

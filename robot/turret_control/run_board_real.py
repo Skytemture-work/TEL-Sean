@@ -951,21 +951,43 @@ def _run_board_real(
 
         previous_signals = _shutdown_on_exit_signals()
         startup_cleanup.callback(_restore_signals, previous_signals)
-        model_thread.join()
-        if "model" not in model_box:
-            raise model_box.get("error") or RuntimeError("YOLO 模型載入失敗")
-        if "warmup_error" in model_box:
-            raise RuntimeError("YOLO 預熱失敗") from model_box["warmup_error"]
-        print(f"[Aim] PREWARM_READY（{time.monotonic() - model_started_at:.1f} s），等待 SWA 放行", flush=True)
+        print("[Aim] 預熱中（模型背景載入），等待 SWA 放行", flush=True)
+        # Commands are served from the start: the release (PREPARE_MOTORS)
+        # must not wait for the model.  Positioning frames are processed only
+        # once the model is ready.
+        model_ready = False
         positioning = True
-        positioning_vision = create_vision()
-        positioning_pose = BoardPoseTracker(config)
+        positioning_vision = None
+        positioning_pose = None
         reference_plan = None
         board_center = np.array([[BOARD_WIDTH_CM / 200.0, BOARD_HEIGHT_CM / 200.0, 0.0]])
         intrinsics = camera_matrix(config)
         distortion = distortion_coefficients(config)
+
+        def reset_positioning():
+            nonlocal positioning_vision, positioning_pose, reference_plan
+            positioning_vision = create_vision() if model_ready else None
+            positioning_pose = BoardPoseTracker(config)
+            reference_plan = None
+
         while stop_event is None or not stop_event.is_set():
-            command = next_handoff_command(0.2 if positioning or stop_event is not None else None)
+            if not model_ready and not model_thread.is_alive():
+                model_thread.join()
+                if "model" not in model_box:
+                    raise model_box.get("error") or RuntimeError("YOLO 模型載入失敗")
+                if "warmup_error" in model_box:
+                    raise RuntimeError("YOLO 預熱失敗") from model_box["warmup_error"]
+                model_ready = True
+                print(f"[Aim] PREWARM_READY（{time.monotonic() - model_started_at:.1f} s）", flush=True)
+                if positioning:
+                    reset_positioning()
+            if not model_ready:
+                timeout = 0.1  # keep polling the model while serving commands
+            elif positioning:
+                timeout = 0.005  # a frame per loop; camera.read paces it
+            else:
+                timeout = 0.2 if stop_event is not None else None
+            command = next_handoff_command(timeout)
             if command is None:
                 return
             if command == "PREPARE_MOTORS" and launcher is None:
@@ -974,12 +996,11 @@ def _run_board_real(
                 motors.enable()
                 launcher = create_launcher(spin_up=True)
                 startup_cleanup.callback(launcher.close, home_pusher=False)
-                print("[Aim] DM 已使能，飛輪預轉中，等待定位完成", flush=True)
+                print("[Aim] DM 已使能，飛輪預轉中，等待定位完成"
+                      f"（子程序啟動後 {time.monotonic() - model_started_at:.1f} s）", flush=True)
             elif command == "VISION_ON" and not positioning:
                 positioning = True
-                positioning_vision = create_vision()
-                positioning_pose = BoardPoseTracker(config)
-                reference_plan = None
+                reset_positioning()
             elif command == "VISION_OFF":
                 positioning = False
             elif command in ("START upper", "START lower"):
@@ -987,7 +1008,7 @@ def _run_board_real(
                     raise RuntimeError("未完成 SWA 機構交接，拒絕開始投球")
                 args.match_phase = command.split()[1]
                 break
-            elif command == "" and positioning:
+            elif command == "" and positioning and positioning_vision is not None:
                 captured_at = time.monotonic()
                 if use_zed_sdk:
                     ok, frame, _ = camera.read(want_depth=False)
@@ -1501,6 +1522,27 @@ def _run_board_real(
                     f"/{config.image_width_px}x{config.image_height_px}",
                     flush=True,
                 )
+                if launcher is not None and previous_status is not None:
+                    # Why no shot yet: every auto-fire gate on one line.
+                    command = previous_status.command
+
+                    def _deg(value):
+                        return "-" if value is None else f"{math.degrees(value):+.2f}°"
+
+                    print(
+                        "發射狀態："
+                        f"{auto_fire.state if auto_fire is not None else '手動'}｜"
+                        f"孔={previous_status.target.hole_id if previous_status.target else '-'}｜"
+                        f"到位={command.fire_allowed}｜"
+                        f"伺服誤差 yaw={_deg(command.yaw_servo_error_rad)} "
+                        f"pitch={_deg(command.pitch_servo_error_rad)}｜"
+                        f"可達={command.target_reachable}｜"
+                        f"阻擋={command.blocked_reason or '-'}｜"
+                        f"機構忙={launcher.mechanism_busy}｜待發={launcher.pending}｜"
+                        f"飛輪到速={launcher.flywheel_ready}｜"
+                        f"冷卻完成={driver.fire_cooldown_ready}",
+                        flush=True,
+                    )
                 last_report = now
 
             reference_plan = board_plan or plan

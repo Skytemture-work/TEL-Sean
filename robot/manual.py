@@ -420,7 +420,10 @@ class VESCDualMotorController:
         for attempt in range(1, VESC_RUNTIME_READ_ATTEMPTS + 1):
             try:
                 return self._read_motor(reader)
-            except TimeoutError as exc:
+            except (TimeoutError, serial.SerialTimeoutException) as exc:
+                # TimeoutError: no telemetry reply.  SerialTimeoutException:
+                # the request write stalled, e.g. while a ZED camera opening
+                # resets the shared USB controller.  Both are transient.
                 if self._stop_event.is_set():
                     return None
                 last_error = exc
@@ -428,11 +431,19 @@ class VESCDualMotorController:
                     # 偶發逾時不急停：重送上一筆轉速命令維持現況後重試，
                     # 避免飛輪被反覆剎停又起轉。連續失敗才由 _run 停機。
                     print(
-                        "[VESC] {} 遙測讀取失敗，維持目前轉速命令後重試：{}".format(label, exc),
+                        "[VESC] {} 遙測{}逾時，維持目前轉速命令後重試：{}".format(
+                            label,
+                            "寫入" if isinstance(exc, serial.SerialTimeoutException) else "讀取",
+                            exc,
+                        ),
                         flush=True,
                     )
-                    self._resend_last_commands()
                     time.sleep(VESC_RUNTIME_RETRY_DELAY)
+                    try:
+                        ser.reset_input_buffer()
+                    except Exception:
+                        pass
+                    self._resend_last_commands()
             except Exception as exc:
                 raise RuntimeError(
                     "{} VESC 遙測查詢失敗 ({})：{}".format(label, ser.port, exc)
@@ -510,12 +521,24 @@ class VESCDualMotorController:
                     pass
 
     def _write_rpm(self, label, ser, erpm):
-        try:
-            vesc_send_set_rpm(ser, erpm)
-        except Exception as exc:
-            raise RuntimeError(
-                "{} VESC {} RPM 命令寫入失敗：{}".format(label, ser.port, exc)
-            ) from exc
+        for attempt in range(1, VESC_RUNTIME_READ_ATTEMPTS + 1):
+            try:
+                vesc_send_set_rpm(ser, erpm)
+                break
+            except serial.SerialTimeoutException as exc:
+                # USB stall (e.g. a ZED opening resets the shared controller).
+                if attempt < VESC_RUNTIME_READ_ATTEMPTS and not self._stop_event.is_set():
+                    print("[VESC] {} RPM 命令寫入逾時，重試 {}/{}".format(
+                        label, attempt, VESC_RUNTIME_READ_ATTEMPTS - 1), flush=True)
+                    time.sleep(VESC_RUNTIME_RETRY_DELAY)
+                    continue
+                raise RuntimeError(
+                    "{} VESC {} RPM 命令連續寫入逾時：{}".format(label, ser.port, exc)
+                ) from exc
+            except Exception as exc:
+                raise RuntimeError(
+                    "{} VESC {} RPM 命令寫入失敗：{}".format(label, ser.port, exc)
+                ) from exc
         self._last_erpm[label] = int(erpm)
 
     def _run(self):
@@ -1556,18 +1579,39 @@ class ManualController:
         else:
             raise RuntimeError("未知射擊階段：{}".format(self.shot_stage))
 
+    @staticmethod
+    def _read_encoder_once(servo):
+        """Send one 0x31 read and accept only a genuine 0x31 reply.
+
+        mks_servo_can accepts ANY frame from the motor's CAN ID as the reply,
+        e.g. an asynchronous 0xFD "move finished" notice (fd 02 00), and then
+        decodes garbage.  Returns (value, stray_frame).
+        """
+        op = MksCommands.READ_ENCODED_VALUE_ADDITION
+        data = servo.set_generic(op, 8, [op.value])
+        if not isinstance(data, (bytes, bytearray)):
+            # Not a real MKS servo (test double): use the library call.
+            return servo.read_encoder_value_addition(), None
+        if not data:
+            return None, None
+        if len(data) != 8 or data[0] != op.value:
+            return None, bytes(data)
+        return int.from_bytes(data[1:7], byteorder="big", signed=True), None
+
     def _read_encoder(self, servo, attempts=ENCODER_READ_ATTEMPTS):
-        """讀取 MKS Encoder；CAN 偶發漏回（回傳 None）時重試，全部失敗才回傳 None。"""
+        """讀取 MKS Encoder；漏回或收到非 Encoder 回覆時重試，全部失敗才回傳 None。"""
+        can_id = getattr(servo, "can_id", "?")
         for attempt in range(1, attempts + 1):
-            value = servo.read_encoder_value_addition()
+            value, stray = self._read_encoder_once(servo)
             if value is not None:
                 if attempt > 1:
-                    print("[Manual] CAN ID{} Encoder 第 {} 次讀取成功。".format(
-                        getattr(servo, "can_id", "?"), attempt), flush=True)
+                    print("[Manual] CAN ID{} Encoder 第 {} 次讀取成功。".format(can_id, attempt), flush=True)
                 return value
             if attempt < attempts:
-                print("[Manual] CAN ID{} Encoder 沒有回覆，重試 {}/{}".format(
-                    getattr(servo, "can_id", "?"), attempt, attempts - 1), flush=True)
+                reason = ("收到非 Encoder 回覆 {}".format(stray.hex()) if stray is not None
+                          else "沒有回覆")
+                print("[Manual] CAN ID{} Encoder {}，重試 {}/{}".format(
+                    can_id, reason, attempt, attempts - 1), flush=True)
                 time.sleep(ENCODER_READ_RETRY_DELAY)
         return None
 
