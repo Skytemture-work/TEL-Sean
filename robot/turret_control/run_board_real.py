@@ -446,6 +446,19 @@ def main(
     reload_event: Optional[threading.Event] = None,
     next_handoff_command: Optional[Callable[[], Optional[str]]] = None,
 ) -> None:
+    """Run the real board pipeline with cleanup for early motor handoff."""
+    with ExitStack() as startup_cleanup:
+        _run_board_real(
+            argv, fire_callback=fire_callback, telemetry_callback=telemetry_callback,
+            stop_event=stop_event, reload_event=reload_event,
+            next_handoff_command=next_handoff_command, startup_cleanup=startup_cleanup,
+        )
+
+
+def _run_board_real(
+    argv, *, fire_callback, telemetry_callback, stop_event, reload_event,
+    next_handoff_command, startup_cleanup,
+):
     """Run the real board pipeline.
 
     ``fire_callback`` is an opt-in automatic launcher hook.  It is called only
@@ -464,8 +477,8 @@ def main(
     for a reload; a press at any other time is discarded, never stored.
 
     ``next_handoff_command`` is an optional blocking stdin adapter. Wait for
-    ZED_READY before opening the camera and START upper/lower before taking
-    motor ownership. None from the adapter means the parent closed the pipe.
+    PREPARE_MOTORS after SWA and hardware handoff, ZED_READY before opening
+    the camera, and START upper/lower before running the match.
 
     ``telemetry_callback`` receives the same dictionary exposed by
     ``GET /api/status`` once per processed camera frame.  Both callbacks run on
@@ -847,13 +860,46 @@ def main(
 
     model_thread = threading.Thread(target=_load_model, name="yolo-load", daemon=True)
     model_thread.start()
+    motors = None
+    launcher = None
+    previous_signals = None
+
+    def create_motors():
+        return SharedMotorBackend(
+            args.port,
+            speed_rad_s=args.aim_speed,
+            acceleration_rad_s2=args.aim_acceleration,
+        )
+
+    def create_launcher(spin_up=True):
+        from .panel_launcher import PanelLauncher
+
+        return PanelLauncher(
+            motors,
+            push_rpm=args.push_rpm,
+            push_acceleration=args.push_accel,
+            push_home_rpm=args.push_home_rpm,
+            spin_up=spin_up,
+        )
+
     if next_handoff_command is not None:
         model_thread.join()
         if "model" not in model_box:
             raise model_box.get("error") or RuntimeError("YOLO 模型載入失敗")
         if "warmup_error" in model_box:
             raise RuntimeError("YOLO 預熱失敗") from model_box["warmup_error"]
-        print(f"[Aim] PREWARM_READY（{time.monotonic() - model_started_at:.1f} s），等待 ZED_READY", flush=True)
+        print(f"[Aim] PREWARM_READY（{time.monotonic() - model_started_at:.1f} s），等待 SWA 放行", flush=True)
+        if next_handoff_command() != "PREPARE_MOTORS":
+            print("[Aim] 未收到 SWA 機構交接，結束預熱子程序", flush=True)
+            return
+        previous_signals = _shutdown_on_exit_signals()
+        startup_cleanup.callback(_restore_signals, previous_signals)
+        motors = create_motors()
+        startup_cleanup.callback(motors.close)
+        motors.enable()
+        launcher = create_launcher(spin_up=False)
+        startup_cleanup.callback(launcher.close, home_pusher=False)
+        print("[Aim] DM 已使能，VESC 已初始化並保持停轉，等待 ZED_READY", flush=True)
         if next_handoff_command() != "ZED_READY":
             print("[Aim] 未收到 ZED 交接，結束預熱子程序", flush=True)
             return
@@ -933,6 +979,7 @@ def main(
 
     try:
         if next_handoff_command is not None:
+            print("[Aim] 等待半場及正式投球指令，VESC 保持停轉", flush=True)
             command = next_handoff_command()
             if command not in ("START upper", "START lower"):
                 print("[Aim] 未收到機構交接及半場設定，結束瞄準子程序", flush=True)
@@ -956,11 +1003,8 @@ def main(
                 "程式會鎖定紅燈孔 60 秒。",
                 flush=True,
             )
-        motors = SharedMotorBackend(
-            args.port,
-            speed_rad_s=args.aim_speed,
-            acceleration_rad_s2=args.aim_acceleration,
-        )
+        if motors is None:
+            motors = create_motors()
         print(
             f"自動瞄準軌跡速度上限 {args.aim_speed:.3f} rad/s，"
             f"加速度上限 {args.aim_acceleration:.3f} rad/s²。",
@@ -1035,7 +1079,6 @@ def main(
     window = f"REAL BOARD AIM - {fire_label} / S skip / G score start / Q quit"
     if not args.headless:
         cv2.namedWindow(window, cv2.WINDOW_NORMAL)
-    launcher = None
     shot_log = None
     logged_shots = 0
     last_shot_started_at = None
@@ -1125,18 +1168,18 @@ def main(
         plan = EngagementPlan([])
         driver.set_plan(plan)
 
-    previous_signals = _shutdown_on_exit_signals()
+    if previous_signals is None:
+        previous_signals = _shutdown_on_exit_signals()
+    # The normal runtime shutdown now owns the prepared hardware.
+    startup_cleanup.pop_all()
     try:
-        motors.enable()
+        if next_handoff_command is None:
+            motors.enable()
         if args.panel_fire:
-            from .panel_launcher import PanelLauncher
-
-            launcher = PanelLauncher(
-                motors,
-                push_rpm=args.push_rpm,
-                push_acceleration=args.push_accel,
-                push_home_rpm=args.push_home_rpm,
-            )
+            if launcher is None:
+                launcher = create_launcher()
+            else:
+                launcher.start_flywheels()
             print(
                 "推球馬達 ID1："
                 f"推球 {launcher.controller.shooting_speed_rpm} RPM、"
