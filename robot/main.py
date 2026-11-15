@@ -45,7 +45,7 @@ def read_commands():
         command = line.strip()
         if command == "RELOAD":
             reload_event.set()
-        elif command in ("ZED_READY", "START upper", "START lower"):
+        elif command in ("PREPARE_MOTORS", "ZED_READY", "START upper", "START lower"):
             handoff.put(command)
     handoff.put(None)
 
@@ -114,6 +114,7 @@ def main():
         current_mode = "M"
         awaiting_phase = False
         aim_started = False
+        aim_prepared = False
         last_auto_reload = None
         next_auto_status_at = 0.0
         last_received_mode = None
@@ -184,6 +185,7 @@ def main():
                             continue
                         aim_process = None
                         aim_started = False
+                        aim_prepared = False
                         if vision is not None:
                             vision.stop()
                             vision = None
@@ -252,6 +254,13 @@ def main():
                         brake_until = None
                         avoid_until = None
                     elif not auto_started:
+                        if not aim_prepared and aim_process is not None and aim_process.poll() is None:
+                            if manual is not None:
+                                manual.close()
+                                manual = None
+                            aim_prepared = send_aim_command(aim_process, "PREPARE_MOTORS")
+                            if aim_prepared:
+                                print("[Aim] SWA 已放行，背景準備 DM／VESC", flush=True)
                         auto_started = True
                         vy_recorded_before_release = locked_vy is not None
                         next_auto_status_at = 0.0
@@ -279,16 +288,18 @@ def main():
                     time.sleep(0.02)
                     continue
 
-            if awaiting_phase and packet is not None and packet.get("mode") == "A":
+            # START authorizes the match only while SWA is on.
+            if (
+                awaiting_phase and packet is not None and packet.get("mode") == "A"
+                and packet.get("auto_start") == 1
+            ):
                 awaiting_phase = False
                 match_phase = "lower" if packet.get("fire") == 1 else "upper"
-                if aim_process is not None and aim_process.poll() is None:
-                    manual.close()
-                    manual = None
+                if aim_prepared:
                     last_auto_reload = packet.get("reload")
                     aim_started = send_aim_command(aim_process, f"START {match_phase}")
                     if aim_started:
-                        print(f"[Aim] 已交接機構並送出半場設定（{match_phase}）", flush=True)
+                        print(f"[Aim] 已送出正式投球及半場設定（{match_phase}）", flush=True)
                 else:
                     print("[Aim] 預熱子程序已結束，未交接機構", flush=True)
 
@@ -427,9 +438,9 @@ def main():
                         print("[Aim] ZED 未確認釋放，未啟動瞄準", flush=True)
                         if aim_process is not None:
                             aim_process.stdin.close()
-                    elif send_aim_command(aim_process, "ZED_READY"):
+                    elif aim_prepared and send_aim_command(aim_process, "ZED_READY"):
                         awaiting_phase = True
-                        print("[Aim] 已通知 ZED 交接，等待下一筆 A 模式封包選擇半場", flush=True)
+                        print("[Aim] 已通知 ZED 交接，等待 A 模式封包的 auto_start=1 與半場設定", flush=True)
                     else:
                         print("[Aim] 未完成 ZED 交接", flush=True)
 
