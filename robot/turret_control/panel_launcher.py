@@ -43,7 +43,8 @@ class SharedAimMonitor:
 
 class PanelLauncher:
     def __init__(self, motors, *, controller_factory=None, clock=time.monotonic,
-                 push_rpm=None, push_acceleration=None, push_home_rpm=None):
+                 push_rpm=None, push_acceleration=None, push_home_rpm=None,
+                 spin_up=True):
         from manual import ManualController, VESC_MIN_RPM, VESC_RPM_PER_SPEED_UNIT
 
         self._vesc_paused = False
@@ -72,7 +73,7 @@ class PanelLauncher:
         if push_home_rpm is not None:
             self.controller.home_speed_rpm = int(push_home_rpm)
         try:
-            self.controller.vesc_controller.set_speed(PANEL_FLYWHEEL_SPEED)
+            self.controller.vesc_controller.set_speed(PANEL_FLYWHEEL_SPEED if spin_up else None)
             self.check_health()
         except BaseException:
             self.controller.close()
@@ -298,10 +299,10 @@ class PanelLauncher:
             "message": self.message,
         }
 
-    def close(self):
+    def close(self, *, home_pusher=True):
         self._authorization = None
         # Leave the pusher retracted: a run may end after stage 1 or 2 of 3.
-        self.controller.close(home_pusher=True)
+        self.controller.close(home_pusher=home_pusher)
 
 
 class AutoFireTrigger:
