@@ -30,22 +30,58 @@ AUTO_FIRE_WEB_PORT = 8765
 AIM_SCRIPT = Path(__file__).resolve().parent / "turret_control" / "run_board_real.py"
 
 
-# The aiming process consumes this event only while waiting for a refill.
+# Keep the existing stdin channel for handoff and reload commands.
 AIM_ENTRY = """
+import queue
 import sys
 import threading
 from turret_control.run_board_real import main
 
 reload_event = threading.Event()
+handoff = queue.Queue()
 
-def read_reload_commands():
+def read_commands():
     for line in sys.stdin:
-        if line.strip() == "RELOAD":
+        command = line.strip()
+        if command == "RELOAD":
             reload_event.set()
+        elif command in ("ZED_READY", "START upper", "START lower"):
+            handoff.put(command)
+    handoff.put(None)
 
-threading.Thread(target=read_reload_commands, daemon=True).start()
-main(sys.argv[1:], reload_event=reload_event)
+threading.Thread(target=read_commands, daemon=True).start()
+main(sys.argv[1:], reload_event=reload_event, next_handoff_command=handoff.get)
 """
+
+
+def start_aim_process():
+    return subprocess.Popen(
+        [
+            sys.executable, "-u", "-c", AIM_ENTRY,
+            "--match-fire", "--web-port", str(AUTO_FIRE_WEB_PORT),
+            "--headless",
+        ],
+        cwd=str(AIM_SCRIPT.parent.parent),
+        stdin=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+
+
+def send_aim_command(process, command):
+    if process is None:
+        return False
+    exit_code = process.poll()
+    if exit_code is not None:
+        print(f"[Aim] 子程序已結束（exit={exit_code}），無法送出 {command}", flush=True)
+        return False
+    try:
+        process.stdin.write(command + "\n")
+        process.stdin.flush()
+        return True
+    except OSError as exc:
+        print(f"[Aim] 無法送出 {command}：{exc}", flush=True)
+        return False
 
 
 def stop_aim_process(process):
@@ -77,6 +113,7 @@ def main():
         # 預設手動模式；收到 ESP32 封包後依封包中的 mode 切換
         current_mode = "M"
         awaiting_phase = False
+        aim_started = False
         last_auto_reload = None
         next_auto_status_at = 0.0
         last_received_mode = None
@@ -138,6 +175,20 @@ def main():
                             "自動模式" if new_mode == "A" else "手動模式"
                         )
                     )
+                    if new_mode == "M":
+                        try:
+                            stop_aim_process(aim_process)
+                        except subprocess.TimeoutExpired:
+                            print("[Aim] 瞄準程式尚未完成關閉，暫緩切回手動。", flush=True)
+                            time.sleep(0.02)
+                            continue
+                        aim_process = None
+                        aim_started = False
+                        if vision is not None:
+                            vision.stop()
+                            vision = None
+                        lidar.set_active(False)
+
                     auto_complete = False
                     auto_started = False
                     awaiting_phase = False
@@ -148,18 +199,6 @@ def main():
                     positioning_moved = False
                     brake_until = None
                     avoid_until = None
-                    if new_mode == "M":
-                        try:
-                            stop_aim_process(aim_process)
-                        except subprocess.TimeoutExpired:
-                            print("[Aim] 瞄準程式尚未完成關閉，暫緩切回手動。", flush=True)
-                            time.sleep(0.02)
-                            continue
-                        aim_process = None
-                        if vision is not None:
-                            vision.stop()
-                            vision = None
-                        lidar.set_active(False)
 
                     # 手動切自動時，等待 ID1 回零及 DM 回位、失能完成。
                     print("[Mode Switch] 等待手動控制器交接", flush=True)
@@ -173,6 +212,11 @@ def main():
                         uart.send_packet(
                             mode="A", vx=0, vy=0, wz=0, yaw=50, pitch=50, fire=0, speed=0
                         )
+                        try:
+                            aim_process = start_aim_process()
+                            print(f"[Aim] 開始背景預熱（PID={aim_process.pid}）", flush=True)
+                        except OSError as exc:
+                            print(f"[Aim] 無法啟動預熱子程序：{exc}", flush=True)
                         vision = VisionTracker()
                         vision.start()
                         vision.set_active(True)
@@ -238,39 +282,25 @@ def main():
             if awaiting_phase and packet is not None and packet.get("mode") == "A":
                 awaiting_phase = False
                 match_phase = "lower" if packet.get("fire") == 1 else "upper"
-                try:
+                if aim_process is not None and aim_process.poll() is None:
                     manual.close()
                     manual = None
-                    aim_process = subprocess.Popen(
-                        [
-                            sys.executable, "-u", "-c", AIM_ENTRY,
-                            "--match-fire", "--match-phase", match_phase,
-                            "--web-port", str(AUTO_FIRE_WEB_PORT),
-                            "--headless",
-                        ],
-                        cwd=str(AIM_SCRIPT.parent.parent),
-                        stdin=subprocess.PIPE,
-                        text=True,
-                        start_new_session=True,
-                    )
                     last_auto_reload = packet.get("reload")
-                    print(f"[Aim] 已啟動比賽全自動（半場={match_phase}，PID={aim_process.pid}）", flush=True)
-                except OSError as exc:
-                    print(f"[Aim] 啟動失敗：{exc}", flush=True)
+                    aim_started = send_aim_command(aim_process, f"START {match_phase}")
+                    if aim_started:
+                        print(f"[Aim] 已交接機構並送出半場設定（{match_phase}）", flush=True)
+                else:
+                    print("[Aim] 預熱子程序已結束，未交接機構", flush=True)
 
             if (
                 current_mode == "A" and packet is not None and packet.get("mode") == "A"
-                and aim_process is not None and aim_process.poll() is None
+                and aim_started
             ):
                 reload_value = packet.get("reload")
                 if reload_value in (0, 1):
                     if last_auto_reload == 0 and reload_value == 1:
-                        try:
-                            aim_process.stdin.write("RELOAD\n")
-                            aim_process.stdin.flush()
+                        if send_aim_command(aim_process, "RELOAD"):
                             print("[Aim] 已轉送遙控器裝填確認", flush=True)
-                        except BrokenPipeError:
-                            print("[Aim] 子程序已關閉裝填通道", flush=True)
                     last_auto_reload = reload_value
 
             if current_mode == "A" and not auto_complete:
@@ -395,11 +425,13 @@ def main():
                     vision = None
                     if not camera_released:
                         print("[Aim] ZED 未確認釋放，未啟動瞄準", flush=True)
-                    elif not AIM_SCRIPT.is_file():
-                        print(f"[Aim] 找不到瞄準程式：{AIM_SCRIPT}", flush=True)
-                    else:
+                        if aim_process is not None:
+                            aim_process.stdin.close()
+                    elif send_aim_command(aim_process, "ZED_READY"):
                         awaiting_phase = True
-                        print("[Aim] 定位完成，等待下一筆 A 模式封包選擇半場", flush=True)
+                        print("[Aim] 已通知 ZED 交接，等待下一筆 A 模式封包選擇半場", flush=True)
+                    else:
+                        print("[Aim] 未完成 ZED 交接", flush=True)
 
                 if not auto_complete and now >= next_auto_status_at:
                     next_auto_status_at = now + AUTO_STATUS_INTERVAL_SECONDS
