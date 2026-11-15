@@ -935,9 +935,11 @@ def _run_board_real(
         motors = create_motors()
         startup_cleanup.callback(motors.close)
         motors.enable()
-        launcher = create_launcher(spin_up=False)
+        # Spin the flywheels up while the chassis is still positioning, so the
+        # first shot can go as soon as the robot stops (3-minute match).
+        launcher = create_launcher(spin_up=True)
         startup_cleanup.callback(launcher.close, home_pusher=False)
-        print("[Aim] DM 已使能，VESC 已初始化並保持停轉，等待 ZED_READY", flush=True)
+        print("[Aim] DM 已使能，飛輪已開始起轉，等待 ZED_READY", flush=True)
         if next_handoff_command() != "ZED_READY":
             print("[Aim] 未收到 ZED 交接，結束預熱子程序", flush=True)
             return
@@ -1018,7 +1020,7 @@ def _run_board_real(
 
     try:
         if next_handoff_command is not None:
-            print("[Aim] 等待半場及正式投球指令，VESC 保持停轉", flush=True)
+            print("[Aim] 等待半場及正式投球指令（飛輪維持運轉）", flush=True)
             command = next_handoff_command()
             if command not in ("START upper", "START lower"):
                 print("[Aim] 未收到機構交接及半場設定，結束瞄準子程序", flush=True)
