@@ -288,11 +288,9 @@ def main():
                     time.sleep(0.02)
                     continue
 
-            # START authorizes the match only while SWA is on.
-            if (
-                awaiting_phase and packet is not None and packet.get("mode") == "A"
-                and packet.get("auto_start") == 1
-            ):
+            # SWA already authorized motor preparation for this auto session.
+            # The next A packet supplies only the half selection.
+            if awaiting_phase and packet is not None and packet.get("mode") == "A":
                 awaiting_phase = False
                 match_phase = "lower" if packet.get("fire") == 1 else "upper"
                 if aim_prepared:
@@ -440,7 +438,7 @@ def main():
                             aim_process.stdin.close()
                     elif aim_prepared and send_aim_command(aim_process, "ZED_READY"):
                         awaiting_phase = True
-                        print("[Aim] 已通知 ZED 交接，等待 A 模式封包的 auto_start=1 與半場設定", flush=True)
+                        print("[Aim] 已通知 ZED 交接，等待下一筆 A 模式封包選擇半場", flush=True)
                     else:
                         print("[Aim] 未完成 ZED 交接", flush=True)
 
