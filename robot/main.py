@@ -1,12 +1,12 @@
 # main.py
 import signal
+import socket
 import subprocess
 import sys
 import time
 from pathlib import Path
 import config
 from comm_uart import UARTController
-from vision_target import VisionTracker
 from lidar_avoid import LidarAvoidance
 from manual import (
     ManualController,
@@ -33,39 +33,80 @@ AIM_SCRIPT = Path(__file__).resolve().parent / "turret_control" / "run_board_rea
 # Keep the existing stdin channel for handoff and reload commands.
 AIM_ENTRY = """
 import queue
+import socket
 import sys
 import threading
 from turret_control.run_board_real import main
 
 reload_event = threading.Event()
 handoff = queue.Queue()
+vision_socket = socket.socket(fileno=int(sys.argv[1]))
+vision_socket.setblocking(False)
+
+def publish_vy(captured_at, vy):
+    try:
+        vision_socket.send(f"{captured_at} {vy}".encode("ascii"))
+    except BlockingIOError:
+        pass
+
+def next_command(timeout):
+    try:
+        return handoff.get(timeout=timeout)
+    except queue.Empty:
+        return ""
 
 def read_commands():
     for line in sys.stdin:
         command = line.strip()
         if command == "RELOAD":
             reload_event.set()
-        elif command in ("PREPARE_MOTORS", "ZED_READY", "START upper", "START lower"):
+        elif command in ("PREPARE_MOTORS", "VISION_ON", "VISION_OFF", "START upper", "START lower"):
             handoff.put(command)
     handoff.put(None)
 
 threading.Thread(target=read_commands, daemon=True).start()
-main(sys.argv[1:], reload_event=reload_event, next_handoff_command=handoff.get)
+with vision_socket:
+    main(sys.argv[2:], reload_event=reload_event, next_handoff_command=next_command,
+         positioning_callback=publish_vy)
 """
 
 
 def start_aim_process():
-    return subprocess.Popen(
-        [
-            sys.executable, "-u", "-c", AIM_ENTRY,
-            "--match-fire", "--web-port", str(AUTO_FIRE_WEB_PORT),
-            "--headless",
-        ],
-        cwd=str(AIM_SCRIPT.parent.parent),
-        stdin=subprocess.PIPE,
-        text=True,
-        start_new_session=True,
-    )
+    parent_socket, child_socket = socket.socketpair(type=socket.SOCK_DGRAM)
+    parent_socket.setblocking(False)
+    try:
+        with child_socket:
+            process = subprocess.Popen(
+                [
+                    sys.executable, "-u", "-c", AIM_ENTRY, str(child_socket.fileno()),
+                    "--match-fire", "--web-port", str(AUTO_FIRE_WEB_PORT), "--headless",
+                ],
+                cwd=str(AIM_SCRIPT.parent.parent),
+                stdin=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+                pass_fds=(child_socket.fileno(),),
+            )
+    except BaseException:
+        parent_socket.close()
+        raise
+    return process, parent_socket
+
+
+def read_positioning_vy(vision_socket, valid_after, latest):
+    if vision_socket is None:
+        return None
+    while True:
+        try:
+            captured_at, vy = vision_socket.recv(128).decode("ascii").split()
+        except BlockingIOError:
+            break
+        latest = float(captured_at), int(vy)
+    if latest is not None:
+        captured_at, _ = latest
+        if captured_at >= valid_after and time.monotonic() - captured_at <= config.AUTO_VISION_MAX_AGE_S:
+            return latest
+    return None
 
 
 def send_aim_command(process, command):
@@ -97,9 +138,9 @@ def main():
     print("====================================================")
 
     uart = UARTController(config.SERIAL_PORT, config.BAUDRATE)
-    vision = None
+    vision_socket = None
     aim_process = None
-    lidar = LidarAvoidance()
+    lidar = None
 
     # 手動模式控制器：接收遙控器封包，管理砲台指令、射擊與彈藥倉格位
     manual = None
@@ -107,8 +148,6 @@ def main():
         print("[System] 正在初始化手動控制器（DM / MKS CAN / VESC）", flush=True)
         manual = ManualController(uart=uart)
         print("[System] 手動控制器初始化完成", flush=True)
-        lidar.start()
-        time.sleep(1.0)
 
         # 預設手動模式；收到 ESP32 封包後依封包中的 mode 切換
         current_mode = "M"
@@ -121,6 +160,8 @@ def main():
         auto_complete = False
         auto_started = False
         locked_vy = None
+        latest_vy = None
+        vision_valid_after = 0.0
         vy_recorded_before_release = False
         strafe_until = None
         vision_wait_until = None
@@ -187,15 +228,18 @@ def main():
                         aim_process = None
                         aim_started = False
                         aim_prepared = False
-                        if vision is not None:
-                            vision.stop()
-                            vision = None
-                        lidar.set_active(False)
+                        if vision_socket is not None:
+                            vision_socket.close()
+                            vision_socket = None
+                        if lidar is not None:
+                            lidar.stop()
 
                     auto_complete = False
                     auto_started = False
                     awaiting_phase = False
                     locked_vy = None
+                    latest_vy = None
+                    vision_valid_after = time.monotonic()
                     vy_recorded_before_release = False
                     strafe_until = None
                     vision_wait_until = None
@@ -216,16 +260,17 @@ def main():
                             mode="A", vx=0, vy=0, wz=0, yaw=50, pitch=50, fire=0, speed=0
                         )
                         try:
-                            aim_process = start_aim_process()
+                            aim_process, vision_socket = start_aim_process()
                             aim_exit_reported = False
                             print(f"[Aim] 開始背景預熱（PID={aim_process.pid}）", flush=True)
                         except OSError as exc:
                             print(f"[Aim] 無法啟動預熱子程序：{exc}", flush=True)
-                        vision = VisionTracker()
-                        vision.start()
-                        vision.set_active(True)
-                        print("[Vision] 正在準備相機與模型", flush=True)
-                        lidar.set_active(True)
+                            auto_complete = True
+                        if not auto_complete:
+                            if lidar is not None:
+                                lidar.join()
+                            lidar = LidarAvoidance()
+                            lidar.start()
                         next_auto_status_at = 0.0
                     current_mode = new_mode
                     print(f"[Mode Switch] 已切換至 {current_mode}", flush=True)
@@ -247,13 +292,11 @@ def main():
                 aim_exit_reported = True
                 auto_complete = True
                 awaiting_phase = False
-                lidar.set_active(False)
+                if lidar is not None:
+                    lidar.stop()
                 uart.send_packet(
                     mode="A", vx=0, vy=0, wz=0, yaw=50, pitch=50, fire=0, speed=0
                 )
-                if vision is not None:
-                    vision.stop()
-                    vision = None
                 if aim_process.returncode == 0:
                     print("[Aim] 自動瞄準子程序已結束，底盤已送出停止；撥回手動模式即可繼續手動操作。",
                           flush=True)
@@ -267,12 +310,16 @@ def main():
 
             if current_mode == "A" and not auto_complete:
                 now = time.monotonic()
+                latest_vy = read_positioning_vy(vision_socket, vision_valid_after, latest_vy)
                 if packet is not None and packet.get("mode") == "A":
                     swa_enabled = packet.get("auto_start") == 1
                     if not swa_enabled:
                         if auto_started:
                             print("[Auto Drive] SWA 關閉，暫停定位", flush=True)
                             locked_vy = None
+                            latest_vy = None
+                            vision_valid_after = time.monotonic()
+                            send_aim_command(aim_process, "VISION_ON")
                         auto_started = False
                         vy_recorded_before_release = False
                         strafe_until = None
@@ -281,6 +328,8 @@ def main():
                         brake_until = None
                         avoid_until = None
                     elif not auto_started:
+                        locked_vy = None if latest_vy is None else latest_vy[1]
+                        send_aim_command(aim_process, "VISION_OFF")
                         if not aim_prepared and aim_process is not None and aim_process.poll() is None:
                             if manual is not None:
                                 manual.close()
@@ -297,9 +346,7 @@ def main():
                         )
 
                 if not auto_started:
-                    (_, preview_vy, _), _, detected = vision.get_vision_data()
-                    if detected:
-                        locked_vy = preview_vy
+                    locked_vy = None if latest_vy is None else latest_vy[1]
                     uart.send_packet(
                         mode="A", vx=0, vy=0, wz=0, yaw=50, pitch=50, fire=0, speed=0
                     )
@@ -356,6 +403,7 @@ def main():
                 valid_distance = fresh_scan and front_distance_m is not None
                 blocked = valid_distance and front_distance_m <= lidar.safe_dist_m
                 auto_complete = False
+                positioning_succeeded = False
                 completion_reason = "已抵達目標距離並完成橫移"
 
                 if blocked and positioning_moved and brake_until is None:
@@ -387,7 +435,7 @@ def main():
                     and now >= vision_wait_until
                 ):
                     auto_complete = True
-                    completion_reason = "LiDAR 已到位，等待 Vision 10 秒逾時，定位完成"
+                    completion_reason = "等待視覺橫移方向 10 秒逾時"
                 elif not fresh_scan:
                     lidar_status = "等待有效前方掃描"
                 elif front_distance_m is None:
@@ -403,9 +451,12 @@ def main():
                         if vision_wait_until is None:
                             vision_wait_until = now + VISION_WAIT_SECONDS
                             next_auto_status_at = 0.0
-                        (_, raw_vy, _), _, detected = vision.get_vision_data()
-                        if detected:
-                            locked_vy = raw_vy
+                            vision_valid_after = time.monotonic()
+                            latest_vy = None
+                            send_aim_command(aim_process, "VISION_ON")
+                        if latest_vy is not None:
+                            locked_vy = latest_vy[1]
+                            send_aim_command(aim_process, "VISION_OFF")
                     lidar_status = "抵達目標距離" if arrived else "尚未抵達目標距離"
                     final_vx = 0 if arrived else AUTO_FORWARD_VX
                     if locked_vy is not None and strafe_until is None:
@@ -428,6 +479,9 @@ def main():
                                 final_vx = abs(final_vy)
                         else:
                             auto_complete = arrived
+                            positioning_succeeded = front_distance_m < AUTO_TARGET_DISTANCE_M
+                            if auto_complete and not positioning_succeeded:
+                                completion_reason = "橫移後未能確認仍在目標距離內"
                     positioning_moved = positioning_moved or bool(final_vx or final_vy)
 
                 if auto_complete:
@@ -452,22 +506,21 @@ def main():
                 )
 
                 if auto_complete:
-                    lidar.set_active(False)
+                    lidar.stop()
+                    print("[LiDAR] 定位結束，關閉點雲、IMU 與心跳", flush=True)
                     print(
-                        f"[Auto Drive] {distance_text}，{completion_reason}，底盤已送出停止，等待釋放 ZED",
+                        f"[Auto Drive] {distance_text}，{completion_reason}，底盤已送出停止",
                         flush=True,
                     )
-                    camera_released = vision.stop()
-                    vision = None
-                    if not camera_released:
-                        print("[Aim] ZED 未確認釋放，未啟動瞄準", flush=True)
+                    if not positioning_succeeded:
+                        print("[Aim] 定位未成功，取消本輪投球；請切回 M 模式後重試", flush=True)
                         if aim_process is not None:
                             aim_process.stdin.close()
-                    elif aim_prepared and send_aim_command(aim_process, "ZED_READY"):
+                    elif aim_prepared and send_aim_command(aim_process, "VISION_OFF"):
                         awaiting_phase = True
-                        print("[Aim] 已通知 ZED 交接，等待下一筆 A 模式封包選擇半場", flush=True)
+                        print("[Aim] 沿用 ZED，等待下一筆 A 模式封包選擇半場", flush=True)
                     else:
-                        print("[Aim] 未完成 ZED 交接", flush=True)
+                        print("[Aim] 投球子程序未完成機構交接", flush=True)
 
                 if not auto_complete and now >= next_auto_status_at:
                     next_auto_status_at = now + AUTO_STATUS_INTERVAL_SECONDS
@@ -488,12 +541,16 @@ def main():
     except KeyboardInterrupt:
         print("\n[System] 使用者中斷，關閉系統...")
     finally:
+        if lidar is not None:
+            lidar.stop()
+            if lidar.ident is not None:
+                lidar.join()
         try:
             stop_aim_process(aim_process)
         except (OSError, subprocess.TimeoutExpired) as exc:
             print(f"[Aim] 關閉時發生錯誤：{exc}", flush=True)
-        if vision is not None:
-            vision.stop()
+        if vision_socket is not None:
+            vision_socket.close()
         try:
             if manual is not None:
                 manual.close()
