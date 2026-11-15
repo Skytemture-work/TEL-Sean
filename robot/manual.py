@@ -83,6 +83,11 @@ VESC_RUNTIME_RETRY_DELAY = 0.1
 VESC_MAX_MOTOR_CURRENT_A = 50.0
 VESC_MAX_INPUT_VOLTAGE_V = 30.0
 VESC_MIN_INPUT_VOLTAGE_V = 10.5
+# 飛輪停轉後至少間隔這麼久才允許再次起轉，避免模式來回切換時
+# VESC 反覆剎車／加速而過熱。停轉時間記在檔案中，讓主程式與
+# 自動瞄準子程序共用同一個冷卻計時。
+VESC_MIN_RESTART_INTERVAL_S = 3.0
+VESC_LAST_STOP_FILE = "/tmp/tel_sean_vesc_last_stop"
 # 飛輪上下排列：LEFT = 上飛輪、RIGHT = 下飛輪。
 # 下輪比上輪快會讓球產生下旋（backspin），升力使彈道較平。
 # 目標轉速 target 為兩輪平均：上輪 = target*(1-k)、下輪 = target*(1+k)。
@@ -287,6 +292,23 @@ def format_vesc_motor_temp(values):
     return "{:.1f}°C".format(values["motor_temp"])
 
 
+def record_flywheel_stop():
+    try:
+        with open(VESC_LAST_STOP_FILE, "w") as stamp:
+            stamp.write(repr(time.time()))
+    except OSError:
+        pass
+
+
+def seconds_since_flywheel_stop():
+    """上次飛輪停轉距今秒數；沒有紀錄時回傳 None。"""
+    try:
+        with open(VESC_LAST_STOP_FILE) as stamp:
+            return time.time() - float(stamp.read())
+    except (OSError, ValueError):
+        return None
+
+
 def flywheel_wheel_targets(target_rpm):
     """平均目標轉速 → (LEFT 上輪, RIGHT 下輪) 目標 RPM；下輪較快產生下旋。"""
     return (
@@ -315,6 +337,11 @@ class VESCDualMotorController:
         self._ready_event = threading.Event()
         # 最近一次讀到的實際轉速 (left_rpm, right_rpm, monotonic 時間)；供發射記錄使用。
         self.last_rpm = None
+        # 最近一次送出的 ERPM 命令；遙測偶發逾時時重送以維持現況。
+        self._last_erpm = {"LEFT": 0, "RIGHT": 0}
+        # 本控制器目前是否正在命令飛輪轉動（用於記錄停轉時間）。
+        self._spinning = False
+        self._restart_hold_reported = False
 
     def start(self):
         print("[VESC] 啟動控制執行緒，檢查雙馬達遙測；初始保持停轉。", flush=True)
@@ -395,11 +422,13 @@ class VESCDualMotorController:
                     return None
                 last_error = exc
                 if attempt < VESC_RUNTIME_READ_ATTEMPTS:
+                    # 偶發逾時不急停：重送上一筆轉速命令維持現況後重試，
+                    # 避免飛輪被反覆剎停又起轉。連續失敗才由 _run 停機。
                     print(
-                        "[VESC] {} 遙測讀取失敗，先送停止命令後重試：{}".format(label, exc),
+                        "[VESC] {} 遙測讀取失敗，維持目前轉速命令後重試：{}".format(label, exc),
                         flush=True,
                     )
-                    self._stop_motors()
+                    self._resend_last_commands()
                     time.sleep(VESC_RUNTIME_RETRY_DELAY)
             except Exception as exc:
                 raise RuntimeError(
@@ -445,14 +474,46 @@ class VESCDualMotorController:
                         failures[label] = exc
         return {label: exc for label, exc in failures.items() if label not in stopped}
 
-    @staticmethod
-    def _write_rpm(label, ser, erpm):
+    def _apply_restart_interval(self, target_rpm):
+        """停轉後未滿 VESC_MIN_RESTART_INTERVAL_S 前，起轉要求先維持停轉。"""
+        if target_rpm is None:
+            if self._spinning:
+                self._spinning = False
+                record_flywheel_stop()
+            self._restart_hold_reported = False
+            return None
+        if not self._spinning:
+            since = seconds_since_flywheel_stop()
+            if since is not None and 0.0 <= since < VESC_MIN_RESTART_INTERVAL_S:
+                if not self._restart_hold_reported:
+                    self._restart_hold_reported = True
+                    print(
+                        "[VESC] 飛輪剛停轉 {:.1f} 秒，等滿 {:.0f} 秒再起轉以免過熱。".format(
+                            since, VESC_MIN_RESTART_INTERVAL_S
+                        ),
+                        flush=True,
+                    )
+                return None
+            self._spinning = True
+            self._restart_hold_reported = False
+        return target_rpm
+
+    def _resend_last_commands(self):
+        for label, ser in (("LEFT", self._ser_left), ("RIGHT", self._ser_right)):
+            if ser is not None and ser.is_open:
+                try:
+                    vesc_send_set_rpm(ser, self._last_erpm.get(label, 0))
+                except Exception:
+                    pass
+
+    def _write_rpm(self, label, ser, erpm):
         try:
             vesc_send_set_rpm(ser, erpm)
         except Exception as exc:
             raise RuntimeError(
                 "{} VESC {} RPM 命令寫入失敗：{}".format(label, ser.port, exc)
             ) from exc
+        self._last_erpm[label] = int(erpm)
 
     def _run(self):
         pi_left_integral = 0.0
@@ -515,6 +576,7 @@ class VESCDualMotorController:
                     None if speed_value is None
                     else VESC_MIN_RPM + speed_value * VESC_RPM_PER_SPEED_UNIT
                 )
+                target_rpm = self._apply_restart_interval(target_rpm)
 
                 if target_rpm is None:
                     # 自動模式或關閉時清除積分並命令兩顆馬達停轉。
@@ -573,6 +635,9 @@ class VESCDualMotorController:
             print("[VESC ERROR] 停止雙馬達控制：{}".format(exc))
         finally:
             self._ready_event.set()
+            if self._spinning:
+                self._spinning = False
+                record_flywheel_stop()
             stop_failures = self._stop_motors()
             if stop_failures and self.error is None:
                 self.error = "VESC 停止命令寫入失敗：{}".format(stop_failures)

@@ -411,13 +411,16 @@ def _restore_signals(previous):
         signal.signal(sig, old)
 
 
-def _start_muzzle_preview(config, dashboard, args):
-    """Open the muzzle ZED for the dashboard; any failure only disables it."""
+def _start_muzzle_preview(config, dashboard, args, camera=None):
+    """Open the muzzle ZED for the dashboard; any failure only disables it.
+
+    ``camera`` is a muzzle ZED already opened during the prewarm phase.
+    """
     from .muzzle_camera import MuzzlePreview, MuzzleZedCamera
 
-    camera = None
     try:
-        camera = MuzzleZedCamera(config.muzzle_zed_serial)
+        if camera is None:
+            camera = MuzzleZedCamera(config.muzzle_zed_serial)
         preview = MuzzlePreview(
             camera, dashboard.update_muzzle_frame,
             offset_x_m=config.muzzle_barrel_offset_x_m,
@@ -860,6 +863,41 @@ def _run_board_real(
 
     model_thread = threading.Thread(target=_load_model, name="yolo-load", daemon=True)
     model_thread.start()
+
+    # The muzzle ZED is not used by main.py's positioning vision (that one
+    # holds only the chassis ZED), so open it now while the robot is still
+    # driving instead of after ZED_READY.  A failure here only falls back to
+    # opening it at the usual time.
+    muzzle_box: Dict[str, Any] = {"claimed": False}
+    muzzle_thread = None
+    if (next_handoff_command is not None and args.web_port
+            and not (args.zed_uvc or args.opencv_camera)
+            and not args.no_muzzle_camera and not args.virtual_board):
+        def _open_muzzle_early():
+            try:
+                from .muzzle_camera import MuzzleZedCamera
+
+                muzzle_box["camera"] = MuzzleZedCamera(config.muzzle_zed_serial)
+                print("[Aim] 砲口 ZED 已在預熱階段開啟", flush=True)
+            except Exception as exc:
+                print(f"[Aim] 砲口 ZED 預熱開啟失敗，稍後再試：{exc}", flush=True)
+
+        def _release_unclaimed_muzzle():
+            muzzle_thread.join()
+            if not muzzle_box["claimed"] and "camera" in muzzle_box:
+                muzzle_box["camera"].release()
+
+        muzzle_thread = threading.Thread(target=_open_muzzle_early, name="muzzle-open", daemon=True)
+        muzzle_thread.start()
+        startup_cleanup.callback(_release_unclaimed_muzzle)
+
+    def take_early_muzzle_camera():
+        if muzzle_thread is None:
+            return None
+        muzzle_thread.join()
+        muzzle_box["claimed"] = True
+        return muzzle_box.get("camera")
+
     motors = None
     launcher = None
     previous_signals = None
@@ -971,7 +1009,8 @@ def _run_board_real(
             # The muzzle camera needs the ZED SDK; UVC/OpenCV runs (and tests
             # with a mocked camera) never touch it.
             if use_zed_sdk and not args.no_muzzle_camera and not args.virtual_board:
-                muzzle_camera, muzzle_preview = _start_muzzle_preview(config, dashboard, args)
+                muzzle_camera, muzzle_preview = _start_muzzle_preview(
+                    config, dashboard, args, camera=take_early_muzzle_camera())
     except BaseException:
         _stop_early_services()
         camera.release()
