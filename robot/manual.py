@@ -78,6 +78,10 @@ VESC_LOOP_INTERVAL = 0.10
 VESC_TELEMETRY_TIMEOUT = 0.5
 VESC_STARTUP_READ_ATTEMPTS = 5
 VESC_STARTUP_RETRY_DELAY = 0.4
+# 開啟時找不到 VESC 序列埠（USB 受干擾斷線、重新列舉中）最多等待的秒數。
+# 實測 EMI 斷線後約 19 秒才重新出現。
+VESC_PORT_WAIT_S = 25.0
+VESC_PORT_POLL_S = 0.5
 VESC_RUNTIME_READ_ATTEMPTS = 3
 VESC_RUNTIME_RETRY_DELAY = 0.1
 VESC_MAX_MOTOR_CURRENT_A = 50.0
@@ -488,6 +492,35 @@ class VESCDualMotorController:
                         failures[label] = exc
         return {label: exc for label, exc in failures.items() if label not in stopped}
 
+    def _open_port_waiting(self, port, label):
+        """Open a VESC port, waiting for it to (re)appear on USB.
+
+        EMI can make the hub drop a VESC ("disabled by hub (EMI?)"); it comes
+        back after a re-enumeration that took ~19 s on the robot.  Wait up to
+        VESC_PORT_WAIT_S instead of failing the whole run.  Returns None if
+        close() is requested meanwhile; raises once the wait is exhausted.
+        """
+        deadline = time.monotonic() + VESC_PORT_WAIT_S
+        reported = False
+        while True:
+            try:
+                ser = serial.Serial(port, VESC_BAUDRATE, timeout=0.05, write_timeout=0.5)
+                if reported:
+                    print("[VESC] {} 序列埠已重新出現並開啟。".format(label), flush=True)
+                return ser
+            except serial.SerialException as exc:
+                if time.monotonic() >= deadline:
+                    raise
+                if not reported:
+                    reported = True
+                    print(
+                        "[VESC] {} 序列埠暫時不存在（USB 可能受干擾重新連線），"
+                        "最多等待 {:.0f} 秒：{}".format(label, VESC_PORT_WAIT_S, exc),
+                        flush=True,
+                    )
+            if self._stop_event.wait(VESC_PORT_POLL_S):
+                return None
+
     def _apply_restart_interval(self, target_rpm):
         """停轉後未滿 VESC_MIN_RESTART_INTERVAL_S 前，起轉要求先維持停轉。"""
         if target_rpm is None:
@@ -551,12 +584,12 @@ class VESCDualMotorController:
                     VESC_LEFT_PORT, VESC_RIGHT_PORT
                 )
             )
-            self._ser_left = serial.Serial(
-                VESC_LEFT_PORT, VESC_BAUDRATE, timeout=0.05, write_timeout=0.5
-            )
-            self._ser_right = serial.Serial(
-                VESC_RIGHT_PORT, VESC_BAUDRATE, timeout=0.05, write_timeout=0.5
-            )
+            self._ser_left = self._open_port_waiting(VESC_LEFT_PORT, "LEFT")
+            if self._ser_left is None:
+                return  # close() requested while waiting
+            self._ser_right = self._open_port_waiting(VESC_RIGHT_PORT, "RIGHT")
+            if self._ser_right is None:
+                return
             time.sleep(0.5)
             self._ser_left.reset_input_buffer()
             self._ser_right.reset_input_buffer()
