@@ -42,7 +42,7 @@ class LidarAvoidance(threading.Thread):
         self.dropped_point_packets = 0  
         self.obstacle_rel_pos = None    
 
-        self.running = True
+        self._stop_requested = threading.Event()
         self.is_active = True           
         self.last_grid = None
 
@@ -58,12 +58,12 @@ class LidarAvoidance(threading.Thread):
     def _heartbeat_loop(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._heartbeat_sock = sock
-        while self.running:
+        while not self._stop_requested.is_set():
             try:
                 sock.sendto(HEARTBEAT_MSG, (LIDAR_IP, CMD_PORT))
             except OSError:
                 pass
-            time.sleep(HEARTBEAT_INTERVAL_S)
+            self._stop_requested.wait(HEARTBEAT_INTERVAL_S)
         sock.close()
 
     def run(self):
@@ -74,16 +74,16 @@ class LidarAvoidance(threading.Thread):
         t_imu.start()
         t_point.start()
 
-        while self.running:
-            time.sleep(0.1)
+        for worker in (t_heartbeat, t_imu, t_point):
+            worker.join()
 
     def _listen_imu(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind((HOST_IP, IMU_PORT))
-        sock.settimeout(1.0)
+        sock.settimeout(0.2)
 
-        while self.running:
+        while not self._stop_requested.is_set():
             try:
                 data, _ = sock.recvfrom(2048)
                 self.imu_packet_count += 1
@@ -105,9 +105,9 @@ class LidarAvoidance(threading.Thread):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind((HOST_IP, POINT_PORT))
-        sock.settimeout(1.0)
+        sock.settimeout(0.2)
 
-        while self.running:
+        while not self._stop_requested.is_set():
             if not self.is_active:
                 time.sleep(0.05)
                 continue
@@ -237,4 +237,9 @@ class LidarAvoidance(threading.Thread):
             self.obstacle_rel_pos = None
 
     def stop(self):
-        self.running = False
+        """Request shutdown. Join this thread to wait for all UDP sockets to close."""
+        self._stop_requested.set()
+        self.set_active(False)
+        with self.buffer_lock:
+            self.point_buffer.clear()
+            self.point_history.clear()
