@@ -255,6 +255,51 @@ def _all_holes_confirmed(plan, confirmed_holes):
             and set(confirmed_holes) == {f"H{n:02d}" for n in range(1, 13)})
 
 
+UNREACHABLE_SKIP_S = 3.0
+
+
+class UnreachableHoleSkipper:
+    """Match mode: give up on a hole that stays outside the turret's reach.
+
+    The per-target timeout is off in panel/match firing, so a hole the turret
+    cannot reach (e.g. H11 outside the high-elevation workspace after the
+    chassis stopped off-centre) used to stall the whole match.  Once the
+    current hole has been unreachable for ``hold_s`` -- with a stable pose and
+    an idle launcher -- every consecutive plan entry for that hole is skipped.
+    """
+
+    def __init__(self, hold_s=UNREACHABLE_SKIP_S, *, clock=time.monotonic):
+        self.hold_s = float(hold_s)
+        self._clock = clock
+        self._hole = None
+        self._since = None
+
+    def update(self, plan, status, pose_ready, launcher_idle):
+        """Return ``(hole_id, skipped_count)`` when a hole was skipped, else None."""
+        target = plan.current() if plan is not None else None
+        unreachable = bool(
+            target is not None and pose_ready and launcher_idle
+            and status is not None and status.target is not None
+            and status.target.hole_id == target.hole_id
+            and not status.command.target_reachable
+        )
+        if not unreachable:
+            self._hole = self._since = None
+            return None
+        now = self._clock()
+        if target.hole_id != self._hole:
+            self._hole, self._since = target.hole_id, now
+            return None
+        if now - self._since < self.hold_s:
+            return None
+        hole, count = self._hole, 0
+        while plan.current() is not None and plan.current().hole_id == hole:
+            plan.skip()
+            count += 1
+        self._hole = self._since = None
+        return hole, count
+
+
 def _auto_fire_ready(driver, launcher, plan, pose_ready, previous_status):
     """True when the previous tick already had a fire-allowed aim on this hole."""
     current = plan.current() if plan is not None else None
@@ -1224,6 +1269,8 @@ def _run_board_real(
     restore_completed = args.restore_completed_aim
     auto_fire = None
     previous_status = None
+    # Match firing never times a hole out, so skip holes the turret cannot reach.
+    unreachable_skipper = UnreachableHoleSkipper() if args.match_fire else None
     match = (MatchSequencer(
         args.match_phase, args.match_duration, args.balls_loaded,
         lambda new_plan: driver.set_plan(new_plan), light_wait_s=args.light_wait,
@@ -1698,6 +1745,17 @@ def _run_board_real(
                     hold_reason=match.hold_reason if match is not None else None)
             else:
                 status = driver.update()
+            if unreachable_skipper is not None and launcher is not None:
+                skipped = unreachable_skipper.update(
+                    driver.plan, status, pose_ready,
+                    not launcher.pending and not launcher.mechanism_busy)
+                if skipped is not None:
+                    hole, count = skipped
+                    upcoming = driver.plan.current() if driver.plan is not None else None
+                    reason = status.command.blocked_reason or "unreachable"
+                    print(f"{hole} 連續 {UNREACHABLE_SKIP_S:g} 秒打不到（{reason}）：跳過 {count} 發，"
+                          f"改射 {upcoming.hole_id if upcoming is not None else '（無剩餘孔位）'}。",
+                          flush=True)
             if launcher is not None:
                 # Where the time between "ball released" and "next push" goes.
                 released_at = launcher.last_released_at

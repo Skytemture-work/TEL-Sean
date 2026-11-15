@@ -168,7 +168,7 @@ def main_keep_enabled(argv=None, *, confirm=True, stop_event=None, ready_event=N
         <= pitch_deg
         <= MAX_MUZZLE_ELEVATION_DEG
     ):
-        raise SystemExit("垂直砲口仰角必須在 0° 到 35° 之間")
+        raise SystemExit(f"垂直砲口仰角必須在 0° 到 {MAX_MUZZLE_ELEVATION_DEG:g}° 之間")
 
     yaw_delta = math.radians(yaw_deg)
     pitch_calibration = load_pitch_calibration(args.startup_pose)

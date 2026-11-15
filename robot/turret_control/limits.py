@@ -22,8 +22,8 @@ DEFAULT_LIMITS_PATH = Path(__file__).with_name("mechanism_limits.json")
 YAW_DESIGN_LIMIT_DEG = 34.5
 PITCH_MIN_DEG = 0.0
 PITCH_ACTIVITY_TRANSITION_DEG = 30.0
-PITCH_MAX_DEG = 35.0
-TRIANGLE_BASE_YAW_DEG = 25.0
+PITCH_MAX_DEG = 38.0
+TRIANGLE_BASE_YAW_DEG = 28.0
 HOME_CORRIDOR_TRANSITION_DEG = 33.0
 
 
@@ -36,8 +36,8 @@ def max_activity_pitch_for_yaw_deg(
     """Return the maximum normal-activity pitch for a physical yaw angle.
 
     The normal workspace is rectangular through 30 degrees elevation.  From
-    30 to 35 degrees it narrows linearly from +/-25 degrees yaw to the
-    centered apex at 35 degrees.
+    30 to 38 degrees it narrows linearly from +/-28 degrees yaw to the
+    centered apex at 38 degrees (widened 2026-11-16; was +/-25 to 35).
     """
 
     yaw_abs = abs(float(yaw_deg))
@@ -53,14 +53,14 @@ def max_activity_pitch_for_yaw_deg(
 
 
 def constrain_pitch_activity_limit(bounds, calibration):
-    """Intersect recorded limits with the calibrated 0–35° activity range."""
+    """Intersect recorded limits with the calibrated 0–PITCH_MAX_DEG activity range."""
     design = sorted(
         calibration.motor_from_muzzle(math.radians(angle))
         for angle in (PITCH_MIN_DEG, PITCH_MAX_DEG)
     )
     lower, upper = max(bounds[0], design[0]), min(bounds[1], design[1])
     if lower >= upper:
-        raise ValueError("recorded pitch limits do not overlap the 0–35° activity range")
+        raise ValueError(f"recorded pitch limits do not overlap the 0–{PITCH_MAX_DEG:g}° activity range")
     return lower, upper
 
 

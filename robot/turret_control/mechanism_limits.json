@@ -45,8 +45,8 @@
     "activity_extension": {
       "type": "linear_yaw_pitch_triangle",
       "base_pitch_deg": 30.0,
-      "apex_pitch_deg": 35.0,
-      "base_yaw_half_width_deg": 25.0,
+      "apex_pitch_deg": 38.0,
+      "base_yaw_half_width_deg": 28.0,
       "apex_yaw_deg": 0.0
     },
     "closure_gap_motor_deg": 1.001539183305738,
@@ -123,15 +123,15 @@
         "pitch_rad": -0.30253370139290026
       },
       {
-        "yaw_rad": 1.5669864740014177,
+        "yaw_rad": 1.5146265964415877,
         "pitch_rad": -0.30253370139290026
       },
       {
         "yaw_rad": 2.003318787,
-        "pitch_rad": -0.38980016399261674
+        "pitch_rad": -0.4421600415524467
       },
       {
-        "yaw_rad": 2.4396510999985823,
+        "yaw_rad": 2.4920109775584125,
         "pitch_rad": -0.30253370139290026
       },
       {
@@ -3305,13 +3305,50 @@
       1.4215686027024383,
       2.588120818517029
     ],
-    "pitch_activity_limit_source": "operator-confirmed 0–30 degree rectangle, 30–35 degree triangle and 33-degree-to-recorded-home corridor, converted from measured level zero",
+    "pitch_activity_limit_source": "operator widened 2026-11-16: 0–30 degree rectangle, 30–38 degree triangle (+/-28 deg yaw at 30 deg to 0 at 38 deg); was +/-25 deg to 35 deg",
     "inactive_calibration_home_corridor": {
       "yaw_center_rad": 2.003318787,
       "yaw_tolerance_motor_deg": 0.25,
       "home_pitch_rad": -0.5579079985618591,
       "transition_pitch_rad": -0.35018184582392375,
       "reference_source": "recorded home motor position and retained transition; pitch angles relative to measured level"
+    },
+    "previous_activity_vertices_rad": [
+      {
+        "yaw_rad": 2.6054573789380435,
+        "pitch_rad": 0.22106507420539856
+      },
+      {
+        "yaw_rad": 1.4011801950619565,
+        "pitch_rad": 0.22106507420539856
+      },
+      {
+        "yaw_rad": 1.4011801950619565,
+        "pitch_rad": -0.30253370139290026
+      },
+      {
+        "yaw_rad": 1.5669864740014177,
+        "pitch_rad": -0.30253370139290026
+      },
+      {
+        "yaw_rad": 2.003318787,
+        "pitch_rad": -0.38980016399261674
+      },
+      {
+        "yaw_rad": 2.4396510999985823,
+        "pitch_rad": -0.30253370139290026
+      },
+      {
+        "yaw_rad": 2.6054573789380435,
+        "pitch_rad": -0.30253370139290026
+      }
+    ],
+    "previous_activity_extension": {
+      "type": "linear_yaw_pitch_triangle",
+      "base_pitch_deg": 30.0,
+      "apex_pitch_deg": 35.0,
+      "base_yaw_half_width_deg": 25.0,
+      "apex_yaw_deg": 0.0
     }
   },
   "calibration_translation_rad": 1.4862287048314209,

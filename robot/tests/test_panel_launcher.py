@@ -597,7 +597,7 @@ class PusherSpeedTests(unittest.TestCase):
         self.assertEqual(controller.home_speed_rpm, manual.HOME_SPEED_RPM)
         # Faster pusher defaults shared by manual and auto modes; magazine unchanged.
         self.assertEqual((manual.SHOOTING_SPEED_RPM, manual.SHOOTING_ACCELERATION,
-                          manual.HOME_SPEED_RPM, manual.ACCELERATION), (200, 200, 40, 2))
+                          manual.HOME_SPEED_RPM, manual.ACCELERATION), (200, 200, 40, 200))
         launcher = PanelLauncher(Mock(), controller_factory=Mock(return_value=controller))
         self.assertEqual(controller.shooting_speed_rpm, manual.SHOOTING_SPEED_RPM)
         launcher.close()

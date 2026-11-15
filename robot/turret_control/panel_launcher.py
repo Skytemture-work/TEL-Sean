@@ -11,6 +11,9 @@ FIRE_REQUEST_TTL_S = 1.0
 # target and the reading is fresh (the VESC thread polls at 10 Hz).
 FLYWHEEL_READY_FRACTION = 0.03
 FLYWHEEL_READING_MAX_AGE_S = 0.5
+# Reload stop: wheels count as stopped below this, within this time.
+FLYWHEEL_STOPPED_RPM = 30.0
+FLYWHEEL_STOP_TIMEOUT_S = 12.0
 
 
 class SharedAimMonitor:
@@ -107,12 +110,14 @@ class PanelLauncher:
         vesc = self.controller.vesc_controller
         stopped_at = time.monotonic()
         vesc.set_speed(None)
-        deadline = stopped_at + 5.0
+        # Soft stop: ramp (2.5 s) + gentle brake (<= 4 s), never a hard brake.
+        deadline = stopped_at + FLYWHEEL_STOP_TIMEOUT_S
         while time.monotonic() < deadline:
             self.check_health()
             rpm = self.flywheel_rpm()
             sample = vesc.last_rpm
-            if rpm == (0.0, 0.0) and sample is not None and sample[2] >= stopped_at:
+            if (rpm is not None and all(abs(value) <= FLYWHEEL_STOPPED_RPM for value in rpm)
+                    and sample is not None and sample[2] >= stopped_at):
                 break
             time.sleep(0.05)
         else:

@@ -106,7 +106,19 @@ VESC_SYNC_KP = 0.10
 
 # VESC command IDs / packet format
 VESC_COMM_GET_VALUES = 4
+VESC_COMM_SET_CURRENT = 6
+VESC_COMM_SET_CURRENT_BRAKE = 7
 VESC_COMM_SET_RPM = 8
+# 軟停止：急煞（SET_RPM 0，約 1 秒從 4000 RPM 煞到 0）的回灌電流造成 EMI，
+# 會讓 USB hub 關掉 VESC 的埠（"disabled by hub (EMI?)"）。改為：
+#   1. 2.5 秒內把目標轉速線性降到 VESC_STOP_BRAKE_RPM；
+#   2. 以小電流 VESC_STOP_BRAKE_CURRENT_A 煞到 VESC_STOPPED_RPM 以下（最多 4 秒）；
+#   3. SET_CURRENT 0 放開馬達（不再主動煞車，也不會反轉）。
+VESC_STOP_RAMP_S = 2.5
+VESC_STOP_BRAKE_RPM = 800.0
+VESC_STOP_BRAKE_CURRENT_A = 2.0
+VESC_STOP_BRAKE_MAX_S = 4.0
+VESC_STOPPED_RPM = 30.0
 VESC_PACKET_SHORT = 2
 VESC_PACKET_LONG = 3
 VESC_PACKET_END = 3
@@ -122,7 +134,9 @@ SHOOTING_SPEED_RPM = 200      # 推球 ID1（手動與自動共用）；原 100
 # MKS 加速度 0～255，數值越大加速越快：每 (256-acc)*50us 加 1 RPM。
 # 原 2 → 0～100 RPM 約 1.27 s；200 → 0～200 RPM 約 0.56 s。
 SHOOTING_ACCELERATION = 200   # 推球 ID1（手動與自動共用）
-ACCELERATION = 2              # 彈藥倉 ID2 轉格維持原設定
+# 彈藥倉 ID2 轉格加速度（MKS 0-255，越大加速越快）。原為 2，轉一格約 4 秒；
+# 2026-11-16 調為與推球 ID1 相同的 200。若轉格卡球或甩球再調小。
+ACCELERATION = 200
 
 HOME_DIRECTION = Direction.CW
 MOVE_DIRECTION = (
@@ -137,6 +151,11 @@ HOME_CURRENT_MA = 400
 REVERSE_ANGLE = 0x0400
 
 TARGET_POSITIONS = (1700, 3000)
+# 第 1、2 顆推出後，ID1 先往回退「該顆推球行程 × 此比例」，下一顆再從退回的
+# 位置推到原本的目標位置（1700 → 退到 1275 → 推到 3000 → 退到 2675 → 推到底）。
+# 目的：推完不要一直頂著彈藥倉裡剩下的球，減少擠壓變形（待實測驗證）。
+# 0 = 關閉，恢復原本連續往前推的行為。
+PUSH_RETRACT_FRACTION = 0.25
 SLOTS_PER_MAGAZINE = 6
 
 MOVE_TIMEOUT = 30.0
@@ -145,6 +164,7 @@ POLL_INTERVAL = 0.1
 # MKS 讀 Encoder 偶爾沒有回覆（函式庫等 1 秒後回傳 None）；重試幾次再判定失敗。
 ENCODER_READ_ATTEMPTS = 3
 ENCODER_READ_RETRY_DELAY = 0.05
+ENCODER_READ_TIMEOUT_S = 0.3   # 單次 Encoder 讀取等待（正常回覆約 2 ms）
 SETTLE_TIME = 0.2
 # 回零後與轉格前的位置穩定容許值；單位為編碼器 counts，不是命令 pulses。
 SHOOT_HOME_TOLERANCE_COUNTS = 20
@@ -200,6 +220,27 @@ def vesc_send_command(ser, command, data=b""):
 
 def vesc_send_set_rpm(ser, erpm):
     vesc_send_command(ser, VESC_COMM_SET_RPM, struct.pack(">i", int(erpm)))
+
+
+def vesc_send_set_current(ser, amps):
+    vesc_send_command(ser, VESC_COMM_SET_CURRENT, struct.pack(">i", int(round(amps * 1000))))
+
+
+def vesc_send_set_current_brake(ser, amps):
+    vesc_send_command(ser, VESC_COMM_SET_CURRENT_BRAKE, struct.pack(">i", int(round(amps * 1000))))
+
+
+def vesc_send(ser, command):
+    """Send one ("rpm", erpm) / ("brake", amps) / ("release", 0) command."""
+    kind, value = command
+    if kind == "rpm":
+        vesc_send_set_rpm(ser, value)
+    elif kind == "brake":
+        vesc_send_set_current_brake(ser, value)
+    elif kind == "release":
+        vesc_send_set_current(ser, 0.0)
+    else:
+        raise ValueError("unknown VESC command {!r}".format(kind))
 
 
 class VESCReader:
@@ -346,6 +387,12 @@ class VESCDualMotorController:
         self.last_rpm = None
         # 最近一次送出的 ERPM 命令；遙測偶發逾時時重送以維持現況。
         self._last_erpm = {"LEFT": 0, "RIGHT": 0}
+        # 最近一次送出的完整命令（含軟停止的煞車／放開），重送時沿用。
+        self._last_cmd = {"LEFT": ("release", 0), "RIGHT": ("release", 0)}
+        # 軟停止狀態：None = 沒在停止；否則 dict(phase, started_at, start_rpm, ...)。
+        self._soft_stop = None
+        # 已完成軟停止並放開馬達（close() 等待這個再結束執行緒）。
+        self._released_event = threading.Event()
         # 本控制器目前是否正在命令飛輪轉動（用於記錄停轉時間）。
         self._spinning = False
         self._restart_hold_reported = False
@@ -486,7 +533,9 @@ class VESCDualMotorController:
             for label, ser in (("LEFT", self._ser_left), ("RIGHT", self._ser_right)):
                 if ser is not None and ser.is_open:
                     try:
-                        vesc_send_set_rpm(ser, 0)
+                        # Release (coast), never SET_RPM 0: a hard brake from
+                        # speed makes the EMI that drops the VESC off USB.
+                        vesc_send(ser, ("release", 0))
                         stopped.add(label)
                     except Exception as exc:
                         failures[label] = exc
@@ -549,9 +598,67 @@ class VESCDualMotorController:
         for label, ser in (("LEFT", self._ser_left), ("RIGHT", self._ser_right)):
             if ser is not None and ser.is_open:
                 try:
-                    vesc_send_set_rpm(ser, self._last_erpm.get(label, 0))
+                    vesc_send(ser, self._last_cmd.get(label, ("release", 0)))
                 except Exception:
                     pass
+
+    def _soft_stop_commands(self, rpm_left, rpm_right, now):
+        """Per-wheel commands while the target is STOP (see VESC_STOP_*)."""
+        measured = (rpm_left, rpm_right)
+        state = self._soft_stop
+        if state is None:
+            start = max(abs(rpm_left), abs(rpm_right))
+            state = self._soft_stop = {
+                "phase": "ramp" if start > VESC_STOP_BRAKE_RPM else (
+                    "brake" if start > VESC_STOPPED_RPM else "release"),
+                "started_at": now,
+                "start": (abs(rpm_left), abs(rpm_right)),
+                "sign": tuple(1.0 if r >= 0 else -1.0 for r in measured),
+                "brake_at": now,
+            }
+            if state["phase"] != "release":
+                print("[VESC] 軟停止：{:.0f} RPM 起 {:.1f} 秒內減速，低速再輕煞後放開。".format(
+                    start, VESC_STOP_RAMP_S), flush=True)
+        if state["phase"] == "ramp":
+            fraction = max(0.0, 1.0 - (now - state["started_at"]) / VESC_STOP_RAMP_S)
+            goals = [max(VESC_STOP_BRAKE_RPM, s * fraction) if s > VESC_STOP_BRAKE_RPM else s
+                     for s in state["start"]]
+            if fraction <= 0.0:
+                state["phase"], state["brake_at"] = "brake", now
+            else:
+                return [("rpm", int(sign * goal * pp)) for sign, goal, pp in zip(
+                    state["sign"], goals, (VESC_LEFT_POLE_PAIRS, VESC_RIGHT_POLE_PAIRS))]
+        if state["phase"] == "brake":
+            done = all(abs(r) <= VESC_STOPPED_RPM for r in measured)
+            if done or now - state["brake_at"] >= VESC_STOP_BRAKE_MAX_S:
+                state["phase"] = "release"
+            else:
+                return [("brake", VESC_STOP_BRAKE_CURRENT_A) if abs(r) > VESC_STOPPED_RPM
+                        else ("release", 0) for r in measured]
+        self._released_event.set()
+        return [("release", 0), ("release", 0)]
+
+    def _write_cmd(self, label, ser, command):
+        for attempt in range(1, VESC_RUNTIME_READ_ATTEMPTS + 1):
+            try:
+                vesc_send(ser, command)
+                break
+            except serial.SerialTimeoutException as exc:
+                if attempt < VESC_RUNTIME_READ_ATTEMPTS and not self._stop_event.is_set():
+                    print("[VESC] {} 命令寫入逾時，重試 {}/{}".format(
+                        label, attempt, VESC_RUNTIME_READ_ATTEMPTS - 1), flush=True)
+                    time.sleep(VESC_RUNTIME_RETRY_DELAY)
+                    continue
+                raise RuntimeError(
+                    "{} VESC {} 命令連續寫入逾時：{}".format(label, ser.port, exc)
+                ) from exc
+            except Exception as exc:
+                raise RuntimeError(
+                    "{} VESC {} 命令寫入失敗：{}".format(label, ser.port, exc)
+                ) from exc
+        self._last_cmd[label] = command
+        if command[0] == "rpm":
+            self._last_erpm[label] = int(command[1])
 
     def _write_rpm(self, label, ser, erpm):
         for attempt in range(1, VESC_RUNTIME_READ_ATTEMPTS + 1):
@@ -609,8 +716,10 @@ class VESCDualMotorController:
             )
             # Confirm both command paths can accept a safe stop before
             # declaring the VESC subsystem initialized to the main loop.
-            self._write_rpm("LEFT", self._ser_left, 0)
-            self._write_rpm("RIGHT", self._ser_right, 0)
+            # Release (not SET_RPM 0): a restart while the wheels still spin
+            # must not brake them hard.
+            self._write_cmd("LEFT", self._ser_left, ("release", 0))
+            self._write_cmd("RIGHT", self._ser_right, ("release", 0))
             self._ready_event.set()
 
             while not self._stop_event.is_set():
@@ -638,11 +747,17 @@ class VESCDualMotorController:
                 target_rpm = self._apply_restart_interval(target_rpm)
 
                 if target_rpm is None:
-                    # 自動模式或關閉時清除積分並命令兩顆馬達停轉。
+                    # 自動模式或關閉時清除積分並軟停止（減速→輕煞→放開）。
                     pi_left_integral = 0.0
                     pi_right_integral = 0.0
-                    target_left = target_right = 0
+                    cmd_left, cmd_right = self._soft_stop_commands(
+                        left["erpm"] / VESC_LEFT_POLE_PAIRS,
+                        right["erpm"] / VESC_RIGHT_POLE_PAIRS,
+                        time.monotonic(),
+                    )
                 else:
+                    self._soft_stop = None
+                    self._released_event.clear()
                     rpm_left = left["erpm"] / VESC_LEFT_POLE_PAIRS
                     rpm_right = right["erpm"] / VESC_RIGHT_POLE_PAIRS
                     goal_left, goal_right = flywheel_wheel_targets(target_rpm)
@@ -670,8 +785,12 @@ class VESCDualMotorController:
                     target_left = int(base_left + trim_left - sync)
                     target_right = int(base_right + trim_right + sync)
 
-                self._write_rpm("LEFT", self._ser_left, target_left)
-                self._write_rpm("RIGHT", self._ser_right, target_right)
+                if target_rpm is not None:
+                    cmd_left, cmd_right = ("rpm", target_left), ("rpm", target_right)
+                self._write_cmd("LEFT", self._ser_left, cmd_left)
+                self._write_cmd("RIGHT", self._ser_right, cmd_right)
+                target_left = cmd_left[1] if cmd_left[0] == "rpm" else cmd_left[0]
+                target_right = cmd_right[1] if cmd_right[0] == "rpm" else cmd_right[0]
                 print(
                     "[VESC] VRB={} -> target={} RPM | "
                     "L cmd={} ERPM actual={} ERPM ({:.1f} RPM) | "
@@ -710,6 +829,12 @@ class VESCDualMotorController:
 
     def close(self, timeout=3.0):
         self.set_speed(None)
+        # Let the soft stop (ramp, gentle brake, release) finish first.
+        thread = self._thread
+        if thread is not None and thread.is_alive() and self.error is None:
+            limit = VESC_STOP_RAMP_S + VESC_STOP_BRAKE_MAX_S + 1.5
+            if not self._released_event.wait(limit):
+                print("[VESC] 軟停止 {:.0f} 秒內未完成，直接放開馬達。".format(limit), flush=True)
         self._stop_event.set()
         if self._thread is not None:
             self._thread.join(timeout=timeout)
@@ -1540,6 +1665,7 @@ class ManualController:
             stage = self.shot_stage
             with self.lock:
                 request_seq = self.shot_request_seq
+            self._active_request_seq = request_seq
             print("[Manual] FIRE：執行第 {}/3 階段，彈藥格位 {}。".format(
                 stage + 1, self.current_slot
             ), flush=True)
@@ -1588,14 +1714,13 @@ class ManualController:
             if self.current_mode != "M":
                 raise RuntimeError("回零期間已離開手動模式，停止推球並禁止轉格")
             print("[Manual] 推球前回零確認完成，開始第 1 階段。", flush=True)
-            self._move_relative(
-                self.shoot_servo, TARGET_POSITIONS[0], MOVE_DIRECTION, self.shooting_speed_rpm
-            )
+            self._push_position = 0
+            self._push_to(TARGET_POSITIONS[0])
+            self._retract_after_push(TARGET_POSITIONS[0])
         elif self.shot_stage == 1:
-            self._move_relative(
-                self.shoot_servo, TARGET_POSITIONS[1] - TARGET_POSITIONS[0],
-                MOVE_DIRECTION, self.shooting_speed_rpm
-            )
+            stroke = TARGET_POSITIONS[1] - TARGET_POSITIONS[0]
+            self._push_to(TARGET_POSITIONS[1])
+            self._retract_after_push(stroke)
         elif self.shot_stage == 2:
             if not self.reload_pending:
                 self._shoot_home_encoder = None
@@ -1612,39 +1737,89 @@ class ManualController:
         else:
             raise RuntimeError("未知射擊階段：{}".format(self.shot_stage))
 
-    @staticmethod
-    def _read_encoder_once(servo):
-        """Send one 0x31 read and accept only a genuine 0x31 reply.
+    def _push_to(self, target):
+        """Push ID1 forward from the tracked position to ``target`` pulses."""
+        start = getattr(self, "_push_position", None)
+        if start is None:
+            # Position unknown (should not happen): fall back to the original
+            # stage-to-stage stroke.
+            start = TARGET_POSITIONS[0] if target == TARGET_POSITIONS[1] else 0
+        self._move_relative(self.shoot_servo, target - start, MOVE_DIRECTION, self.shooting_speed_rpm)
+        self._push_position = target
 
-        mks_servo_can accepts ANY frame from the motor's CAN ID as the reply,
-        e.g. an asynchronous 0xFD "move finished" notice (fd 02 00), and then
-        decodes garbage.  Returns (value, stray_frame).
+    def _retract_after_push(self, stroke):
+        """Back ID1 off a fraction of the stroke just pushed (see PUSH_RETRACT_FRACTION).
+
+        The ball is already out, so the shot is marked released first: the
+        turret may turn to the next hole while ID1 backs off.  The next FIRE
+        still waits for this stage (controller busy) to finish.
         """
-        op = MksCommands.READ_ENCODED_VALUE_ADDITION
-        data = servo.set_generic(op, 8, [op.value])
+        retract = int(round(stroke * PUSH_RETRACT_FRACTION))
+        if retract <= 0:
+            return
+        self._mark_shot_released()
+        print("[Manual] 推球後先退回 {} pulses（{:.0%} 行程），減少擠壓。".format(
+            retract, PUSH_RETRACT_FRACTION), flush=True)
+        self._move_relative(self.shoot_servo, retract, HOME_DIRECTION, self.shooting_speed_rpm)
+        self._push_position -= retract
+
+    def _mark_shot_released(self):
+        seq = getattr(self, "_active_request_seq", None)
+        if isinstance(seq, int):
+            with self.lock:
+                self.shot_released_seq = max(self.shot_released_seq, seq)
+
+    @staticmethod
+    def _read_encoder_once(servo, op_value=0x31):
+        """Send one encoder read and accept only a genuine reply to it.
+
+        0x31 returns the addition value directly; 0x30 returns (carry,
+        value) which is the same position: carry * 0x4000 + value.  On the
+        robot ID2 drops ~50 % of 0x31 requests but answers 0x30 far more
+        reliably, so both are used.  mks_servo_can accepts ANY frame from the
+        motor's CAN ID as the reply (e.g. an asynchronous 0xFD "move finished"
+        notice), so the opcode and length are checked here.  Returns
+        (value, stray_frame).
+        """
+        data = None
+        timeout = getattr(servo, "timeout", None)
+        try:
+            if isinstance(timeout, (int, float)):
+                servo.timeout = ENCODER_READ_TIMEOUT_S  # replies take ~2 ms
+            data = servo.set_generic(op_value, 8, [op_value])
+        finally:
+            if isinstance(timeout, (int, float)):
+                servo.timeout = timeout
         if not isinstance(data, (bytes, bytearray)):
             # Not a real MKS servo (test double): use the library call.
             return servo.read_encoder_value_addition(), None
         if not data:
             return None, None
-        if len(data) != 8 or data[0] != op.value:
+        if len(data) != 8 or data[0] != op_value:
             return None, bytes(data)
+        if op_value == 0x30:
+            carry = int.from_bytes(data[1:5], byteorder="big", signed=True)
+            value = int.from_bytes(data[5:7], byteorder="big")
+            return carry * 0x4000 + value, None
         return int.from_bytes(data[1:7], byteorder="big", signed=True), None
 
     def _read_encoder(self, servo, attempts=ENCODER_READ_ATTEMPTS):
-        """讀取 MKS Encoder；漏回或收到非 Encoder 回覆時重試，全部失敗才回傳 None。"""
+        """讀取 MKS Encoder：每輪先用 0x30、沒回應再用 0x31；全部失敗才回傳 None。"""
         can_id = getattr(servo, "can_id", "?")
         for attempt in range(1, attempts + 1):
-            value, stray = self._read_encoder_once(servo)
-            if value is not None:
-                if attempt > 1:
-                    print("[Manual] CAN ID{} Encoder 第 {} 次讀取成功。".format(can_id, attempt), flush=True)
-                return value
+            reasons = []
+            for op_value in (0x30, 0x31):
+                value, stray = self._read_encoder_once(servo, op_value)
+                if value is not None:
+                    if attempt > 1 or reasons:
+                        print("[Manual] CAN ID{} Encoder 改用 0x{:02X} 讀取成功（第 {} 輪）。".format(
+                            can_id, op_value, attempt), flush=True)
+                    return value
+                reasons.append("0x{:02X} {}".format(
+                    op_value, "收到非 Encoder 回覆 " + stray.hex() if stray is not None else "沒有回覆"))
             if attempt < attempts:
-                reason = ("收到非 Encoder 回覆 {}".format(stray.hex()) if stray is not None
-                          else "沒有回覆")
                 print("[Manual] CAN ID{} Encoder {}，重試 {}/{}".format(
-                    can_id, reason, attempt, attempts - 1), flush=True)
+                    can_id, "、".join(reasons), attempt, attempts - 1), flush=True)
                 time.sleep(ENCODER_READ_RETRY_DELAY)
         return None
 
@@ -1840,9 +2015,19 @@ class ManualController:
             ),
             flush=True,
         )
-        before = self._read_encoder(self.ammo_servo)
+        # ID2 encoder replies are unreliable and only informational: one quick
+        # try (<= 2 x 0.3 s), then judge the rotation from the run status.
+        before = self._read_encoder(self.ammo_servo, attempts=1)
         if before is None:
-            raise RuntimeError("彈藥倉移動前 Encoder 讀取失敗")
+            # The ID2 encoder replies come and go while its status replies stay
+            # reliable.  Rotation completion is already judged from the run
+            # status when the encoder is invalid, so only require ID2 to answer
+            # a status query before moving.
+            status = self._query_status(self.ammo_servo)
+            if status is None or status == MotorStatus.Fail:
+                raise RuntimeError("彈藥倉移動前 Encoder 與狀態都讀取失敗")
+            print("[Manual] 彈藥倉 Encoder 暫時讀不到，但狀態回應正常（{}）；"
+                  "以運轉狀態確認轉格。".format(status), flush=True)
 
         self._verify_shooter_home_before_reload()
         # 此次確認只能用於一筆轉格指令，失敗或完成後都不能重複使用。
@@ -1874,7 +2059,7 @@ class ManualController:
                 raise TimeoutError("彈藥倉轉格逾時")
 
             running = self.ammo_servo.is_motor_running()
-            now_encoder = self.ammo_servo.read_encoder_value_addition()
+            now_encoder = self._read_encoder_once(self.ammo_servo, 0x30)[0]  # 0.3 s max
             if (
                 before not in (None, -1)
                 and now_encoder not in (None, -1)
@@ -1895,7 +2080,7 @@ class ManualController:
 
             time.sleep(POLL_INTERVAL)
 
-        after = self.ammo_servo.read_encoder_value_addition()
+        after = self._read_encoder_once(self.ammo_servo, 0x30)[0]
         if before in (None, -1) or after in (None, -1):
             print(
                 "[Manual] 彈藥倉 Encoder 回授無效；以馬達運轉狀態確認動作停止。"
