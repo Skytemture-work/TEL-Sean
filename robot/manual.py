@@ -170,8 +170,11 @@ PUSH_END_POSITION_PULSES = 5350
 # 2026-11-16 19:25 實車：快推 2006 pulses 只走了約 1744 就被擋住（堵轉保護），
 # 之後回零 30 s 無回覆而停機；全程 40 RPM 當天 7 次都成功，所以先關閉。
 PUSH_FAST_OUT_FRACTION = 0.0
-# 推到底後回原點：前段用 200 RPM 快退的比例（無負載），最後一段 40 RPM 無限位回零。
+# 推到底後回原點：前段快退的比例（無負載），最後一段 40 RPM 無限位回零。
 PUSH_FAST_BACK_FRACTION = 0.75
+# 快退速度。原本與推球共用 200 RPM：2026-11-16 19:44 走到一半被擋（堵轉保護），
+# 23:11 送出後 30 s 都沒回報停止，兩次都停機；先降到 100 RPM。
+PUSH_FAST_BACK_SPEED_RPM = 100
 SLOTS_PER_MAGAZINE = 6
 
 MOVE_TIMEOUT = 30.0
@@ -1793,9 +1796,9 @@ class ManualController:
                 fast_back = int(PUSH_END_POSITION_PULSES * PUSH_FAST_BACK_FRACTION)
                 if fast_back > 0:
                     print("[Manual] 快退 {} pulses（{} RPM），再慢速回原點。".format(
-                        fast_back, self.shooting_speed_rpm), flush=True)
+                        fast_back, PUSH_FAST_BACK_SPEED_RPM), flush=True)
                     self._move_relative(self.shoot_servo, fast_back, HOME_DIRECTION,
-                                        self.shooting_speed_rpm)
+                                        PUSH_FAST_BACK_SPEED_RPM)
                 self._shoot_home_encoder = self._go_home(
                     self.shoot_servo, HOME_DIRECTION, "正向無限位回零"
                 )

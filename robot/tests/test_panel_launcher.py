@@ -629,12 +629,13 @@ class PusherSpeedTests(unittest.TestCase):
         fast_out = manual.PUSH_FAST_OUT_FRACTION
         fast_back = manual.PUSH_FAST_BACK_FRACTION
         self.assertEqual(fast_out, 0.0)  # 200 RPM push-out stalled on the robot
+        self.assertEqual(manual.PUSH_FAST_BACK_SPEED_RPM, 100)  # 200 RPM return stalled too
         # Slow current-sensed push to the end; fast back most of the way, slow
         # current-sensed home.
         self.assertEqual(calls, [
             ('home', manual.MOVE_DIRECTION, manual.PUSH_END_SPEED_RPM),
             ('move', manual.HOME_DIRECTION, int(manual.PUSH_END_POSITION_PULSES * fast_back),
-             controller.shooting_speed_rpm),
+             manual.PUSH_FAST_BACK_SPEED_RPM),
             ('home', manual.HOME_DIRECTION, None),
         ])
         self.assertEqual(manual.PUSH_END_SPEED_RPM, 40)
