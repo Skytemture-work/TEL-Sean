@@ -259,6 +259,8 @@ def _all_holes_confirmed(plan, confirmed_holes):
 
 
 UNREACHABLE_SKIP_S = 3.0
+# E-stop during a reload: how often to retry the DM until the 24 V is back.
+POWER_RETRY_S = 3.0
 
 
 class UnreachableHoleSkipper:
@@ -533,6 +535,7 @@ def main(
     reload_event: Optional[threading.Event] = None,
     next_handoff_command: Optional[Callable[[Optional[float]], Optional[str]]] = None,
     positioning_callback: Optional[Callable[[float, int], None]] = None,
+    event_callback: Optional[Callable[[str], None]] = None,
 ) -> None:
     """Run the real board pipeline with cleanup for early motor handoff."""
     with ExitStack() as startup_cleanup:
@@ -540,13 +543,13 @@ def main(
             argv, fire_callback=fire_callback, telemetry_callback=telemetry_callback,
             stop_event=stop_event, reload_event=reload_event,
             next_handoff_command=next_handoff_command, positioning_callback=positioning_callback,
-            startup_cleanup=startup_cleanup,
+            event_callback=event_callback, startup_cleanup=startup_cleanup,
         )
 
 
 def _run_board_real(
     argv, *, fire_callback, telemetry_callback, stop_event, reload_event,
-    next_handoff_command, positioning_callback, startup_cleanup,
+    next_handoff_command, positioning_callback, startup_cleanup, event_callback=None,
 ):
     """Run the real board pipeline.
 
@@ -1419,13 +1422,153 @@ def _run_board_real(
             + (f"；預熱失敗：{model_box['warmup_error']}" if "warmup_error" in model_box else "。"),
             flush=True,
         )
+        # Emergency stop during a reload (required by the referees): the motor
+        # 24 V drops, the DM worker trips and ends, the MKS drivers reboot.
+        # Keep the match state, wait for the operator's reload confirmation,
+        # then rebuild the DM control, re-enable the MKS and carry on.
+        forced_reload_confirm = False
+
+        def _replace_dm_after_power_loss():
+            nonlocal motors
+            try:
+                motors.close()
+            except Exception as exc:
+                print(f"[E-STOP] 關閉斷電前的雙軸控制：{exc}", flush=True)
+            new_motors = create_motors()
+            new_motors.enable()  # closes itself if the motors do not answer
+            motors = new_motors
+            turret.motors = new_motors
+            monitor = getattr(launcher.controller, "dm_controller", None)
+            if monitor is not None and hasattr(monitor, "motors"):
+                monitor.motors = new_motors
+
+        def _wait_out_power_loss(cause):
+            """Recover by itself once the 24 V is back; depart on the reload confirmation.
+
+            While the team pulls the robot back and refills it, keep trying the
+            DM (every POWER_RETRY_S).  As soon as it answers the power is back:
+            re-enable the DM (turret held, no sagging), set the MKS up again and
+            reconnect the VESC with the wheels released.  The magazine and the
+            flywheels still wait for the reload confirmation (hands are near the
+            launcher), which is also the departure.  Returns True to continue,
+            False on stop.
+            """
+            print(f"[E-STOP] 裝填中馬達斷電（{cause}）：保留比賽進度。復電後會自動準備機構；"
+                  "裝好球後按遙控器 RELOAD（或儀表板「裝填完成」）即出發。", flush=True)
+            next_note = time.monotonic() + 5.0
+            next_try = time.monotonic()
+            dm_back = mks_back = vesc_back = False
+            confirmed = False
+            while True:
+                if stop_event is not None and stop_event.is_set():
+                    return False
+                now_s = time.monotonic()
+                ready = dm_back and mks_back and vesc_back
+                if dashboard is not None:
+                    # Keep the dashboard's reload button accepted (3 s freshness).
+                    snapshot = dashboard.telemetry_snapshot()
+                    snapshot["generated_at_ms"] = int(time.time() * 1000)
+                    snapshot["match"] = match.telemetry(now_s)
+                    snapshot["power_lost"] = ("已復電，機構就緒，裝填完成後按 RELOAD 出發" if ready
+                                              else "裝填中斷電，等待復電")
+                    dashboard.update_telemetry(snapshot)
+                # A press before the mechanism is ready is kept, not lost.
+                confirmed = confirmed or bool(
+                    (dashboard is not None and dashboard.take_reload_done())
+                    | _take_external_reload(reload_event, True))
+                if not ready and now_s >= next_try:
+                    next_try = now_s + POWER_RETRY_S
+                    try:
+                        if not dm_back:
+                            _replace_dm_after_power_loss()
+                            dm_back = True
+                            print("[E-STOP] 偵測到復電：DM 已重新使能（砲口鎖住）。", flush=True)
+                        if not mks_back:
+                            launcher.controller.reconfigure_mks_after_power_loss()
+                            mks_back = True
+                        if not vesc_back:
+                            launcher.reconnect_flywheels_stopped()
+                            vesc_back = True
+                        print("[E-STOP] 機構已就緒（DM、MKS、VESC），飛輪不轉、彈藥倉不動；"
+                              "裝填完成後按 RELOAD 出發。", flush=True)
+                    except Exception as exc:
+                        if dm_back:  # power is back, a later step failed: say why
+                            print(f"[E-STOP] 復電後準備未完成（{exc}），{POWER_RETRY_S:g} 秒後重試。",
+                                  flush=True)
+                    continue
+                if confirmed and ready:
+                    _begin_reposition()  # the reload confirmation is the departure
+                    print("[E-STOP] 已收到裝填完成：出發；彈藥倉轉格（ID1 先回原點）與飛輪起轉"
+                          "同時進行。", flush=True)
+                    return True
+                if now_s >= next_note:
+                    next_note = now_s + 5.0
+                    print("[E-STOP] " + ("機構就緒，等待 RELOAD…" if ready
+                                         else "等待復電…" + ("（已收到 RELOAD，復電後立即出發）"
+                                                             if confirmed else "")), flush=True)
+                time.sleep(0.1)
+
+        def _power_loss_during_reload(exc):
+            """Handle a launcher/DM failure: True = recovered, False = stop; re-raise otherwise."""
+            if match is None or not match.reload_wait or launcher is None:
+                raise exc
+            return _wait_out_power_loss(exc)
+
+        # Reload = robot pulled back to the start zone by hand.  The reload
+        # confirmation is the new departure: main.py drives the positioning
+        # again (vy from here), the magazine turns and the flywheels spin up
+        # meanwhile, and shooting resumes once main.py reports POSITIONED.
+        repositioning = False
+        reposition_vision = False
+        reload_was_waiting = False
+        board_center_m = np.array([[BOARD_WIDTH_CM / 200.0, BOARD_HEIGHT_CM / 200.0, 0.0]])
+
+        def _begin_reposition():
+            """Reload confirmed = departure from the start zone (once)."""
+            nonlocal repositioning, reposition_vision, pose_tracker
+            if repositioning or event_callback is None:
+                return
+            repositioning = True
+            reposition_vision = True
+            if pose_lock is not None:
+                pose_lock.release("裝填：車已移回出發區")
+            pose_tracker = BoardPoseTracker(config)
+            event_callback("REPOSITION")
+            print("[Aim] 裝填完成：通知底盤重新出發定位；砲口邊走邊瞄準下一孔，"
+                  "彈藥倉轉格與飛輪起轉同時進行，到定點前不發射。", flush=True)
+
+        def _drain_reposition_commands():
+            nonlocal repositioning, reposition_vision
+            while next_handoff_command is not None:
+                command = next_handoff_command(0)
+                if not command:
+                    return
+                if command == "VISION_ON":
+                    reposition_vision = True
+                elif command == "VISION_OFF":
+                    reposition_vision = False
+                elif command == "POSITIONED" and repositioning:
+                    repositioning = False
+                    reposition_vision = False
+                    if pose_lock is not None:
+                        pose_lock.release("裝填後重新定位完成")
+                    print("[Aim] 重新定位完成：重新取得靶面姿態後繼續射擊。", flush=True)
+
         frame_seq = 0
         while True:
             if stop_event is not None and stop_event.is_set():
                 print("收到停止要求：結束自動瞄準，停止發射器並回 home。", flush=True)
                 break
+            if repositioning:
+                _drain_reposition_commands()
             if launcher is not None:
-                launcher.check_health()
+                try:
+                    launcher.check_health()
+                except RuntimeError as exc:
+                    if not _power_loss_during_reload(exc):
+                        break
+                    forced_reload_confirm = True
+                    continue
             loop_started_at = time.perf_counter()
             capture_started_at = loop_started_at
             if grabber is not None:
@@ -1572,6 +1715,19 @@ def _run_board_real(
                           + (pose_lock.release_reason or "已恢復即時 PnP。"), flush=True)
                     pose_locked_previous = pose_locked
 
+            if (repositioning and reposition_vision and positioning_callback is not None
+                    and pose_ready and pose is not None and pose.source == "pnp"):
+                # Same strafe signal as the pre-START positioning loop.
+                import config as drive_config
+
+                projected, _ = cv2.projectPoints(
+                    board_center_m, pose.rvec, pose.tvec,
+                    camera_matrix(config), distortion_coefficients(config))
+                error_px = float(projected[0, 0, 0] - config.camera_center_x_px)
+                if math.isfinite(error_px):
+                    positioning_callback(
+                        now, drive_config.AUTO_STRAFE_SIGN * int(np.clip(error_px / 4, -15, 15)))
+
             # An operator confirmation belongs to the exact stable pose in
             # which it was given.  Never keep it latched across robot motion or
             # a lost visual pose and fire later without a fresh confirmation.
@@ -1661,8 +1817,13 @@ def _run_board_real(
                     mechanism_busy=bool(launcher is not None and launcher.mechanism_busy),
                     reload_confirmed=(
                         bool(dashboard is not None and dashboard.take_reload_done())
-                        | _take_external_reload(reload_event, match.reload_wait)),
+                        | _take_external_reload(reload_event, match.reload_wait)
+                        | forced_reload_confirm),
                 )
+                forced_reload_confirm = False
+                if reload_was_waiting and not match.reload_wait and match.stopped is None:
+                    _begin_reposition()  # no-op if the e-stop recovery already did it
+                reload_was_waiting = match.reload_wait
                 plan = match.plan if match.plan is not None else plan
                 if match.bonus_hole_id is not None:
                     last_bonus_hole_id = match.bonus_hole_id
@@ -1770,14 +1931,27 @@ def _run_board_real(
                     muzzle_corrector, muzzle_preview, driver, plan, previous_status,
                     pitch_trim_deg, time.monotonic())
             if launcher is not None:
-                status = _update_panel_engagement(
-                    driver, launcher, dashboard, plan, pose_ready, pose_blocked_reason,
-                    auto_fire=auto_fire, previous_status=previous_status,
-                    fire_hold=muzzle_hold,
-                    hold_reason=match.hold_reason if match is not None else None)
+                try:
+                    status = _update_panel_engagement(
+                        driver, launcher, dashboard, plan, pose_ready, pose_blocked_reason,
+                        auto_fire=auto_fire, previous_status=previous_status,
+                        # While driving back to the shooting spot the turret
+                        # already tracks the next hole; only firing waits.
+                        fire_hold=(muzzle_hold or (
+                            "裝填後重新定位中，到定點前不發射" if repositioning else None)),
+                        hold_reason=match.hold_reason if match is not None else None)
+                except RuntimeError as exc:
+                    if not _power_loss_during_reload(exc):
+                        break
+                    forced_reload_confirm = True
+                    continue
             else:
                 status = driver.update()
-            if unreachable_skipper is not None and launcher is not None:
+            if unreachable_skipper is not None and repositioning:
+                # Seen from the start zone a hole may be out of reach for a
+                # while; never skip it on the way.  None resets the timer.
+                unreachable_skipper.update(None, None, False, False)
+            elif unreachable_skipper is not None and launcher is not None:
                 skipped = unreachable_skipper.update(
                     driver.plan, status, pose_ready,
                     not launcher.pending and not launcher.mechanism_busy)

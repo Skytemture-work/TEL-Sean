@@ -129,6 +129,21 @@ class PanelLauncher:
         self._vesc_paused = True
         print("[VESC] 已確認雙輪停轉，關閉序列埠等待裝填。", flush=True)
 
+    def reconnect_flywheels_stopped(self):
+        """Reopen both VESC ports after a power loss, wheels released (no spin).
+
+        Done as soon as the 24 V is back, so the later start_flywheels() on
+        the reload confirmation only has to set the speed.
+        """
+        if not self._vesc_paused:
+            return
+        vesc = type(self.controller.vesc_controller)()
+        self.controller.vesc_controller = vesc
+        vesc.start()  # waits for the ports to reappear on USB
+        vesc.check_health()
+        self._vesc_paused = False
+        print("[VESC] 復電後已重新連線，飛輪保持不轉，等待裝填完成。", flush=True)
+
     def start_flywheels(self):
         """Reopen both ports at zero before requesting operating speed."""
         if self._vesc_paused:

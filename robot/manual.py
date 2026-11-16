@@ -1427,6 +1427,22 @@ class ManualController:
             self.shoot_bus, self.shoot_notifier, SHOOTING_MOTOR_CAN_ID
         )
 
+        self._configure_mks_servos()
+
+    def reconfigure_mks_after_power_loss(self):
+        """MKS drivers lost 24 V (emergency stop during a reload) and rebooted.
+
+        The CAN adapter stayed up, so only the drivers are configured again
+        (work mode, enable, clear stall protection).  ID1's home is re-found
+        by the reload worker itself before the magazine turns.
+        """
+        print("[Manual] 復電後重新設定 MKS 推球 ID1 與彈藥倉 ID2。", flush=True)
+        with self.lock:
+            self._shoot_home_encoder = None
+            self.reload_pending = False
+        self._configure_mks_servos()
+
+    def _configure_mks_servos(self):
         for label, servo in (
             ("彈藥倉", self.ammo_servo),
             ("射擊機構", self.shoot_servo),

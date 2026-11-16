@@ -22,6 +22,9 @@ AUTO_FORWARD_VX = 40
 OCCLUSION_STRAFE_VY = 15
 MAX_STRAFE_SECONDS = 1.0
 VISION_WAIT_SECONDS = 10.0
+# After a reload the robot sits in the start zone again; the remote's reload
+# confirmation is the departure.  Wait this long for a fresh vy first.
+REPOSITION_VY_WAIT_S = 3.0
 NORMAL_STRAFE_DURATION_SCALE = 1.5
 OCCLUSION_BRAKE_SECONDS = 0.15
 
@@ -97,6 +100,12 @@ def publish_vy(captured_at, vy):
     except BlockingIOError:
         pass
 
+def publish_event(name):
+    try:
+        vision_socket.send(f"EVT {name}".encode("ascii"))
+    except BlockingIOError:
+        pass
+
 def next_command(timeout):
     try:
         return handoff.get(timeout=timeout)
@@ -108,14 +117,15 @@ def read_commands():
         command = line.strip()
         if command == "RELOAD":
             reload_event.set()
-        elif command in ("PREPARE_MOTORS", "VISION_ON", "VISION_OFF", "START upper", "START lower"):
+        elif command in ("PREPARE_MOTORS", "VISION_ON", "VISION_OFF", "START upper", "START lower",
+                         "POSITIONED"):
             handoff.put(command)
     handoff.put(None)
 
 threading.Thread(target=read_commands, daemon=True).start()
 with vision_socket:
     main(sys.argv[2:], reload_event=reload_event, next_handoff_command=next_command,
-         positioning_callback=publish_vy)
+         positioning_callback=publish_vy, event_callback=publish_event)
 """
 
 
@@ -141,15 +151,22 @@ def start_aim_process():
     return process, parent_socket
 
 
-def read_positioning_vy(vision_socket, valid_after, latest):
+def read_positioning_vy(vision_socket, valid_after, latest, events=None):
+    """Newest fresh (captured_at, vy); aim events ("EVT name") go to ``events``."""
     if vision_socket is None:
         return None
     while True:
         try:
-            captured_at, vy = vision_socket.recv(128).decode("ascii").split()
+            parts = vision_socket.recv(128).decode("ascii").split()
         except BlockingIOError:
             break
-        latest = float(captured_at), int(vy)
+        if len(parts) == 2 and parts[0] == "EVT":
+            if events is not None:
+                events.append(parts[1])
+            continue
+        if len(parts) != 2:
+            continue
+        latest = float(parts[0]), int(parts[1])
     if latest is not None:
         captured_at, _ = latest
         if captured_at >= valid_after and time.monotonic() - captured_at <= config.AUTO_VISION_MAX_AGE_S:
@@ -249,6 +266,8 @@ def main():
         brake_until = None
         avoid_until = None
         aim_exit_reported = False
+        repositioning = False
+        reposition_release_at = 0.0
         # Warm the aim subprocess up while still in manual mode, so the
         # switch to auto finds the model loaded and both ZEDs open.
         aim_process, vision_socket = prewarm_aim_process()
@@ -320,6 +339,7 @@ def main():
                     auto_complete = False
                     auto_started = False
                     awaiting_phase = False
+                    repositioning = False
                     locked_vy = None
                     latest_vy = None
                     vision_valid_after = time.monotonic()
@@ -398,11 +418,42 @@ def main():
                         flush=True,
                     )
 
+            if current_mode == "A" and auto_complete and aim_started and not repositioning:
+                aim_events = []
+                latest_vy = read_positioning_vy(vision_socket, vision_valid_after, latest_vy,
+                                                aim_events)
+                if "REPOSITION" in aim_events:
+                    # Reload done in the start zone: the reload confirmation is
+                    # the departure.  Same positioning as at the match start.
+                    repositioning = True
+                    reposition_release_at = time.monotonic() + REPOSITION_VY_WAIT_S
+                    auto_complete = False
+                    auto_started = False
+                    locked_vy = None
+                    latest_vy = None
+                    vision_valid_after = time.monotonic()
+                    vy_recorded_before_release = False
+                    strafe_until = None
+                    vision_wait_until = None
+                    positioning_moved = False
+                    brake_until = None
+                    avoid_until = None
+                    if lidar is not None:
+                        lidar.join()
+                    lidar = LidarAvoidance()
+                    lidar.start()
+                    next_auto_status_at = 0.0
+                    print(f"[Auto Drive] 裝填完成：重新出發定位（先等視覺 vy，最多 "
+                          f"{REPOSITION_VY_WAIT_S:g} 秒）", flush=True)
+
             if current_mode == "A" and not auto_complete:
                 now = time.monotonic()
                 latest_vy = read_positioning_vy(vision_socket, vision_valid_after, latest_vy)
                 if packet is not None and packet.get("mode") == "A":
-                    swa_enabled = packet.get("auto_start") == 1
+                    # A re-departure after the reload needs no VRA release.
+                    swa_enabled = packet.get("auto_start") == 1 or repositioning
+                    reposition_hold = (repositioning and latest_vy is None
+                                       and now < reposition_release_at)
                     if not swa_enabled:
                         if auto_started:
                             print("[Auto Drive] SWA 關閉，暫停定位", flush=True)
@@ -417,7 +468,7 @@ def main():
                         positioning_moved = False
                         brake_until = None
                         avoid_until = None
-                    elif not auto_started:
+                    elif not auto_started and not reposition_hold:
                         # Keep the last seen vy: a single stale sample at the
                         # moment of release must not drop the strafe direction.
                         if latest_vy is not None:
@@ -615,7 +666,12 @@ def main():
                         # reach are skipped after 3 s by the aim process.
                         print(f"[Aim] 定位不完整（{completion_reason}），仍照常開始投球；"
                               "打不到的孔會自動跳過", flush=True)
-                    if aim_prepared and send_aim_command(aim_process, "VISION_OFF"):
+                    if repositioning:
+                        repositioning = False
+                        send_aim_command(aim_process, "VISION_OFF")
+                        if send_aim_command(aim_process, "POSITIONED"):
+                            print("[Aim] 重新定位完成，通知繼續射擊", flush=True)
+                    elif aim_prepared and send_aim_command(aim_process, "VISION_OFF"):
                         awaiting_phase = True
                         print("[Aim] 沿用 ZED，等待下一筆 A 模式封包選擇半場", flush=True)
                     else:
