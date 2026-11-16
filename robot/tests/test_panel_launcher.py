@@ -718,6 +718,34 @@ class PusherSpeedTests(unittest.TestCase):
             controller.reconfigure_mks_after_power_loss()
         self.assertIsNone(controller._pusher_home_encoder)
 
+    def test_model_ready_turns_three_slots_without_counting_them(self):
+        controller = self._manual()
+        controller.current_mode = 'A'
+        controller.current_slot, controller.slots_fired_since_reload = 1, 0
+        controller._go_home = Mock(return_value=5)
+        move = Mock()
+        move.poll.return_value = True
+        controller._start_ammo_move = Mock(return_value=move)
+        with patch('builtins.print'):
+            self.assertTrue(controller.signal_model_ready())
+            controller.wait_signal_turn()
+        controller._go_home.assert_called_once()
+        controller._start_ammo_move.assert_called_once_with(manual.AMMO_SLOT_PULSES * 3,
+                                                            verify_home=False)
+        move.finish.assert_called_once_with()
+        self.assertEqual((controller.current_slot, controller.slots_fired_since_reload), (1, 0))
+        self.assertFalse(controller.busy)
+
+    def test_model_ready_turn_is_skipped_when_busy_or_in_manual(self):
+        for mode, busy in (('M', False), ('A', True)):
+            with self.subTest(mode=mode, busy=busy):
+                controller = self._manual()
+                controller.current_mode, controller.busy = mode, busy
+                controller._start_ammo_move = Mock()
+                with patch('builtins.print'):
+                    self.assertFalse(controller.signal_model_ready())
+                controller._start_ammo_move.assert_not_called()
+
     def test_launcher_overrides_only_the_pusher(self):
         controller = self._manual()
         launcher = PanelLauncher(Mock(), controller_factory=Mock(return_value=controller),
@@ -839,6 +867,25 @@ class StallProtectionTests(unittest.TestCase):
         self.assertTrue(self._homed(5.0, 8)._wait_shooter_stopped.called)
         self.assertTrue(self._homed(0.1, 5 + manual.SHOOT_HOME_TOLERANCE_COUNTS + 1)
                         ._wait_shooter_stopped.called)
+
+
+class SettleNextShotTests(unittest.TestCase):
+    def test_only_the_next_shot_waits_longer(self):
+        from turret_control.panel_launcher import AutoFireTrigger
+        clock = [0.0]
+        trigger = AutoFireTrigger(0.15, clock=lambda: clock[0])
+        plan = EngagementPlan([BoardTarget(u_px=0.0, v_px=0.0, width_px=1.0, height_px=1.0,
+                                           confidence=1.0, hole_id='H06')])
+        trigger.settle_next_shot(1.0)
+        self.assertIsNone(trigger.take(plan, 1, True))   # starts the hold
+        clock[0] = 0.5
+        self.assertIsNone(trigger.take(plan, 1, True))   # 0.5 s < 1.0 s
+        clock[0] = 1.0
+        self.assertIsNotNone(trigger.take(plan, 1, True))
+        clock[0] = 2.0
+        self.assertIsNone(trigger.take(plan, 1, True))   # new hold, back to 0.15 s
+        clock[0] = 2.2
+        self.assertIsNotNone(trigger.take(plan, 1, True))
 
 
 class ShotToolTests(unittest.TestCase):

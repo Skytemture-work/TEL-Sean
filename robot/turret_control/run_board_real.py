@@ -694,6 +694,10 @@ def _run_board_real(
         help="全自動模式：同一孔位需連續符合發射條件的秒數（預設 0.15，範圍 0.1～5；原 0.3）",
     )
     parser.add_argument(
+        "--reload-first-settle", type=float, default=1.0,
+        help="裝填後重新定位完成的第一發，瞄準穩定秒數（預設 1.0；其他發用 --auto-fire-settle）",
+    )
+    parser.add_argument(
         "--stable-frames", type=int, default=2,
         help="砲口需連續幾個辨識畫面都在容許誤差內才算到位（預設 2，範圍 1～10；原 3）",
     )
@@ -878,6 +882,8 @@ def _run_board_real(
         parser.error("--zed-calibration 必須配合 --zed-uvc 使用")
     if args.restore_completed_aim and (not args.aim_only or args.score_mode):
         parser.error("--restore-completed-aim 需要 --aim-only --no-score-mode")
+    if not math.isfinite(args.reload_first_settle) or not 0.0 <= args.reload_first_settle <= 5.0:
+        parser.error("--reload-first-settle 必須在 0～5 秒之間")
     if not math.isfinite(args.auto_fire_settle) or not 0.1 <= args.auto_fire_settle <= 5.0:
         parser.error("--auto-fire-settle 必須在 0.1～5 秒之間")
     for flag, value, low, high in (("--push-rpm", args.push_rpm, 20, 600),
@@ -1164,6 +1170,8 @@ def _run_board_real(
                     raise RuntimeError("YOLO 預熱失敗") from model_box["warmup_error"]
                 model_ready = True
                 print(f"[Aim] PREWARM_READY（{time.monotonic() - model_started_at:.1f} s）", flush=True)
+                if event_callback is not None:
+                    event_callback("MODEL_READY")  # main.py turns the magazine as a sign
                 if positioning:
                     reset_positioning()
             if not model_ready:
@@ -1674,6 +1682,12 @@ def _run_board_real(
                 elif command == "POSITIONED" and repositioning:
                     repositioning = False
                     reposition_vision = False
+                    if auto_fire is not None:
+                        # The turret just came a long way (from home) on a
+                        # robot that just stopped: let the first shot settle.
+                        auto_fire.settle_next_shot(args.reload_first_settle)
+                        print(f"[Aim] 裝填後第一發：瞄準穩定 {args.reload_first_settle:g} 秒才發射。",
+                              flush=True)
                     if pose_lock is not None:
                         pose_lock.release("裝填後重新定位完成")
                     print("[Aim] 重新定位完成：重新取得靶面姿態後繼續射擊。", flush=True)

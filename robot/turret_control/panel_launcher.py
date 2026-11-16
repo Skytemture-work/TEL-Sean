@@ -341,9 +341,14 @@ class AutoFireTrigger:
             raise ValueError("settle_s must be >= 0")
         self.settle_s = float(settle_s)
         self._clock = clock
+        self._next_settle_s = None  # one-shot longer settle (e.g. after a reload)
         self._key = None
         self._since = None
         self.state = "等待瞄準到位"
+
+    def settle_next_shot(self, seconds):
+        """Hold the next shot (only) ready for at least ``seconds``."""
+        self._next_settle_s = max(self.settle_s, float(seconds))
 
     def _reset(self, state):
         self._key = None
@@ -364,12 +369,14 @@ class AutoFireTrigger:
         if key != self._key:
             self._key, self._since = key, now
         held = now - self._since
-        if held < self.settle_s:
-            self.state = f"{target.hole_id} 瞄準穩定中 {held:.1f}/{self.settle_s:.1f} s"
+        settle = self.settle_s if self._next_settle_s is None else self._next_settle_s
+        if held < settle:
+            self.state = f"{target.hole_id} 瞄準穩定中 {held:.1f}/{settle:.1f} s"
             return None
         self.state = f"{target.hole_id} 自動發射"
         # Fire once per settled hole; a new click needs a fresh settle period.
         self._key = self._since = None
+        self._next_settle_s = None
         return (plan_revision, plan.index, target.hole_id, now)
 
     def snapshot(self):

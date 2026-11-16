@@ -187,6 +187,9 @@ FAST_BACK_DISPLACEMENT_TOLERANCE = 0.02
 # 上一格第 3 段已回原點、推桿沒動過時，下一格第 1 段前不再重新回零（原本會往後頂
 # 一下再退，約 1.1 s，也就是推第 1 顆前「抖一下」）。False = 一律回零。
 SKIP_PREHOME_WHEN_HOMED = True
+# 自動模式發車前，模型載入完成時彈藥倉轉這幾格當作提示（6 格一圈、整匣都裝球，
+# 轉幾格都對得準；不計入格位）。0 = 不轉。
+MODEL_READY_SIGNAL_SLOTS = 3
 SLOTS_PER_MAGAZINE = 6
 
 MOVE_TIMEOUT = 30.0
@@ -1714,6 +1717,55 @@ class ManualController:
                 self._shot_thread = None
                 raise
         return True
+
+    def signal_model_ready(self, slots=None):
+        """Auto mode, before the release: turn the magazine as a visible
+        "model loaded" sign.  Not counted as fired slots."""
+        slots = MODEL_READY_SIGNAL_SLOTS if slots is None else slots
+        if slots <= 0:
+            return False
+        with self.lock:
+            if self.current_mode != "A" or self.busy or self.shot_error is not None:
+                print("[Manual] 模型已載入，但機構忙碌或不在自動模式：略過提示轉格。", flush=True)
+                return False
+            self.busy = True
+            self._signal_thread = threading.Thread(
+                target=self._signal_worker, args=(slots,), name="model-ready-signal")
+            try:
+                self._signal_thread.start()
+            except RuntimeError:
+                self.busy = False
+                self._signal_thread = None
+                raise
+        return True
+
+    def _signal_worker(self, slots):
+        try:
+            # Turning needs ID1 at home: find it again (ID1 was homed on the
+            # switch to auto, but nothing may have moved since is not proven).
+            self._go_home(self.shoot_servo, HOME_DIRECTION, "提示轉格前 ID1 回原點")
+            print("[Manual] 模型載入完成：彈藥倉轉 {} 格作為提示（不計入格位）。".format(slots),
+                  flush=True)
+            move = self._start_ammo_move(AMMO_SLOT_PULSES * slots, verify_home=False)
+            while not move.poll():
+                time.sleep(POLL_INTERVAL)
+            move.finish()
+            print("[Manual] 提示轉格完成。", flush=True)
+        except Exception as exc:
+            print("[Manual Error] 提示轉格失敗：{}".format(exc), flush=True)
+            self._emergency_stop(self.ammo_servo, "彈藥倉")
+            self._emergency_stop(self.shoot_servo, "射擊機構")
+        finally:
+            with self.lock:
+                self._shoot_home_encoder = None
+                self.busy = False
+
+    def wait_signal_turn(self, timeout=20.0):
+        """Let a running model-ready turn finish (close() would e-stop it)."""
+        thread = getattr(self, "_signal_thread", None)
+        if thread is not None and thread.is_alive():
+            print("[Manual] 等提示轉格完成再交接機構…", flush=True)
+            thread.join(timeout)
 
     def request_reload(self):
         """啟動一次補彈，與 FIRE 共用馬達的忙碌狀態。"""

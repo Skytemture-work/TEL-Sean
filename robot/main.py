@@ -545,7 +545,12 @@ def main():
 
             if current_mode == "A" and not auto_complete:
                 now = time.monotonic()
-                latest_vy = read_positioning_vy(vision_socket, vision_valid_after, latest_vy)
+                pre_events = []
+                latest_vy = read_positioning_vy(vision_socket, vision_valid_after, latest_vy,
+                                                pre_events)
+                if "MODEL_READY" in pre_events and manual is not None and not aim_prepared:
+                    # Visible sign that the model is loaded: the magazine turns.
+                    manual.signal_model_ready()
                 if packet is not None and packet.get("mode") == "A":
                     # A re-departure after the reload needs no VRA release.
                     swa_enabled = packet.get("auto_start") == 1 or repositioning
@@ -582,6 +587,7 @@ def main():
                             print("[Match] VRA 發車：比賽計時開始", flush=True)
                         if not aim_prepared and aim_process is not None and aim_process.poll() is None:
                             if manual is not None:
+                                manual.wait_signal_turn()  # close() would e-stop it
                                 manual.close()
                                 manual = None
                             # The half switch is already set on release: tell the aim
