@@ -78,6 +78,50 @@ class BoardPreviewTests(unittest.TestCase):
         self.assertFalse(any(abs(t.u_px - extra_u) < 5 and abs(t.v_px - extra_v) < 5
                              for t in result.targets))
 
+    def test_grid_at_twice_the_column_pitch_is_implausible(self):
+        from turret_control.run_zed_tensorrt_test import _grid_scale_plausible
+
+        real = np.asarray(((540, 280), (802, 281), (835, 600), (513, 601)), np.float32)
+        detections = list(build_plan_from_board_quad(real, .2, .4).targets)
+        wrong = real.copy()
+        wrong[:, 0] = real[0, 0] + 2.0 * (real[:, 0] - real[0, 0])  # 2x pitch, same rows
+
+        def judge(quad):
+            plan = build_plan_from_board_quad(quad, .2, .4)
+            predicted = np.asarray([(t.u_px, t.v_px) for t in plan.targets])
+            points = np.asarray([(t.u_px, t.v_px) for t in detections])
+            distances = np.linalg.norm(points[:, None, :] - predicted[None, :, :], axis=2)
+            nearest = np.argmin(distances, axis=1)
+            return _grid_scale_plausible(plan, detections, nearest, distances, 1e9)
+
+        self.assertTrue(judge(real))
+        self.assertFalse(judge(wrong))
+
+    def test_poster_circle_in_line_with_a_column_keeps_all_real_holes(self):
+        # 2026-11-16 at 2.5 m: a poster circle right of the board, two column
+        # pitches beyond the right column, in line with the board's rows.
+        quad = np.asarray(((540, 280), (802, 281), (835, 600), (513, 601)), np.float32)
+        holes = list(build_plan_from_board_quad(quad, .2, .4).targets)
+        cells = {t.hole_id: t for t in holes}
+        poster_u = cells["H09"].u_px + (cells["H09"].u_px - cells["H03"].u_px)
+        frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+        rows = [[t.u_px - t.width_px / 2, t.v_px - t.height_px / 2,
+                 t.u_px + t.width_px / 2, t.v_px + t.height_px / 2, .9, 0] for t in holes]
+        size = cells["H09"].width_px
+        rows.append([poster_u - size / 2, cells["H09"].v_px - size / 2,
+                     poster_u + size / 2, cells["H09"].v_px + size / 2, .9, 0])
+        detected = Results(frame, path="test", names={0: "hole"}, boxes=torch.tensor(rows))
+
+        class Detector:
+            def predict(self, image, **kwargs):
+                return [detected]
+
+        result = BoardVision(Detector(), TurretConfig()).process(frame, now=0.0)
+        kept = {(round(t.u_px), round(t.v_px)) for t in result.targets}
+        for t in holes:
+            self.assertIn((round(t.u_px), round(t.v_px)), kept, t.hole_id)
+        self.assertNotIn((round(poster_u), round(cells["H09"].v_px)), kept)
+
     def test_estimates_outline_from_observed_grid_with_missing_hole(self):
         corners = np.asarray(((540, 280), (802, 281), (835, 600), (513, 601)), np.float32)
         matrix = cv2.getPerspectiveTransform(np.asarray(((0, 0), (1, 0), (1, 1), (0, 1)), np.float32), corners)

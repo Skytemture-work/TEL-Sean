@@ -87,14 +87,41 @@ def _estimate_quad_from_large_rows(candidates, frame_shape):
     return quad if _valid_estimated_quad(quad, frame_shape) else None
 
 
-def _estimate_board_quad(targets, frame_shape):
-    """Estimate a preview-only board outline from well-supported hole geometry."""
-    candidates = [target for target in targets if target.confidence >= 0.5]
-    if len(candidates) < 8:
-        return _estimate_quad_from_large_rows(candidates, frame_shape)
+# Official board: 40 cm large holes on a 90 cm column pitch.
+_LARGE_HOLE_TO_COLUMN_PITCH = 40.0 / 90.0
+_LARGE_HOLE_IDS = frozenset(f"H{number:02d}" for number in range(1, 10))
+
+
+def _grid_scale_plausible(plan, candidates, nearest, distances, threshold):
+    """Detected large-hole size vs the fitted column pitch must match the board.
+
+    2026-11-16: close to the board, a poster circle on the wall lined up with
+    the left and right columns at twice the real pitch; the fitted 3x4 grid
+    used it as the third column and pushed the real centre column out of the
+    outline (PnP never valid).  Real 43 px holes / 95 px pitch = 0.45 (board
+    0.44); the wrong grid gave 0.23.
+    """
+    position = {t.hole_id: np.asarray((t.u_px, t.v_px), dtype=np.float64) for t in plan.targets}
+    try:
+        pitches = [float(np.linalg.norm(position[f"H{n:02d}"] - position[f"H{n + 3:02d}"]))
+                   for n in range(1, 7)]
+    except KeyError:
+        return True
+    pitch = float(np.median(pitches))
+    sizes = [candidates[index].size_px for index, predicted_index in enumerate(nearest)
+             if distances[index, predicted_index] <= threshold
+             and plan.targets[predicted_index].hole_id in _LARGE_HOLE_IDS]
+    if pitch <= 0 or not sizes:
+        return True  # nothing to judge with
+    ratio = float(np.median(sizes)) / pitch
+    return 0.6 * _LARGE_HOLE_TO_COLUMN_PITCH <= ratio <= 1.6 * _LARGE_HOLE_TO_COLUMN_PITCH
+
+
+def _quad_from_grid(candidates, frame_shape):
+    """(quad, scale_plausible); quad is None when no supported grid fits."""
     plan = build_virtual_plan_from_partial(candidates, 0.2, 0.4)
     if len(plan.targets) != 12:
-        return _estimate_quad_from_large_rows(candidates, frame_shape)
+        return None, False
     predicted = np.asarray([(t.u_px, t.v_px) for t in plan.targets], dtype=np.float32)
     points = np.asarray([(t.u_px, t.v_px) for t in candidates], dtype=np.float32)
     distances = np.linalg.norm(points[:, None, :] - predicted[None, :, :], axis=2)
@@ -108,14 +135,36 @@ def _estimate_board_quad(targets, frame_shape):
     supported = [plan.targets[index] for index in matches]
     if (len(supported) < 8 or len({t.column for t in supported}) < 3
             or len({t.row for t in supported}) < 4):
-        return _estimate_quad_from_large_rows(candidates, frame_shape)
+        return None, False
     expected = np.asarray([hole_position(t.hole_id) for t in plan.targets], dtype=np.float32)
     matrix, _ = cv2.findHomography(expected, predicted, 0)
     if matrix is None:
-        return None
+        return None, False
     corners = np.asarray(((0, 0), (1, 0), (1, 1), (0, 1)), dtype=np.float32).reshape(-1, 1, 2)
     quad = cv2.perspectiveTransform(corners, matrix).reshape(4, 2)
     if not _valid_estimated_quad(quad, frame_shape):
+        return None, False
+    return quad, _grid_scale_plausible(plan, candidates, nearest, distances, threshold)
+
+
+def _estimate_board_quad(targets, frame_shape):
+    """Estimate a preview-only board outline from well-supported hole geometry."""
+    candidates = [target for target in targets if target.confidence >= 0.5]
+    if len(candidates) < 8:
+        return _estimate_quad_from_large_rows(candidates, frame_shape)
+    quad, plausible = _quad_from_grid(candidates, frame_shape)
+    if quad is not None and not plausible:
+        # A round shape off the board fitted into the grid: try without each
+        # candidate in turn and keep the first grid of the right scale.
+        quad = None
+        if len(candidates) > 8:
+            for skip in range(len(candidates)):
+                retry, retry_plausible = _quad_from_grid(
+                    candidates[:skip] + candidates[skip + 1:], frame_shape)
+                if retry is not None and retry_plausible:
+                    quad = retry
+                    break
+    if quad is None:
         return _estimate_quad_from_large_rows(candidates, frame_shape)
     return quad
 

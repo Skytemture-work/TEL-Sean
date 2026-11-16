@@ -1823,6 +1823,10 @@ def _run_board_real(
                 forced_reload_confirm = False
                 if reload_was_waiting and not match.reload_wait and match.stopped is None:
                     _begin_reposition()  # no-op if the e-stop recovery already did it
+                if not reload_was_waiting and match.reload_wait and event_callback is not None:
+                    # From the reload until this program ends main.py keeps auto
+                    # mode (the e-stop reboots the ESP32, which may report M).
+                    event_callback("RELOAD_WAIT")
                 reload_was_waiting = match.reload_wait
                 plan = match.plan if match.plan is not None else plan
                 if match.bonus_hole_id is not None:
