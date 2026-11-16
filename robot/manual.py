@@ -174,8 +174,12 @@ PUSH_FAST_OUT_FRACTION = 0.0
 PUSH_FAST_BACK_FRACTION = 0.75
 # 快退速度。原本與推球共用 200 RPM：2026-11-16 19:44 走到一半被擋（堵轉保護），
 # 23:11 送出後 30 s 都沒回報停止，兩次都停機；降到 100 RPM 後 23:18 整場正常，
-# 再提高到 150 RPM 試試（又卡住就改回 100）。
-PUSH_FAST_BACK_SPEED_RPM = 150
+# 提高到 150 RPM 後 00:02、00:27 正常，00:39 又在 72% 處卡住；改回 100 RPM。
+PUSH_FAST_BACK_SPEED_RPM = 100
+# 推桿移動中 Encoder 超過這段時間沒有前進（變化 <= PUSHER_STALL_COUNTS）就視為卡住：
+# 立刻停下，不再等 30 s 逾時。第 3 段快退卡住時會解除堵轉保護、改 40 RPM 回原點繼續。
+PUSHER_STALL_S = 0.5
+PUSHER_STALL_COUNTS = 20
 # 推桿每 pulse 的 Encoder counts（2026-11-16 實測 54774 / 2675）。
 PUSH_ENCODER_COUNTS_PER_PULSE = 20.48
 # 第 3 段快退後推桿已離開彈藥倉（隊伍確認：距原點 <= 這個 pulses 時彈藥倉可轉），
@@ -1380,6 +1384,14 @@ class DMStartupController:
             print(f"[Manual DM] 關閉時控制錯誤：{self.error}", flush=True)
 
 
+class PusherStalled(RuntimeError):
+    """ID1 stopped advancing during a relative move (it was stopped)."""
+
+    def __init__(self, moved):
+        super().__init__("推桿卡住（移動中 Encoder 停止前進，已位移 {}）".format(moved))
+        self.moved = moved
+
+
 class _AmmoMove:
     """Follow one magazine move without blocking: ``poll()`` until True.
 
@@ -1938,14 +1950,25 @@ class ManualController:
                 # while ID1 returns home and ID2 turns.  The next push still
                 # waits for this stage (controller busy) to finish.
                 self._mark_shot_released()
-                time.sleep(SETTLE_TIME)
+                # No pause at the end: the homing above already confirmed the
+                # pusher stopped there; go straight back.
                 fast_back = int(PUSH_END_POSITION_PULSES * PUSH_FAST_BACK_FRACTION)
                 moved = None
                 if fast_back > 0:
                     print("[Manual] 快退 {} pulses（{} RPM），再慢速回原點。".format(
                         fast_back, PUSH_FAST_BACK_SPEED_RPM), flush=True)
-                    moved = self._move_relative(self.shoot_servo, fast_back, HOME_DIRECTION,
-                                                PUSH_FAST_BACK_SPEED_RPM)
+                    try:
+                        moved = self._move_relative(self.shoot_servo, fast_back, HOME_DIRECTION,
+                                                    PUSH_FAST_BACK_SPEED_RPM)
+                    except PusherStalled as exc:
+                        moved = None
+                        self._recover_fast_back("{}".format(exc))
+                    else:
+                        expected = fast_back * PUSH_ENCODER_COUNTS_PER_PULSE
+                        if (not isinstance(moved, int)
+                                or abs(abs(moved) - expected) > FAST_BACK_DISPLACEMENT_TOLERANCE * expected):
+                            self._recover_fast_back("快退只走了 {}（預期約 {:.0f}）".format(moved, expected))
+                            moved = None
                 turn = None
                 if self._turn_may_overlap_homing(fast_back, moved):
                     print("[Manual] 快退到位（推桿已離開彈藥倉）：轉格與慢速回原點同時進行。",
@@ -2088,6 +2111,8 @@ class ManualController:
         is_pusher = servo is self.shoot_servo
         poll_s = SHOOT_MOVE_POLL_S if is_pusher else POLL_INTERVAL
         settle_s = SHOOT_MOVE_SETTLE_S if is_pusher else SETTLE_TIME
+        progress_encoder = before
+        progress_at = start
 
         while True:
             elapsed = time.monotonic() - start
@@ -2099,6 +2124,15 @@ class ManualController:
             now_encoder = servo.read_encoder_value_addition()
             if now_encoder is not None and now_encoder != before:
                 movement_seen = True
+            if is_pusher and isinstance(now_encoder, int) and not isinstance(now_encoder, bool):
+                now_s = time.monotonic()
+                if abs(now_encoder - progress_encoder) > PUSHER_STALL_COUNTS:
+                    progress_encoder, progress_at = now_encoder, now_s
+                elif running and movement_seen and now_s - progress_at >= PUSHER_STALL_S:
+                    # Reported running but not moving (stall protection or
+                    # blocked): stop now instead of waiting MOVE_TIMEOUT.
+                    self._emergency_stop(servo, "推桿卡住")
+                    raise PusherStalled(now_encoder - before)
 
             if running:
                 seen_running = True
@@ -2259,6 +2293,17 @@ class ManualController:
         return (status == MotorStatus.MotorStop
                 and isinstance(encoder, int) and not isinstance(encoder, bool)
                 and abs(encoder - encoder_home) <= SHOOT_HOME_TOLERANCE_COUNTS)
+
+    def _recover_fast_back(self, reason):
+        """Stage 3 fast return did not finish: clear the driver, home slowly.
+
+        The 40 RPM current-sensed homing that always ends stage 3 then
+        brings ID1 back; the magazine turn waits for it (no overlap).
+        """
+        print("[Manual Warning] 第 3 段快退卡住：{}；解除堵轉保護，改 40 RPM 慢速回原點後照常轉格。".format(
+            reason), flush=True)
+        self._emergency_stop(self.shoot_servo, "射擊機構")
+        self._clear_stall_protection_at_startup(self.shoot_servo, "射擊機構")
 
     def _turn_may_overlap_homing(self, fast_back, moved):
         """Stage 3: may the magazine turn while ID1 does its slow homing?"""

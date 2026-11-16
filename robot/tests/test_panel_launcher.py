@@ -627,7 +627,7 @@ class PusherSpeedTests(unittest.TestCase):
         fast_out = manual.PUSH_FAST_OUT_FRACTION
         fast_back = manual.PUSH_FAST_BACK_FRACTION
         self.assertEqual(fast_out, 0.0)  # 200 RPM push-out stalled on the robot
-        self.assertEqual(manual.PUSH_FAST_BACK_SPEED_RPM, 150)  # 200 RPM return stalled
+        self.assertEqual(manual.PUSH_FAST_BACK_SPEED_RPM, 100)  # 150/200 RPM returns stalled
         # Slow current-sensed push to the end; fast back most of the way, slow
         # current-sensed home.
         self.assertEqual(calls, [
@@ -743,6 +743,43 @@ class PusherSpeedTests(unittest.TestCase):
                 with patch('builtins.print'):
                     self.assertFalse(controller.signal_model_ready())
                 controller._start_ammo_move.assert_not_called()
+
+    def test_stalled_fast_return_recovers_with_a_slow_homing(self):
+        fast_back = int(manual.PUSH_END_POSITION_PULSES * manual.PUSH_FAST_BACK_FRACTION)
+        full = int(fast_back * manual.PUSH_ENCODER_COUNTS_PER_PULSE)
+        for outcome in (manual.PusherStalled(59545), full // 2):
+            with self.subTest(outcome=outcome):
+                controller = self._manual()
+                controller.shoot_servo = Mock()
+                controller.shoot_servo.read_encoder_value_addition.return_value = 0
+                controller.shot_stage, controller.current_mode = 2, 'M'
+                controller.slots_fired_since_reload = 0
+                controller._push_position = 2675
+                controller._start_ammo_move = Mock()
+                controller._clear_stall_protection_at_startup = Mock()
+                homes = []
+                controller._go_home = lambda servo, direction, label, speed_rpm=None, poll=None: (
+                    homes.append((direction, poll)) or 7)
+                controller._move_relative = Mock(side_effect=[outcome] if isinstance(outcome, Exception)
+                                                 else [outcome])
+                with patch.object(manual.time, 'sleep'), patch('builtins.print'):
+                    controller._run_one_shot_cycle()
+                controller._clear_stall_protection_at_startup.assert_called_once()
+                controller._start_ammo_move.assert_not_called()   # no overlap after a stall
+                self.assertEqual(homes[-1], (manual.HOME_DIRECTION, None))
+                self.assertTrue(controller.reload_pending)          # normal turn follows
+
+    def test_pusher_reported_running_but_not_moving_raises_quickly(self):
+        controller = self._manual()
+        servo = Mock()
+        controller.shoot_servo = servo
+        servo.run_motor_relative_motion_by_pulses.return_value = 'ok'
+        servo.is_motor_running.return_value = True                 # never reports done
+        servo.read_encoder_value_addition.side_effect = [0] + [500] * 10000  # moved once, then stuck
+        controller._read_encoder = Mock(return_value=0)
+        with patch('builtins.print'), self.assertRaises(manual.PusherStalled):
+            controller._move_relative(servo, 4012, manual.HOME_DIRECTION, 100)
+        servo.emergency_stop_motor.assert_called_once_with()
 
     def test_launcher_overrides_only_the_pusher(self):
         controller = self._manual()
