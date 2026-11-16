@@ -619,7 +619,7 @@ class PusherSpeedTests(unittest.TestCase):
         controller.shoot_servo.read_encoder_value_addition.return_value = 0
         controller.shot_stage = 2
         calls = []
-        controller._go_home = lambda servo, direction, label, speed_rpm=None: (
+        controller._go_home = lambda servo, direction, label, speed_rpm=None, poll=None: (
             calls.append(('home', direction, speed_rpm)) or 100)
         controller._move_relative = lambda servo, pulses, direction, speed: (
             calls.append(('move', direction, pulses, speed)))
@@ -629,7 +629,7 @@ class PusherSpeedTests(unittest.TestCase):
         fast_out = manual.PUSH_FAST_OUT_FRACTION
         fast_back = manual.PUSH_FAST_BACK_FRACTION
         self.assertEqual(fast_out, 0.0)  # 200 RPM push-out stalled on the robot
-        self.assertEqual(manual.PUSH_FAST_BACK_SPEED_RPM, 100)  # 200 RPM return stalled too
+        self.assertEqual(manual.PUSH_FAST_BACK_SPEED_RPM, 150)  # 200 RPM return stalled
         # Slow current-sensed push to the end; fast back most of the way, slow
         # current-sensed home.
         self.assertEqual(calls, [
@@ -640,6 +640,83 @@ class PusherSpeedTests(unittest.TestCase):
         ])
         self.assertEqual(manual.PUSH_END_SPEED_RPM, 40)
         self.assertTrue(controller.reload_pending)
+
+    def _stage3(self, moved, slots_fired=0):
+        controller = self._manual()
+        controller.shoot_servo = Mock()
+        controller.shoot_servo.read_encoder_value_addition.return_value = 0
+        controller.shot_stage = 2
+        controller.current_mode = 'M'
+        controller.slots_fired_since_reload = slots_fired
+        controller._push_position = 2675
+        polls = []
+        turn = Mock()
+        turn.poll.return_value = True
+        controller._start_ammo_move = Mock(return_value=turn)
+
+        def go_home(servo, direction, label, speed_rpm=None, poll=None):
+            polls.append(poll)
+            return 7
+        controller._go_home = go_home
+        controller._move_relative = Mock(return_value=moved)
+        with patch.object(manual.time, 'sleep'), patch('builtins.print'):
+            controller._run_one_shot_cycle()
+        return controller, polls, turn
+
+    def test_stage3_turns_the_magazine_while_the_pusher_homes(self):
+        fast_back = int(manual.PUSH_END_POSITION_PULSES * manual.PUSH_FAST_BACK_FRACTION)
+        moved = int(fast_back * manual.PUSH_ENCODER_COUNTS_PER_PULSE)
+        controller, polls, turn = self._stage3(moved)
+        controller._start_ammo_move.assert_called_once_with(manual.AMMO_SLOT_PULSES,
+                                                            verify_home=False)
+        self.assertIs(polls[-1], turn.poll)       # followed during the slow homing
+        turn.finish.assert_called_once_with()
+        self.assertTrue(controller._turned_in_stage3)
+        self.assertEqual(controller._pusher_home_encoder, 7)
+
+    def test_short_fast_return_or_last_slot_keeps_the_old_order(self):
+        fast_back = int(manual.PUSH_END_POSITION_PULSES * manual.PUSH_FAST_BACK_FRACTION)
+        full = int(fast_back * manual.PUSH_ENCODER_COUNTS_PER_PULSE)
+        for moved, slots_fired in ((full // 2, 0), (None, 0), (full, manual.SLOTS_PER_MAGAZINE - 1)):
+            with self.subTest(moved=moved, slots_fired=slots_fired):
+                controller, polls, _ = self._stage3(moved, slots_fired)
+                controller._start_ammo_move.assert_not_called()
+                self.assertIsNone(polls[-1])
+                self.assertFalse(getattr(controller, '_turned_in_stage3', False))
+
+    def _stage1(self, remembered, encoder_now):
+        controller = self._manual()
+        controller.shoot_servo = Mock()
+        controller.shoot_servo.query_motor_status.return_value = manual.MotorStatus.MotorStop
+        controller._read_encoder = Mock(return_value=encoder_now)
+        controller.shot_stage = 0
+        controller.current_mode = 'M'
+        controller._pusher_home_encoder = remembered
+        controller._go_home = Mock(return_value=0)
+        controller._push_to = Mock()
+        controller._retract_after_push = Mock()
+        with patch('builtins.print'):
+            controller._run_one_shot_cycle()
+        return controller
+
+    def test_first_push_skips_the_homing_when_the_pusher_did_not_move(self):
+        controller = self._stage1(remembered=7, encoder_now=9)
+        controller._go_home.assert_not_called()
+        controller._push_to.assert_called_once_with(manual.TARGET_POSITIONS[0])
+        self.assertIsNone(controller._pusher_home_encoder)  # one use only
+
+    def test_first_push_homes_when_moved_or_unknown(self):
+        for remembered, now in ((7, 7 + manual.SHOOT_HOME_TOLERANCE_COUNTS + 1), (None, 7)):
+            with self.subTest(remembered=remembered):
+                self._stage1(remembered, now)._go_home.assert_called_once()
+
+    def test_power_loss_forgets_the_home(self):
+        controller = self._manual()
+        controller._pusher_home_encoder = 7
+        controller._configure_mks_servos = Mock()
+        with patch('builtins.print'):
+            controller.reconfigure_mks_after_power_loss()
+        self.assertIsNone(controller._pusher_home_encoder)
 
     def test_launcher_overrides_only_the_pusher(self):
         controller = self._manual()

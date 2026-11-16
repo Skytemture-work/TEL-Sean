@@ -43,7 +43,8 @@ class MatchSequencer:
                  start_reload_rotation: Callable[[], bool] = lambda: True,
                  stop_flywheels: Callable[[], None] = lambda: None,
                  start_flywheels: Callable[[], None] = lambda: None,
-                 clock_origin: Optional[float] = None):
+                 clock_origin: Optional[float] = None,
+                 on_magazine_empty: Callable[[], None] = lambda: None):
         self.phase = phase
         self.clock_origin = clock_origin
         self.duration_s = duration_s
@@ -60,6 +61,9 @@ class MatchSequencer:
         self._start_reload_rotation = start_reload_rotation
         self._stop_flywheels = stop_flywheels
         self._start_flywheels = start_flywheels
+        # Called once the last ball of a magazine is out and a reload follows,
+        # before the (blocking) flywheel stop: the turret / chassis start now.
+        self._on_magazine_empty = on_magazine_empty
         self.bonus_closed = phase != UPPER_PHASE
         self.reload_wait = False
         self.reload_balls = 0
@@ -148,6 +152,7 @@ class MatchSequencer:
             if launcher_idle:
                 self.reload_wait = True
                 self.reload_balls = min(self.magazine_size, self.plan.remaining)
+                self._on_magazine_empty()
                 self._stop_flywheels()  # hands near the launcher while reloading
                 self._log(f"彈倉已射完：飛輪已停止。請裝填 {self.reload_balls} 顆，完成後在儀表板按"
                           "「裝填完成」。接下來：" + " ".join(self.remaining_ids()))

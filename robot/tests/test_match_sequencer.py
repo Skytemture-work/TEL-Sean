@@ -24,7 +24,8 @@ class Harness:
                                     light_wait_s=light_wait, start_reload_rotation=rotate,
                                     stop_flywheels=lambda: self.flywheels.append("off"),
                                     start_flywheels=lambda: self.flywheels.append("on"),
-                                    clock_origin=clock_origin)
+                                    clock_origin=clock_origin,
+                                    on_magazine_empty=lambda: self.flywheels.append("empty"))
         self.board = _board_plan()
         self.now = 0.0
 
@@ -79,11 +80,12 @@ class UpperHalfTests(unittest.TestCase):
         h.tick(reload=True, busy=True)    # magazine still rotating: refused
         self.assertTrue(h.match.reload_wait)
         self.assertEqual(h.rotations, 0)
-        self.assertEqual(h.flywheels, ["off"])  # flywheels stopped while reloading
+        # The turret / chassis are told before the (blocking) flywheel stop.
+        self.assertEqual(h.flywheels, ["empty", "off"])  # flywheels stopped while reloading
         h.tick(reload=True)
         self.assertFalse(h.match.reload_wait)
         self.assertEqual(h.rotations, 1)  # magazine turned 2 slots before shooting on
-        self.assertEqual(h.flywheels, ["off", "on"])
+        self.assertEqual(h.flywheels, ["empty", "off", "on"])
         self.assertEqual(h.match.balls_remaining, 9)
         second = h.fire(30)
         self.assertEqual(second, ["H06"] * 3 + ["H09"] * 2 + ["H08"] * 2 + ["H07"] * 2)

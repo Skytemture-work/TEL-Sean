@@ -1404,7 +1404,8 @@ def _run_board_real(
         clock_origin=getattr(args, "match_clock_origin", None),
         start_reload_rotation=lambda: bool(launcher is not None and launcher.start_reload_rotation()),
         stop_flywheels=lambda: launcher.stop_flywheels() if launcher is not None else None,
-        start_flywheels=lambda: launcher.start_flywheels() if launcher is not None else None)
+        start_flywheels=lambda: launcher.start_flywheels() if launcher is not None else None,
+        on_magazine_empty=lambda: _on_magazine_empty())
         if args.match_fire else None)
 
     def begin_home():
@@ -1623,6 +1624,27 @@ def _run_board_real(
         reload_home_ok = False
         reload_home_since = 0.0
         RELOAD_HOME_TIMEOUT_S = 10.0
+
+        def _on_magazine_empty():
+            """Last ball of the magazine out: turret home + chassis back, now.
+
+            Called by the match before it waits for the flywheels to stop, so
+            the turret, the chassis, the pusher homing and the flywheel stop
+            all run at the same time.
+            """
+            nonlocal reload_home_pending, reload_home_ok, reload_home_since
+            reload_home_ok = False
+            try:
+                if not hasattr(motors, "request_home"):
+                    raise RuntimeError("此馬達後端不支援回 home")
+                motors.request_home()
+                reload_home_pending = True
+                reload_home_since = time.monotonic()
+                print("[Aim] 彈匣射完：砲台同時回 home（急停斷電時仰角不會掉）。", flush=True)
+            except (ValueError, RuntimeError) as exc:
+                print(f"[Aim] 砲台回 home 未執行（{exc}）：停在原位。", flush=True)
+            if event_callback is not None:
+                event_callback("RETURN_START")
         board_center_m =np.array([[BOARD_WIDTH_CM / 200.0, BOARD_HEIGHT_CM / 200.0, 0.0]])
 
         def _begin_reposition():
@@ -1928,22 +1950,6 @@ def _run_board_real(
                 forced_reload_confirm = False
                 if reload_was_waiting and not match.reload_wait and match.stopped is None:
                     _begin_reposition()  # no-op if the e-stop recovery already did it
-                if match.reload_wait and not reload_was_waiting:
-                    # The last ball of the magazine is out: the turret goes
-                    # home and (under main.py) the chassis drives back, while
-                    # the pusher homes and the flywheels spin down.
-                    reload_home_ok = False
-                    try:
-                        if not hasattr(motors, "request_home"):
-                            raise RuntimeError("此馬達後端不支援回 home")
-                        motors.request_home()
-                        reload_home_pending = True
-                        reload_home_since = time.monotonic()
-                        print("[Aim] 彈匣射完：砲台同時回 home（急停斷電時仰角不會掉）。", flush=True)
-                    except (ValueError, RuntimeError) as exc:
-                        print(f"[Aim] 砲台回 home 未執行（{exc}）：停在原位。", flush=True)
-                    if event_callback is not None:
-                        event_callback("RETURN_START")
                 if reload_home_pending:
                     home_state, home_message = motors.home_status()
                     if home_state == "arrived":
