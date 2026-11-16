@@ -16,9 +16,8 @@ from manual import (
 )
 
 
-STARTUP_MODE_TIMEOUT_S = 1.0
 AUTO_STATUS_INTERVAL_SECONDS = 1.0
-AUTO_TARGET_DISTANCE_M = 2.80
+AUTO_TARGET_DISTANCE_M = 2.60
 AUTO_FORWARD_VX = 40
 OCCLUSION_STRAFE_VY = 15
 MAX_STRAFE_SECONDS = 1.0
@@ -26,6 +25,10 @@ VISION_WAIT_SECONDS = 10.0
 # After a reload the robot sits in the start zone again; the remote's reload
 # confirmation is the departure.  Wait this long for a fresh vy first.
 REPOSITION_VY_WAIT_S = 3.0
+# Leaving auto needs M continuously for this long: one stray M packet (a
+# receiver glitch, the ESP32 rebooting after the e-stop) must not end the
+# match and throw away its state.
+MODE_TO_MANUAL_CONFIRM_S = 0.5
 NORMAL_STRAFE_DURATION_SCALE = 1.5
 OCCLUSION_BRAKE_SECONDS = 0.15
 
@@ -191,6 +194,23 @@ def send_aim_command(process, command):
         return False
 
 
+def prewarm_aim_process():
+    """Start the aim subprocess ahead of time (boot / back in manual).
+
+    It loads YOLO and opens both ZEDs, but touches no motor until
+    PREPARE_MOTORS.  Positioning inference stays off (VISION_OFF) until the
+    switch to auto sends VISION_ON, so manual mode does not load the GPU.
+    """
+    try:
+        process, vision_socket = start_aim_process()
+    except OSError as exc:
+        print(f"[Aim] 無法啟動預熱子程序：{exc}", flush=True)
+        return None, None
+    send_aim_command(process, "VISION_OFF")
+    print(f"[Aim] 開始背景預熱（PID={process.pid}，不碰馬達）", flush=True)
+    return process, vision_socket
+
+
 AIM_SHUTDOWN_TIMEOUT_S = 45.0  # pusher home + turret home (<= 20 s) + cameras
 
 
@@ -226,8 +246,12 @@ def main():
     # 手動模式控制器：接收遙控器封包，管理砲台指令、射擊與彈藥倉格位
     manual = None
     try:
-        current_mode = None
-        startup_mode_deadline = time.monotonic() + STARTUP_MODE_TIMEOUT_S
+        print("[System] 正在初始化手動控制器（DM / MKS CAN / VESC）", flush=True)
+        manual = ManualController(uart=uart)
+        print("[System] 手動控制器初始化完成", flush=True)
+
+        # 預設手動模式；收到 ESP32 封包後依封包中的 mode 切換
+        current_mode = "M"
         awaiting_phase = False
         aim_started = False
         aim_prepared = False
@@ -248,7 +272,11 @@ def main():
         aim_exit_reported = False
         repositioning = False
         reposition_release_at = 0.0
-        print("[System] 已啟動，等待 ESP32 第一筆有效封包...", flush=True)
+        manual_request_since = None
+        # Warm the aim subprocess up while still in manual mode, so the
+        # switch to auto finds the model loaded and both ZEDs open.
+        aim_process, vision_socket = prewarm_aim_process()
+        print("[System] 已啟動，預設手動模式，等待 ESP32 遙控器封包...")
 
         while True:
             if current_mode == "M" and manual is not None:
@@ -289,9 +317,19 @@ def main():
                 # )
                 new_mode = packet.get("mode", current_mode)
                 if new_mode not in ("M", "A"):
-                    new_mode = current_mode
+                    new_mode = current_mode  # 'X' = ESP32 has no remote signal
+                if current_mode == "A" and new_mode == "M":
+                    mode_now = time.monotonic()
+                    if manual_request_since is None:
+                        manual_request_since = mode_now
+                        print("[Mode Switch] 收到 M，持續 "
+                              f"{MODE_TO_MANUAL_CONFIRM_S:g} 秒才切回手動", flush=True)
+                    if mode_now - manual_request_since < MODE_TO_MANUAL_CONFIRM_S:
+                        new_mode = current_mode
+                else:
+                    manual_request_since = None
 
-                if new_mode != current_mode or (new_mode == "M" and manual is None):
+                if new_mode != current_mode:
                     print(
                         "\n[Mode Switch] 正在切換至：{}".format(
                             "自動模式" if new_mode == "A" else "手動模式"
@@ -327,23 +365,24 @@ def main():
                     brake_until = None
                     avoid_until = None
 
-                    if new_mode == "M" and manual is None:
-                        print("[System] 正在初始化手動控制器（DM / MKS CAN / VESC）", flush=True)
+                    # 手動切自動時，等待 ID1 回零及 DM 回位、失能完成。
+                    print("[Mode Switch] 等待手動控制器交接", flush=True)
+                    if manual is None:
                         manual = ManualController(uart=uart)
-                        print("[System] 手動控制器初始化完成", flush=True)
-                    if manual is not None:
-                        manual.on_mode_change(
-                            new_mode, fire=packet.get("fire", 0), reload=packet.get("reload")
-                        )
-
+                    manual.on_mode_change(
+                        new_mode, fire=packet.get("fire", 0), reload=packet.get("reload")
+                    )
+                    print("[Mode Switch] 手動控制器交接完成", flush=True)
                     if new_mode == "A":
                         uart.send_packet(
                             mode="A", vx=0, vy=0, wz=0, yaw=50, pitch=50, fire=0, speed=0
                         )
-                        try:
-                            aim_process, vision_socket = start_aim_process()
-                        except OSError as exc:
-                            print(f"[Aim] 無法啟動自動瞄準子程序：{exc}", flush=True)
+                        if aim_process is not None and aim_process.poll() is None:
+                            print(f"[Aim] 使用已預熱的子程序（PID={aim_process.pid}）", flush=True)
+                        else:
+                            if vision_socket is not None:
+                                vision_socket.close()
+                            aim_process, vision_socket = prewarm_aim_process()
                         aim_exit_reported = False
                         if aim_process is None:
                             auto_complete = True
@@ -357,6 +396,9 @@ def main():
                         next_auto_status_at = 0.0
                     current_mode = new_mode
                     print(f"[Mode Switch] 已切換至 {current_mode}", flush=True)
+                    if current_mode == "M" and aim_process is None:
+                        # Warm the next auto session up while driving manually.
+                        aim_process, vision_socket = prewarm_aim_process()
 
                 if current_mode == "M":
                     # 手動模式：使用遙控器 yaw/pitch 控制砲台方向，
@@ -366,10 +408,6 @@ def main():
                     continue
 
             else:
-                if current_mode is None and time.monotonic() >= startup_mode_deadline:
-                    current_mode = "M"
-                    print("[System] 等待 ESP32 逾時，預設 M；收到有效封包後才初始化機構。",
-                          flush=True)
                 uart.report_if_silent()
 
             # 自動瞄準子程序意外結束（例如機構故障）時，不要默默停在原地：

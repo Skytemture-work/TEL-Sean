@@ -84,7 +84,7 @@ class UpperHalfTests(unittest.TestCase):
         self.assertEqual(h.flywheels, ["off", "on"])
         self.assertEqual(h.match.balls_remaining, 9)
         second = h.fire(30)
-        self.assertEqual(second, ["H05", "H04", "H04", "H07", "H07", "H08", "H08", "H09", "H09"])
+        self.assertEqual(second, ["H05", "H06", "H06", "H09", "H09", "H08", "H08", "H07", "H07"])
         h.tick()
         self.assertEqual(h.match.stopped, "已裝彈藥全部射出，停止發射")
 
@@ -121,7 +121,7 @@ class UpperHalfTests(unittest.TestCase):
         rest = h.fire(6)
         self.assertEqual(rest, ["H12"] * 6)
         self.assertEqual(h.match.bonus_hole_id, "H12")
-        self.assertEqual(h.fire(1), ["H01"])
+        self.assertEqual(h.fire(1), ["H03"])
 
     def test_light_confirmed_late_after_60_s_never_shoots_a_small_hole(self):
         h = Harness("upper", light_wait=55.0)

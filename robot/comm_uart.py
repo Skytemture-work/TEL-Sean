@@ -63,7 +63,9 @@ class UARTController:
 
                 parts = line.split(',')
                 # ESP32 -> Xavier: E,MODE,VX,VY,WZ,YAW,PITCH,FIRE,SPEED,RELOAD[,AUTO_START]
-                if len(parts) not in (10, 11) or parts[0] != 'E' or parts[1] not in ('M', 'A'):
+                # MODE 'X' = the ESP32 has no remote signal (booting after an
+                # e-stop, link lost): a valid packet whose mode main.py ignores.
+                if len(parts) not in (10, 11) or parts[0] != 'E' or parts[1] not in ('M', 'A', 'X'):
                     print(
                         "[UART RX INVALID] expected E,MODE,VX,VY,WZ,YAW,PITCH,FIRE,SPEED,RELOAD[,AUTO_START]; got={!r}".format(line),
                         flush=True,

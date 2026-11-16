@@ -351,7 +351,9 @@ void loop() {
   int swD = safeRead(9);
 
   // 模式切換
-  currentMode = (swA == 1) ? 'A' : 'M';
+  // 遙控器失聯（開機尚未連上、急停復電、訊號中斷）時 safeRead 回 1500，
+  // SWA 會被誤判成 M。改送 'X'（未知），Xavier 會維持原模式，不會中斷比賽。
+  currentMode = ibusConnected ? ((swA == 1) ? 'A' : 'M') : 'X';
 
   // SW2：底盤 / 砲台控制
   bool isTurretControl = (swB > 1500);

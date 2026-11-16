@@ -52,6 +52,32 @@ class BoardPreviewTests(unittest.TestCase):
         self.assertIsNone(lost.plan)
         self.assertFalse(np.any(lost.render(frame)))
 
+    def test_extra_round_shape_on_the_board_is_dropped(self):
+        # 2026-11-16: a poster circle fell inside the board outline at the
+        # 2.8 m stop; 13 candidates left every hole unnamed and PnP invalid.
+        quad = np.asarray(((540, 280), (802, 281), (835, 600), (513, 601)), np.float32)
+        reference = build_plan_from_board_quad(quad, .2, .4)
+        frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+        holes = list(reference.targets)
+        cells = {t.hole_id: t for t in holes}
+        # Halfway between two columns and two rows: on the board, near no hole.
+        extra_u = (cells["H05"].u_px + cells["H08"].u_px) / 2
+        extra_v = (cells["H05"].v_px + cells["H06"].v_px) / 2
+        rows = [[t.u_px - t.width_px / 2, t.v_px - t.height_px / 2,
+                 t.u_px + t.width_px / 2, t.v_px + t.height_px / 2, .9, 0] for t in holes]
+        rows.append([extra_u - 14, extra_v - 14, extra_u + 14, extra_v + 14, .88, 0])
+        detected = Results(frame, path="test", names={0: "hole"}, boxes=torch.tensor(rows))
+
+        class Detector:
+            def predict(self, image, **kwargs):
+                return [detected]
+
+        result = BoardVision(Detector(), TurretConfig()).process(frame, now=0.0)
+        self.assertEqual(len(result.raw_targets), 13)
+        self.assertEqual(len(result.targets), 12)
+        self.assertFalse(any(abs(t.u_px - extra_u) < 5 and abs(t.v_px - extra_v) < 5
+                             for t in result.targets))
+
     def test_estimates_outline_from_observed_grid_with_missing_hole(self):
         corners = np.asarray(((540, 280), (802, 281), (835, 600), (513, 601)), np.float32)
         matrix = cv2.getPerspectiveTransform(np.asarray(((0, 0), (1, 0), (1, 1), (0, 1)), np.float32), corners)

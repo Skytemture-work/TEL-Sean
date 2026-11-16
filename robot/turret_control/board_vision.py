@@ -65,6 +65,38 @@ class BoardVisionResult:
         return display
 
 
+def _prune_to_expected_holes(targets, plan):
+    """Drop extra detections when more candidates than holes lie on the surface.
+
+    A round shape near the board (e.g. a poster circle on the wall behind it)
+    can fall inside the board outline; with 13 candidates no hole IDs are
+    assigned and PnP never becomes valid, so the turret never aims.  The
+    outline already predicts where the 12 holes are: keep, for each expected
+    hole, the nearest detection within half the smallest hole spacing, and
+    drop every detection that matches no hole.
+    """
+    expected = list(plan.targets)
+    if len(targets) <= len(expected) or len(expected) < 2:
+        return targets
+    points = np.asarray([(t.u_px, t.v_px) for t in expected], dtype=float)
+    spacing = np.linalg.norm(points[:, None, :] - points[None, :, :], axis=2)
+    np.fill_diagonal(spacing, np.inf)
+    tolerance = 0.5 * float(spacing.min())
+    pairs = sorted(
+        (float(np.hypot(c.u_px - e.u_px, c.v_px - e.v_px)), i, j)
+        for i, c in enumerate(targets) for j, e in enumerate(expected)
+    )
+    used_candidates, used_holes = set(), set()
+    for distance, i, j in pairs:
+        if distance > tolerance:
+            break
+        if i in used_candidates or j in used_holes:
+            continue
+        used_candidates.add(i)
+        used_holes.add(j)
+    return [t for i, t in enumerate(targets) if i in used_candidates]
+
+
 class BoardVision:
     """Run a detector and maintain the short-lived board geometry tracker."""
 
@@ -111,6 +143,8 @@ class BoardVision:
                 board_distance_m=distance, large_first=config.engage_large_first,
                 left_to_right=config.engage_left_to_right, bottom_to_top=config.engage_bottom_to_top)
             inferred = True
+            if plan is not None and len(targets) > len(plan):
+                targets = _prune_to_expected_holes(targets, plan)
         elif len(targets) == 12:
             if not self.virtual_board:
                 plan = build_plan(targets, config.focal_length_x_px, config.small_hole_diameter_m,
