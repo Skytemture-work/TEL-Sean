@@ -117,6 +117,8 @@ DEFAULT_LAUNCH_ANGLE_RATIO = 0.942
 # Pre-aim on release: H11 muzzle targets were 31.6-31.9 deg in the
 # 2026-11-16 runs (robot stopped ~5.2-5.5 m from the board).
 DEFAULT_PREAIM_PITCH_DEG = 31.7
+# Lower half starts on H01 (bottom of column 1): 12.7-13.5 deg on 2026-11-16.
+DEFAULT_PREAIM_LOWER_PITCH_DEG = 13.0
 
 
 def _parse_shot_order(text):
@@ -718,6 +720,10 @@ def _run_board_real(
         help=f"放行後（車還在跑）砲口先轉到的仰角，約為 H11（預設 {DEFAULT_PREAIM_PITCH_DEG}；0 = 不預瞄）",
     )
     parser.add_argument(
+        "--preaim-lower-pitch-deg", type=float, default=DEFAULT_PREAIM_LOWER_PITCH_DEG,
+        help=f"下半場預瞄仰角，約為 H01（預設 {DEFAULT_PREAIM_LOWER_PITCH_DEG}；0 = 不預瞄）",
+    )
+    parser.add_argument(
         "--preaim-yaw-deg", type=float, default=0.0,
         help="預瞄的水平角（度，相對中心；預設 0 = 正前方）",
     )
@@ -821,6 +827,9 @@ def _run_board_real(
     from .limits import PITCH_MAX_DEG, YAW_DESIGN_LIMIT_DEG
     if not math.isfinite(args.preaim_pitch_deg) or not 0.0 <= args.preaim_pitch_deg <= PITCH_MAX_DEG:
         parser.error(f"--preaim-pitch-deg 必須在 0～{PITCH_MAX_DEG:g} 度之間（0 = 不預瞄）")
+    if (not math.isfinite(args.preaim_lower_pitch_deg)
+            or not 0.0 <= args.preaim_lower_pitch_deg <= PITCH_MAX_DEG):
+        parser.error(f"--preaim-lower-pitch-deg 必須在 0～{PITCH_MAX_DEG:g} 度之間（0 = 不預瞄）")
     if not math.isfinite(args.preaim_yaw_deg) or abs(args.preaim_yaw_deg) > YAW_DESIGN_LIMIT_DEG:
         parser.error(f"--preaim-yaw-deg 必須在 ±{YAW_DESIGN_LIMIT_DEG:g} 度之內")
     if not math.isfinite(args.muzzle_speed) or not 10.0 <= args.muzzle_speed <= 60.0:
@@ -1072,6 +1081,32 @@ def _run_board_real(
         intrinsics = camera_matrix(config)
         distortion = distortion_coefficients(config)
 
+        preaim_phase = None  # "upper" / "lower" from main.py ("PHASE ..."), if known
+
+        def _send_preaim(phase):
+            """Turn toward the half's first target while the chassis drives.
+
+            Upper: H11 (top centre); lower: the grid starts at H01 (bottom of
+            column 1), so only the elevation is pre-set there (13 deg; H01
+            measured 12.7-13.5 deg) and the ~10 deg yaw is left for the stop.
+            """
+            lower = phase == "lower"
+            pitch_deg = args.preaim_lower_pitch_deg if lower else args.preaim_pitch_deg
+            if pitch_deg <= 0 or motors is None:
+                return
+            try:
+                motors.send_targets({
+                    0x03: (motors.yaw_calibration.motor_from_muzzle(
+                        math.radians(args.preaim_yaw_deg)), 0.0, 0.0, 0.0),
+                    0x01: (motors.pitch_calibration.motor_from_muzzle(
+                        math.radians(pitch_deg)), 0.0, 0.0, 0.0),
+                })
+                print(f"[Aim] 預瞄（{'下' if lower else '上'}半場）：砲口先轉到 yaw "
+                      f"{args.preaim_yaw_deg:+.1f}°、仰角 {pitch_deg:.1f}°"
+                      f"（約 {'H01' if lower else 'H11'}）", flush=True)
+            except (ValueError, RuntimeError) as exc:
+                print(f"[Aim] 預瞄未執行：{exc}", flush=True)
+
         def reset_positioning():
             nonlocal positioning_vision, positioning_pose, reference_plan
             positioning_vision = create_vision() if model_ready else None
@@ -1106,18 +1141,7 @@ def _run_board_real(
                 # first target (H11, top centre) now, so after the stop only a
                 # small correction is left.  Sent before the launcher init so the
                 # turret moves while the MKS / VESC start up.
-                if args.preaim_pitch_deg > 0:
-                    try:
-                        motors.send_targets({
-                            0x03: (motors.yaw_calibration.motor_from_muzzle(
-                                math.radians(args.preaim_yaw_deg)), 0.0, 0.0, 0.0),
-                            0x01: (motors.pitch_calibration.motor_from_muzzle(
-                                math.radians(args.preaim_pitch_deg)), 0.0, 0.0, 0.0),
-                        })
-                        print(f"[Aim] 預瞄：砲口先轉到 yaw {args.preaim_yaw_deg:+.1f}°、"
-                              f"仰角 {args.preaim_pitch_deg:.1f}°（約 H11）", flush=True)
-                    except (ValueError, RuntimeError) as exc:
-                        print(f"[Aim] 預瞄未執行：{exc}", flush=True)
+                _send_preaim(preaim_phase)
                 # Early exit (Ctrl+C / main.py stopping us before START): the
                 # same shutdown as after a match -- flywheels off and pusher
                 # home (launcher.close), then the turret home, then disable.
@@ -1127,6 +1151,11 @@ def _run_board_real(
                 startup_cleanup.callback(launcher.close, home_pusher=True)
                 print("[Aim] DM 已使能，飛輪預轉中，等待定位完成"
                       f"（子程序啟動後 {time.monotonic() - model_started_at:.1f} s）", flush=True)
+            elif command in ("PHASE upper", "PHASE lower"):
+                # main.py reads the half switch on release, before positioning.
+                preaim_phase = command.split()[1]
+                if launcher is not None:  # already pre-aimed for the other half
+                    _send_preaim(preaim_phase)
             elif command == "VISION_ON" and not positioning:
                 positioning = True
                 reset_positioning()

@@ -127,7 +127,7 @@ def read_commands():
         if command == "RELOAD":
             reload_event.set()
         elif command in ("PREPARE_MOTORS", "VISION_ON", "VISION_OFF", "START upper", "START lower",
-                         "POSITIONED"):
+                         "POSITIONED", "PHASE upper", "PHASE lower"):
             handoff.put(command)
     handoff.put(None)
 
@@ -485,6 +485,12 @@ def main():
                             if manual is not None:
                                 manual.close()
                                 manual = None
+                            # The half switch is already set on release: tell the aim
+                            # process now, so the turret pre-aims at the right first
+                            # hole (upper H11, lower H01) while the chassis drives.
+                            send_aim_command(
+                                aim_process,
+                                "PHASE lower" if packet.get("fire") == 1 else "PHASE upper")
                             aim_prepared = send_aim_command(aim_process, "PREPARE_MOTORS")
                             if aim_prepared:
                                 print("[Aim] SWA 已放行，背景準備 DM／VESC", flush=True)
