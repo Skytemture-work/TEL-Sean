@@ -5,6 +5,7 @@ from turret_control.official_board import hole_id_for_cell
 from turret_control.scoring_strategy import (
     LOWER_LINE_FIRST_IDS,
     UPPER_GRID_IDS,
+    UPPER_GRID_NO_BONUS_IDS,
     append_reallocated_grid_shots,
     build_max_score_strategy,
 )
@@ -35,16 +36,21 @@ def _board_plan() -> EngagementPlan:
 
 
 class ScoringStrategyTests(unittest.TestCase):
-    def test_upper_is_nine_bonus_then_serpentine_grid_pairs(self):
+    def test_upper_is_three_bonus_then_three_per_cell_and_two_in_the_last_column(self):
         strategy = build_max_score_strategy(_board_plan(), "H11", "upper")
 
         self.assertEqual(len(strategy.plan), 27)
-        self.assertEqual(strategy.hole_ids[:9], ("H11",) * 9)
-        # From the top bonus hole, column 1 down, centre up, right column down.
-        self.assertEqual(strategy.hole_ids[9:], (
-            "H03", "H03", "H02", "H02", "H01", "H01", "H04", "H04", "H05",
-            "H05", "H06", "H06", "H09", "H09", "H08", "H08", "H07", "H07"))
-        self.assertEqual(strategy.hole_ids[9:], UPPER_GRID_IDS)
+        self.assertEqual(strategy.bonus_balls, 3)
+        self.assertEqual(strategy.hole_ids[:3], ("H11",) * 3)
+        # From the top bonus hole, column 1 down, centre up, right column down;
+        # at most 3 balls per big hole, the last column gets 2 each.
+        self.assertEqual(strategy.hole_ids[3:], (
+            "H03", "H03", "H03", "H02", "H02", "H02", "H01", "H01", "H01",
+            "H04", "H04", "H04", "H05", "H05", "H05", "H06", "H06", "H06",
+            "H09", "H09", "H08", "H08", "H07", "H07"))
+        self.assertEqual(strategy.hole_ids[3:], UPPER_GRID_IDS)
+        # The first magazine (18) ends exactly after the third H05.
+        self.assertEqual(strategy.hole_ids[17:19], ("H05", "H06"))
 
     def test_lower_skips_bonus_and_shoots_each_cell_twice_in_serpentine(self):
         strategy = build_max_score_strategy(_board_plan(), "H12", "lower")
@@ -66,10 +72,10 @@ class ScoringStrategyTests(unittest.TestCase):
         strategy = build_max_score_strategy(board, "H10", "upper")
 
         replacements = append_reallocated_grid_shots(
-            strategy.plan, board, "upper", 9
+            strategy.plan, board, "upper", 3
         )
 
-        self.assertEqual(len(replacements), 9)
+        self.assertEqual(sorted(replacements), ["H07", "H08", "H09"])
         counts = {
             hole_id: sum(
                 target.hole_id == hole_id for target in strategy.plan.targets
@@ -92,9 +98,11 @@ class ScoringStrategyTests(unittest.TestCase):
 
 
 class NoLightTests(unittest.TestCase):
-    def test_upper_without_light_is_grid_only(self):
+    def test_upper_without_light_puts_all_27_balls_in_big_holes(self):
         strategy = build_max_score_strategy(_board_plan(), None, "upper")
-        self.assertEqual(strategy.hole_ids, UPPER_GRID_IDS)
+        self.assertEqual(strategy.hole_ids, UPPER_GRID_NO_BONUS_IDS)
+        self.assertEqual(len(strategy.plan), 27)
+        self.assertEqual(strategy.hole_ids[-9:], ("H09",) * 3 + ("H08",) * 3 + ("H07",) * 3)
         self.assertEqual(strategy.bonus_balls, 0)
 
     def test_lower_ignores_the_light(self):

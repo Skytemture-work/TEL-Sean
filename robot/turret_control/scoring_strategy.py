@@ -74,12 +74,14 @@ def _targets_by_id(plan: EngagementPlan) -> Dict[str, BoardTarget]:
     return result
 
 
-# Team decision (2026-11-14): upper half = 9 balls into the lit bonus hole
-# (only within the first 60 s, while the light is on; H11 when the light is not
-# confirmed in time), then the same serpentine grid pairs as the lower half.
-# The first magazine (18) runs out after H05 #1; the team reloads and the plan
-# continues.
-UPPER_BONUS_BALLS = 9
+# Team decision (2026-11-16, rule change): upper half = 3 balls into the lit
+# bonus hole (only within the first 60 s, while the light is on; H11 when the
+# light is not confirmed in time), then the big holes, at most 3 balls each:
+# three into each of the first six cells of the serpentine and two into each
+# of the last three (H09 H08 H07): 3 + 6 x 3 + 3 x 2 = 27.  The first magazine
+# (18) runs out exactly after the third H05; the team reloads and the plan
+# continues with H06.
+UPPER_BONUS_BALLS = 3
 UPPER_BONUS_WINDOW_S = 60.0
 UPPER_FALLBACK_BONUS_ID = "H11"
 # Team decision (2026-11-16): after the bonus balls the muzzle is at the top
@@ -90,8 +92,14 @@ UPPER_SERPENTINE_IDS: Tuple[str, ...] = (
     "H04", "H05", "H06",
     "H09", "H08", "H07",
 )
+UPPER_BALLS_PER_GRID_CELL: Tuple[int, ...] = (3, 3, 3, 3, 3, 3, 2, 2, 2)
 UPPER_GRID_IDS: Tuple[str, ...] = tuple(
-    hole_id for hole_id in UPPER_SERPENTINE_IDS for _ in range(2))
+    hole_id
+    for hole_id, balls in zip(UPPER_SERPENTINE_IDS, UPPER_BALLS_PER_GRID_CELL)
+    for _ in range(balls))
+# Bonus window already over: the 3 bonus balls fill the last cells to the cap.
+UPPER_GRID_NO_BONUS_IDS: Tuple[str, ...] = tuple(
+    hole_id for hole_id in UPPER_SERPENTINE_IDS for _ in range(3))
 
 
 def build_max_score_strategy(
@@ -103,7 +111,8 @@ def build_max_score_strategy(
 
     Upper half (27 balls, reload after 18): ``UPPER_BONUS_BALLS`` into the
     lit bonus hole, then ``UPPER_GRID_IDS``.  ``active_bonus_hole_id=None``
-    (no light seen within the bonus window) gives the grid part only.
+    (the bonus window is over) gives ``UPPER_GRID_NO_BONUS_IDS``: the bonus
+    balls go to the last cells of the serpentine, up to the 3-ball cap.
 
     Lower half: 18 balls, no bonus shots (team decision).  Two consecutive
     balls per grid cell, cells visited in ``LOWER_SERPENTINE_IDS`` order to
@@ -127,11 +136,13 @@ def build_max_score_strategy(
     if phase == UPPER_PHASE:
         bonus = UPPER_BONUS_BALLS if active_bonus_hole_id is not None else 0
         shots = ([by_id[active_bonus_hole_id]] * bonus if bonus else [])
-        shots += [by_id[hole_id] for hole_id in UPPER_GRID_IDS]
-        grid = len(UPPER_GRID_IDS)
+        grid_ids = UPPER_GRID_IDS if bonus else UPPER_GRID_NO_BONUS_IDS
+        shots += [by_id[hole_id] for hole_id in grid_ids]
+        plan = EngagementPlan(shots)
+        grid = len(grid_ids)
         return FiringStrategy(
             phase=phase,
-            plan=EngagementPlan(shots),
+            plan=plan,
             total_balls=bonus + grid,
             bonus_balls=bonus,
             grid_balls=grid,

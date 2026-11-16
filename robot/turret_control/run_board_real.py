@@ -72,6 +72,7 @@ from .match_sequencer import MatchSequencer
 from .scoring_light import ScoreRoundController, draw_score_light_overlay
 from .scoring_strategy import (
     MATCH_PHASES,
+    UPPER_BONUS_BALLS,
     append_reallocated_grid_shots,
     build_max_score_strategy,
 )
@@ -97,6 +98,11 @@ def _fire_tolerance_map(large_deg, small_deg):
 
 
 _MAX_PITCH_TRIM_DEG = 3.0
+# 2026-11-16 (robot ~5.4 m from the board, 35 m/s model): H06 landed 15 cm
+# high on average over 10 shots; -1.5 deg on H06, H08, H01 and H11 was much
+# more accurate, so every hole starts from it.  --pitch-trim-all changes it,
+# --pitch-trim HOLE=DEG replaces it for one hole.
+DEFAULT_PITCH_TRIM_ALL_DEG = -1.5
 
 
 # Ballistic model measured on 2026-11-13 (board 1:1, pitch axis 5.49 m from the
@@ -186,6 +192,13 @@ def _shot_record(shot, shot_no, previous_started_at, command, config, *, pitch_t
                                   if command.pitch_axis_distance_m is not None else None),
         "board_lean_deg": round(lean_deg, 2) if lean_deg is not None else None,
     }
+
+
+def _with_default_pitch_trim(all_deg, per_hole):
+    """Every hole gets ``all_deg``; a hole given in ``per_hole`` replaces it."""
+    if not all_deg:
+        return dict(per_hole)
+    return {**{f"H{n:02d}": all_deg for n in range(1, 13)}, **per_hole}
 
 
 def _parse_pitch_trims(items):
@@ -701,7 +714,13 @@ def _run_board_real(
         default=[],
         metavar="HOLE=DEG",
         help="依孔位微調仰角（度，正值 = 砲口抬高），可重複指定，例如 "
-             "--pitch-trim H10=0.8 --pitch-trim H11=0.8；微調後仍經過限位與工作空間檢查",
+             "--pitch-trim H10=0.8 --pitch-trim H11=0.8；指定的孔取代 --pitch-trim-all 的值"
+             "（不是相加）；微調後仍經過限位與工作空間檢查",
+    )
+    parser.add_argument(
+        "--pitch-trim-all", type=float, default=DEFAULT_PITCH_TRIM_ALL_DEG, metavar="DEG",
+        help=f"所有孔的預設仰角微調（度，正值 = 砲口抬高；預設 {DEFAULT_PITCH_TRIM_ALL_DEG:g}，"
+             f"2026-11-16 實測；0 = 不微調；範圍 ±{_MAX_PITCH_TRIM_DEG:g}）",
     )
     parser.add_argument(
         "--shot-order", default=None, metavar="H07,H08,...",
@@ -817,6 +836,9 @@ def _run_board_real(
         pitch_trim_deg = _parse_pitch_trims(args.pitch_trim)
     except ValueError as exc:
         parser.error(str(exc))
+    if not math.isfinite(args.pitch_trim_all) or abs(args.pitch_trim_all) > _MAX_PITCH_TRIM_DEG:
+        parser.error(f"--pitch-trim-all 必須在 ±{_MAX_PITCH_TRIM_DEG:g} 度內")
+    pitch_trim_deg = _with_default_pitch_trim(args.pitch_trim_all, pitch_trim_deg)
     try:
         shot_order = _parse_shot_order(args.shot_order)
     except ValueError as exc:
@@ -1255,8 +1277,8 @@ def _run_board_real(
     if args.match_fire:
         print(
             f"比賽全自動模式（{args.match_phase}）：辨識到靶板即開賽並開始射擊"
-            + (f"，先射亮燈加分孔 9 顆（{args.light_wait:g} 秒內未確認亮燈先射 H11；限開賽後 60 秒內），"
-               "再照蛇形順序射九宮格，射完 18 顆後等待裝填" if args.match_phase == "upper"
+            + (f"，先射亮燈加分孔 {UPPER_BONUS_BALLS} 顆（{args.light_wait:g} 秒內未確認亮燈先射 H11；"
+               "限開賽後 60 秒內），再照蛇形順序射九宮格（每個大孔最多 3 顆），射完 18 顆後等待裝填" if args.match_phase == "upper"
                else "，不射加分孔")
             + f"；已裝 {args.balls_loaded} 顆，時限 {args.match_duration:g} 秒"
             + ("（自 VRA 發車起算）" if getattr(args, "match_clock_origin", None) is not None

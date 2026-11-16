@@ -626,14 +626,14 @@ class PusherSpeedTests(unittest.TestCase):
         controller._push_position = 2675  # after ball 2 and its 25 % back-off
         with patch.object(manual.time, 'sleep'):
             controller._run_one_shot_cycle()
-        fast = manual.PUSH_FAST_FRACTION
-        # Fast push most of the way, slow current-sensed push to the end; fast
-        # back most of the way, slow current-sensed home.
+        fast_out = manual.PUSH_FAST_OUT_FRACTION
+        fast_back = manual.PUSH_FAST_BACK_FRACTION
+        self.assertEqual(fast_out, 0.0)  # 200 RPM push-out stalled on the robot
+        # Slow current-sensed push to the end; fast back most of the way, slow
+        # current-sensed home.
         self.assertEqual(calls, [
-            ('move', manual.MOVE_DIRECTION, int((manual.PUSH_END_POSITION_PULSES - 2675) * fast),
-             controller.shooting_speed_rpm),
             ('home', manual.MOVE_DIRECTION, manual.PUSH_END_SPEED_RPM),
-            ('move', manual.HOME_DIRECTION, int(manual.PUSH_END_POSITION_PULSES * fast),
+            ('move', manual.HOME_DIRECTION, int(manual.PUSH_END_POSITION_PULSES * fast_back),
              controller.shooting_speed_rpm),
             ('home', manual.HOME_DIRECTION, None),
         ])

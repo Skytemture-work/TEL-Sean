@@ -7,7 +7,8 @@ from turret_control.board import BoardTarget, EngagementPlan
 from turret_control.competition_geometry import with_competition_geometry
 from turret_control.config import TurretConfig, with_recorded_mechanism_geometry
 from turret_control.engagement import BoardEngagement
-from turret_control.run_board_real import _parse_pitch_trims
+from turret_control.run_board_real import (
+    DEFAULT_PITCH_TRIM_ALL_DEG, _parse_pitch_trims, _with_default_pitch_trim)
 
 
 def _field_config():
@@ -74,6 +75,15 @@ class ParsePitchTrimTests(unittest.TestCase):
         self.assertEqual(_parse_pitch_trims(["H10=0.8", "h11=+1", "H3=-0.5"]),
                          {"H10": 0.8, "H11": 1.0, "H03": -0.5})
         self.assertEqual(_parse_pitch_trims([]), {})
+
+    def test_default_trim_covers_every_hole_and_a_hole_trim_replaces_it(self):
+        self.assertEqual(DEFAULT_PITCH_TRIM_ALL_DEG, -1.5)
+        trims = _with_default_pitch_trim(-1.5, {"H06": -1.2})
+        self.assertEqual(len(trims), 12)
+        self.assertEqual(trims["H06"], -1.2)
+        self.assertEqual(trims["H01"], -1.5)
+        self.assertEqual(trims["H12"], -1.5)
+        self.assertEqual(_with_default_pitch_trim(0.0, {"H10": 0.8}), {"H10": 0.8})
 
     def test_rejects_bad_input(self):
         for bad in (["H10"], ["H13=1"], ["X1=1"], ["H10=abc"], ["H10=nan"],

@@ -2,7 +2,7 @@ import unittest
 
 from test_scoring_strategy import _board_plan
 from turret_control.match_sequencer import MatchSequencer
-from turret_control.scoring_strategy import UPPER_GRID_IDS
+from turret_control.scoring_strategy import UPPER_GRID_IDS, UPPER_GRID_NO_BONUS_IDS
 
 
 class Harness:
@@ -69,8 +69,8 @@ class UpperHalfTests(unittest.TestCase):
         self.assertEqual(len(h.match.plan), 0)  # hold still until the light is found
         h.tick(lit="H11")
         first = h.fire(30)
-        self.assertEqual(first, ["H11"] * 9 + ["H03", "H03", "H02", "H02", "H01", "H01",
-                                              "H04", "H04", "H05"])
+        self.assertEqual(first, ["H11"] * 3 + ["H03"] * 3 + ["H02"] * 3 + ["H01"] * 3
+                         + ["H04"] * 3 + ["H05"] * 3)
         h.tick()
         self.assertTrue(h.match.reload_wait)
         self.assertEqual(h.match.reload_balls, 9)
@@ -86,7 +86,7 @@ class UpperHalfTests(unittest.TestCase):
         self.assertEqual(h.flywheels, ["off", "on"])
         self.assertEqual(h.match.balls_remaining, 9)
         second = h.fire(30)
-        self.assertEqual(second, ["H05", "H06", "H06", "H09", "H09", "H08", "H08", "H07", "H07"])
+        self.assertEqual(second, ["H06"] * 3 + ["H09"] * 2 + ["H08"] * 2 + ["H07"] * 2)
         h.tick()
         self.assertEqual(h.match.stopped, "已裝彈藥全部射出，停止發射")
 
@@ -94,18 +94,22 @@ class UpperHalfTests(unittest.TestCase):
         h = Harness("upper")
         h.tick()
         h.tick(lit="H10")
-        self.assertEqual(h.fire(4), ["H10"] * 4)
+        self.assertEqual(h.fire(2), ["H10"] * 2)
         h.now = 60.0
         h.tick(idle=False)  # a stage is running: wait for it
         self.assertEqual(h.match.plan.current().hole_id, "H10")
         h.tick()
         rest = h.fire(30)
         self.assertNotIn("H10", rest)
-        self.assertEqual(rest[:14], list(UPPER_GRID_IDS[:14]))
-        # The 5 skipped balls are still in the magazine and go to the grid later.
-        total = ["H10"] * 4 + rest
-        self.assertEqual(len(total), 18)
-        self.assertTrue(any("略過 5 顆小孔" in line for line in h.logs))
+        self.assertEqual(rest, list(UPPER_GRID_IDS[:16]))
+        self.assertEqual(len(["H10"] * 2 + rest), 18)
+        # The skipped ball is still in the magazine: a big hole below the cap.
+        self.assertTrue(any("略過 1 顆小孔" in line for line in h.logs))
+        h.tick(reload=True)
+        second = h.fire(30)
+        self.assertEqual(len(second), 9)
+        self.assertEqual(second[:8], list(UPPER_GRID_IDS[16:]))
+        self.assertIn(second[8], ("H07", "H08", "H09"))
 
     def test_no_light_in_time_starts_on_h11_then_follows_the_real_light(self):
         h = Harness("upper", light_wait=5.0)
@@ -116,12 +120,12 @@ class UpperHalfTests(unittest.TestCase):
         h.now = 5.0
         h.tick()
         self.assertEqual(h.match.bonus_hole_id, "H11")
-        self.assertEqual(h.fire(3), ["H11"] * 3)
+        self.assertEqual(h.fire(1), ["H11"])
         h.tick(lit="H12", idle=False)   # wait for the running stage
         self.assertEqual(h.match.plan.current().hole_id, "H11")
         h.tick(lit="H12")
-        rest = h.fire(6)
-        self.assertEqual(rest, ["H12"] * 6)
+        rest = h.fire(2)
+        self.assertEqual(rest, ["H12"] * 2)
         self.assertEqual(h.match.bonus_hole_id, "H12")
         self.assertEqual(h.fire(1), ["H03"])
 
@@ -133,7 +137,7 @@ class UpperHalfTests(unittest.TestCase):
         self.assertEqual(h.match.plan.current().hole_id, "H11")
         h.tick(lit="H10")               # light confirmed before the first push
         self.assertEqual(h.match.bonus_hole_id, "H10")
-        self.assertEqual(h.fire(9), ["H10"] * 9)
+        self.assertEqual(h.fire(3), ["H10"] * 3)
         self.assertEqual(h.fire(1), ["H03"])
 
     def test_light_confirmed_late_after_60_s_never_shoots_a_small_hole(self):
@@ -143,7 +147,10 @@ class UpperHalfTests(unittest.TestCase):
         h.tick(lit="H12")
         self.assertFalse(h.match.waiting_light)
         self.assertIsNone(h.match.bonus_hole_id)
-        self.assertEqual(h.fire(18), list(UPPER_GRID_IDS[:18]))
+        self.assertEqual(h.fire(18), list(UPPER_GRID_NO_BONUS_IDS[:18]))
+        h.tick(reload=True)
+        # All 27 balls go to big holes, three each.
+        self.assertEqual(h.fire(30), list(UPPER_GRID_NO_BONUS_IDS[18:]))
 
     def test_reload_rotation_refused_keeps_waiting(self):
         h = Harness("lower", balls=4, rotation_ok=False)
@@ -208,12 +215,12 @@ class DepartureClockTests(unittest.TestCase):
         h = Harness("upper", duration=180.0, clock_origin=-30.0)
         h.tick()
         h.tick(lit="H10")
-        self.assertEqual(h.fire(4), ["H10"] * 4)
+        self.assertEqual(h.fire(2), ["H10"] * 2)
         h.now = 30.0  # 60 s after the departure
         h.tick()
         rest = h.fire(30)
         self.assertNotIn("H10", rest)
-        self.assertTrue(any("略過 5 顆小孔" in line for line in h.logs))
+        self.assertTrue(any("略過 1 顆小孔" in line for line in h.logs))
 
     def test_light_wait_still_counts_from_the_first_shot_chance(self):
         h = Harness("upper", duration=180.0, light_wait=5.0, clock_origin=-30.0)

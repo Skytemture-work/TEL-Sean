@@ -159,11 +159,13 @@ PUSH_RETRACT_FRACTION = 0.25
 # 第 3 段：推到底的終點位置（pulses，從原點起算）。2026-11-16 實測每次推到底
 # Encoder 位移 54774±3（20.48 counts/pulse）= 2675 pulses，起點 2675 → 終點 5350。
 PUSH_END_POSITION_PULSES = 5350
-# 推到底與回原點的前段改用推球速度（200 RPM）快走這個比例，最後一段才用
-# 40 RPM 無限位（電流判斷到底／原點），安全確認不變。原本全程 40 RPM，第 3 段
-# 約 5.6 s。第 3 顆球約在 4300 pulses 推出，仍在快段（與第 1、2 顆同速）。
-# 0 = 關閉，恢復全程 40 RPM。
-PUSH_FAST_FRACTION = 0.75
+# 第 3 段推到底：前段用推球速度（200 RPM）快推的比例，最後一段才用 40 RPM
+# 無限位（電流判斷到底）。0 = 全程 40 RPM。
+# 2026-11-16 19:25 實車：快推 2006 pulses 只走了約 1744 就被擋住（堵轉保護），
+# 之後回零 30 s 無回覆而停機；全程 40 RPM 當天 7 次都成功，所以先關閉。
+PUSH_FAST_OUT_FRACTION = 0.0
+# 推到底後回原點：前段用 200 RPM 快退的比例（無負載），最後一段 40 RPM 無限位回零。
+PUSH_FAST_BACK_FRACTION = 0.75
 SLOTS_PER_MAGAZINE = 6
 
 MOVE_TIMEOUT = 30.0
@@ -1765,7 +1767,7 @@ class ManualController:
                 start = getattr(self, "_push_position", None)
                 if start is None:
                     start = TARGET_POSITIONS[1]
-                fast_out = int((PUSH_END_POSITION_PULSES - start) * PUSH_FAST_FRACTION)
+                fast_out = int((PUSH_END_POSITION_PULSES - start) * PUSH_FAST_OUT_FRACTION)
                 if fast_out > 0:
                     print("[Manual] 第三階段快推 {} pulses（{} RPM），再慢推到底。".format(
                         fast_out, self.shooting_speed_rpm), flush=True)
@@ -1782,7 +1784,7 @@ class ManualController:
                 # waits for this stage (controller busy) to finish.
                 self._mark_shot_released()
                 time.sleep(SETTLE_TIME)
-                fast_back = int(PUSH_END_POSITION_PULSES * PUSH_FAST_FRACTION)
+                fast_back = int(PUSH_END_POSITION_PULSES * PUSH_FAST_BACK_FRACTION)
                 if fast_back > 0:
                     print("[Manual] 快退 {} pulses（{} RPM），再慢速回原點。".format(
                         fast_back, self.shooting_speed_rpm), flush=True)
