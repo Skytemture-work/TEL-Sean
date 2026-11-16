@@ -1617,6 +1617,12 @@ def _run_board_real(
         reposition_vision = False
         reload_was_waiting = False
         reload_estop_ready = False
+        # The turret goes home during the reload: an e-stop there leaves the
+        # pitch in place (it may drop at a low elevation, the axis has no brake).
+        reload_home_pending = False
+        reload_home_ok = False
+        reload_home_since = 0.0
+        RELOAD_HOME_TIMEOUT_S = 10.0
         board_center_m =np.array([[BOARD_WIDTH_CM / 200.0, BOARD_HEIGHT_CM / 200.0, 0.0]])
 
         def _begin_reposition():
@@ -1922,20 +1928,55 @@ def _run_board_real(
                 forced_reload_confirm = False
                 if reload_was_waiting and not match.reload_wait and match.stopped is None:
                     _begin_reposition()  # no-op if the e-stop recovery already did it
-                if (match.reload_wait and not reload_estop_ready
+                if match.reload_wait and not reload_was_waiting:
+                    # The last ball of the magazine is out: the turret goes
+                    # home and (under main.py) the chassis drives back, while
+                    # the pusher homes and the flywheels spin down.
+                    reload_home_ok = False
+                    try:
+                        if not hasattr(motors, "request_home"):
+                            raise RuntimeError("此馬達後端不支援回 home")
+                        motors.request_home()
+                        reload_home_pending = True
+                        reload_home_since = time.monotonic()
+                        print("[Aim] 彈匣射完：砲台同時回 home（急停斷電時仰角不會掉）。", flush=True)
+                    except (ValueError, RuntimeError) as exc:
+                        print(f"[Aim] 砲台回 home 未執行（{exc}）：停在原位。", flush=True)
+                    if event_callback is not None:
+                        event_callback("RETURN_START")
+                if reload_home_pending:
+                    home_state, home_message = motors.home_status()
+                    if home_state == "arrived":
+                        reload_home_pending = False
+                        reload_home_ok = True
+                        print("[Aim] 砲台已回 home。", flush=True)
+                    elif home_state == "error":
+                        reload_home_pending = False
+                        print(f"[Aim] 砲台回 home 失敗（{home_message}）：停在原位。", flush=True)
+                    elif time.monotonic() - reload_home_since > RELOAD_HOME_TIMEOUT_S:
+                        reload_home_pending = False
+                        print(f"[Aim] 砲台 {RELOAD_HOME_TIMEOUT_S:g} 秒內未確認回到 home。", flush=True)
+                if (match.reload_wait and not reload_estop_ready and not reload_home_pending
                         and not (launcher is not None and launcher.mechanism_busy)):
                     # The flywheels already stopped inside match.step and the
                     # pusher / magazine are at rest: only now is an e-stop safe
                     # (a magazine stopped between two slots would be lost).
                     reload_estop_ready = True
-                    print("[Aim] 可以按急停：飛輪已停，推球與彈藥倉已停妥；拉回出發區裝填後，"
-                          "按遙控器 RELOAD 出發。", flush=True)
+                    if event_callback is not None:
+                        # main.py now drives the chassis back to the start zone.
+                        print("[Aim] 飛輪已停，推球與彈藥倉已停妥，" + ("砲台在 home" if reload_home_ok else "砲台未回 home") + "；底盤自動退回出發區，"
+                              "看到 [Return] 已退回出發區 後再按急停裝填，裝填好按遙控器 RELOAD 出發。",
+                              flush=True)
+                    else:
+                        print("[Aim] 可以按急停：飛輪已停，推球與彈藥倉已停妥，" + ("砲台在 home" if reload_home_ok else "砲台未回 home") + "；拉回出發區裝填後，"
+                              "按遙控器 RELOAD 出發。", flush=True)
                     if event_callback is not None:
                         # From the reload until this program ends main.py keeps
                         # auto mode (the e-stop reboots the ESP32, which may say M).
                         event_callback("RELOAD_WAIT")
                 if not match.reload_wait:
                     reload_estop_ready = False
+                    reload_home_pending = False
                 reload_was_waiting = match.reload_wait
                 plan = match.plan if match.plan is not None else plan
                 if match.bonus_hole_id is not None:

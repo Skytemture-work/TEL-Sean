@@ -41,6 +41,16 @@ MODE_LOCK_ESCAPE_S = 3.0
 # are placeholders (reload reads 0) that must never count as a switch edge.
 RELOAD_MODE_MASK_S = 10.0
 NORMAL_STRAFE_DURATION_SCALE = 1.5
+# Upper half: after the first magazine (RELOAD_WAIT) drive back to the start
+# zone by replaying the departure's chassis commands backwards (open loop).
+RETURN_TO_START_ENABLED = True
+# The ESP32 reports every ~20 ms.  Silence this long, or any packet that is not
+# mode A (the e-stop reboots it: silence, then 'X'), aborts the return so the
+# chassis never resumes driving after the power comes back.
+RETURN_PACKET_TIMEOUT_S = 0.3
+# The ESP32 stops the chassis 500 ms after the last command: a longer gap in
+# the recording did not move the robot any further.
+ESP32_COMMAND_TIMEOUT_S = 0.5
 OCCLUSION_BRAKE_SECONDS = 0.15
 
 
@@ -189,6 +199,26 @@ def read_positioning_vy(vision_socket, valid_after, latest, events=None):
     return None
 
 
+def build_return_path(samples, max_gap_s=ESP32_COMMAND_TIMEOUT_S):
+    """Reverse a departure recording into return segments.
+
+    ``samples`` are ``(time, vx, vy, wz)`` as sent to the ESP32, in order.
+    Each command lasted until the next sample (at most ``max_gap_s``).  Equal
+    neighbours merge, stops are dropped, and the result runs backwards with
+    every component negated: ``[(duration_s, vx, vy, wz), ...]``.
+    """
+    segments = []
+    for (t0, vx, vy, wz), (t1, *_rest) in zip(samples, samples[1:]):
+        duration = min(max(0.0, t1 - t0), max_gap_s)
+        if duration <= 0.0 or (vx, vy, wz) == (0, 0, 0):
+            continue
+        if segments and segments[-1][1:] == (vx, vy, wz):
+            segments[-1] = (segments[-1][0] + duration, vx, vy, wz)
+        else:
+            segments.append((duration, vx, vy, wz))
+    return [(duration, -vx, -vy, -wz) for duration, vx, vy, wz in reversed(segments)]
+
+
 def send_aim_command(process, command):
     if process is None:
         return False
@@ -267,12 +297,21 @@ def main():
         mode_mask_until = 0.0
         release_phase = None  # half switch latched at the VRA release
         depart_at = None  # time.monotonic() of the VRA release: the match clock
+        drive_log = []  # departure commands (time, vx, vy, wz) for the return
+        return_path = None  # active return: [(duration, vx, vy, wz), ...]
+        return_requested = False  # the return runs once per match
+        return_arrived = False
+        return_started_at = 0.0
+        last_a_packet_at = 0.0
         print("[System] 已啟動，等待 ESP32 第一筆有效封包...", flush=True)
 
         while True:
             if current_mode == "M" and manual is not None:
                 manual.check_health()
             packet = uart.read_esp32_packet()
+            raw_packet_mode = packet.get("mode") if packet is not None else None
+            if raw_packet_mode == "A":
+                last_a_packet_at = time.monotonic()
 
             if (packet is not None and current_mode == "A"
                     and time.monotonic() < mode_mask_until
@@ -357,6 +396,10 @@ def main():
                     mode_mask_until = 0.0
                     release_phase = None
                     depart_at = None
+                    drive_log = []
+                    return_path = None
+                    return_requested = False
+                    return_arrived = False
                     locked_vy = None
                     latest_vy = None
                     vision_valid_after = time.monotonic()
@@ -451,7 +494,29 @@ def main():
                         # the ESP32 reboots, both edges would be missed.
                         print("[Aim] RELOAD 開關目前在 1：請先撥回 0，裝填好再撥到 1 出發",
                               flush=True)
+                    if return_arrived:
+                        print("[Return] 機構已停妥且車已在出發區：可以按急停裝填", flush=True)
+                if (("RETURN_START" in aim_events or "RELOAD_WAIT" in aim_events)
+                        and not return_requested):
+                    # The last ball is out: drive back while the pusher homes
+                    # and the flywheels stop.
+                    return_requested = True
+                    path = build_return_path(drive_log) if RETURN_TO_START_ENABLED else []
+                    if path:
+                        return_path = path
+                        return_started_at = time.monotonic()
+                        print(f"[Return] 依發車軌跡反向退回出發區（開環，{len(path)} 段，約 "
+                              f"{sum(seg[0] for seg in path):.1f} 秒），推球回原點與飛輪停轉同時進行；"
+                              "到達前請勿靠近車子。按急停、VRA 關閉或 ESP32 中斷都會立即停止回程。",
+                              flush=True)
+                    else:
+                        print("[Return] 沒有可用的發車軌跡，請人工把車移回出發區裝填", flush=True)
                 if "REPOSITION" in aim_events:
+                    if return_path is not None:
+                        return_path = None
+                        uart.send_packet(mode="A", vx=0, vy=0, wz=0, yaw=50, pitch=50,
+                                         fire=0, speed=0)
+                        print("[Return] 已確認裝填：結束回程", flush=True)
                     # Reload done in the start zone: the reload confirmation is
                     # the departure.  Same positioning as at the match start.
                     repositioning = True
@@ -582,6 +647,40 @@ def main():
                             print("[Aim] 已轉送遙控器裝填確認", flush=True)
                     last_auto_reload = reload_value
 
+            if current_mode == "A" and return_path is not None:
+                now = time.monotonic()
+                abort = None
+                if raw_packet_mode is not None and raw_packet_mode != "A":
+                    abort = f"ESP32 回報模式 {raw_packet_mode!r}（急停或重啟）"
+                elif packet is not None and packet.get("auto_start") == 0:
+                    abort = "VRA 已關閉"
+                elif now - last_a_packet_at > RETURN_PACKET_TIMEOUT_S:
+                    abort = "ESP32 沒有回應（可能已按急停）"
+                elapsed = now - return_started_at
+                command = None
+                for duration, seg_vx, seg_vy, seg_wz in return_path:
+                    if elapsed < duration:
+                        command = (seg_vx, seg_vy, seg_wz)
+                        break
+                    elapsed -= duration
+                if abort is not None or command is None:
+                    return_path = None
+                    uart.send_packet(mode="A", vx=0, vy=0, wz=0, yaw=50, pitch=50,
+                                     fire=0, speed=0)
+                    if abort is not None:
+                        print(f"[Return] 中止回程：{abort}；底盤停止，請人工移回出發區"
+                              + ("" if mode_locked else "；推球回原點、飛輪停轉可能還沒完成，"
+                                 "等 [Aim] 機構停妥後再按急停"), flush=True)
+                    else:
+                        return_arrived = True
+                        print("[Return] 已退回出發區（開環，位置可能有誤差）："
+                              + ("可以按急停裝填" if mode_locked
+                                 else "等 [Aim] 機構停妥（飛輪停、推球回原點）後再按急停"),
+                              flush=True)
+                else:
+                    uart.send_packet(mode="A", vx=command[0], vy=command[1], wz=command[2],
+                                     yaw=50, pitch=50, fire=0, speed=0)
+
             if current_mode == "A" and not auto_complete:
                 # 自動模式維持原有視覺追蹤 + LiDAR 避障流程
                 now = time.monotonic()
@@ -700,6 +799,10 @@ def main():
                     fire=fire_cmd,
                     speed=fire_speed,
                 )
+                if not repositioning:
+                    # The match departure (not the re-departure after the
+                    # reload): replayed backwards to return for the reload.
+                    drive_log.append((now, tx_vx, tx_vy, final_wz))
 
                 if auto_complete:
                     lidar.stop()
