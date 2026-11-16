@@ -200,6 +200,11 @@ ENCODER_READ_ATTEMPTS = 3
 ENCODER_READ_RETRY_DELAY = 0.05
 ENCODER_READ_TIMEOUT_S = 0.3   # 單次 Encoder 讀取等待（正常回覆約 2 ms）
 SETTLE_TIME = 0.2
+# 推桿 ID1 一般相對移動（推出／退回）的停止確認：輪詢間隔與需連續停止的時間。
+# 原本與 POLL_INTERVAL / SETTLE_TIME 相同（0.1 / 0.2 s），每段移動約多 0.15 s。
+# 回零後的停穩確認（轉格前安全檢查）不受影響。
+SHOOT_MOVE_POLL_S = 0.05
+SHOOT_MOVE_SETTLE_S = 0.1
 # 回零後與轉格前的位置穩定容許值；單位為編碼器 counts，不是命令 pulses。
 SHOOT_HOME_TOLERANCE_COUNTS = 20
 
@@ -2080,6 +2085,9 @@ class ManualController:
         seen_running = False
         movement_seen = False
         stopped_at = None
+        is_pusher = servo is self.shoot_servo
+        poll_s = SHOOT_MOVE_POLL_S if is_pusher else POLL_INTERVAL
+        settle_s = SHOOT_MOVE_SETTLE_S if is_pusher else SETTLE_TIME
 
         while True:
             elapsed = time.monotonic() - start
@@ -2098,12 +2106,12 @@ class ManualController:
             elif seen_running or movement_seen:
                 if stopped_at is None:
                     stopped_at = time.monotonic()
-                elif time.monotonic() - stopped_at >= SETTLE_TIME:
+                elif time.monotonic() - stopped_at >= settle_s:
                     break
             elif elapsed > 2.0:
                 raise RuntimeError("馬達未偵測到移動")
 
-            time.sleep(POLL_INTERVAL)
+            time.sleep(poll_s)
 
         after = self._read_encoder(servo)
         if after is None:

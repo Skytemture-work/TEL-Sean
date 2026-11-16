@@ -361,8 +361,13 @@ class AutoFireTrigger:
         self._since = None
         self.state = state
 
-    def take(self, plan, plan_revision, ready):
-        """Return a click tuple once ready has held for ``settle_s``, else None."""
+    def take(self, plan, plan_revision, ready, can_fire=True):
+        """Return a click tuple once ready has held for ``settle_s``, else None.
+
+        ``ready`` is the aim (it starts and keeps the settle timer);
+        ``can_fire`` is the mechanism (it only gates the click), so the settle
+        time runs while the pusher is still finishing the previous stage.
+        """
         target = plan.current() if plan is not None else None
         if target is None:
             self._reset("沒有待射孔位")
@@ -378,6 +383,9 @@ class AutoFireTrigger:
         settle = self.settle_s if self._next_settle_s is None else self._next_settle_s
         if held < settle:
             self.state = f"{target.hole_id} 瞄準穩定中 {held:.1f}/{settle:.1f} s"
+            return None
+        if not can_fire:
+            self.state = f"{target.hole_id} 已瞄準穩定，等待推球機構"
             return None
         self.state = f"{target.hole_id} 自動發射"
         # Fire once per settled hole; a new click needs a fresh settle period.

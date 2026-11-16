@@ -532,13 +532,11 @@ class AutoFireTests(unittest.TestCase):
         fired = [self.tick().fired for _ in range(3)]
         self.assertIn(True, fired)
         self.assertEqual(self.plan.index, 1)
-        # Next hole: a fresh settle period is required before the next request.
-        self.now += 1.1
-        for _ in range(3):
-            self.tick()
+        # Next hole: the settle already ran while the cooldown / pusher were
+        # finishing (aim held ready), so the request follows right after.
         self.assertEqual(self.controller.request_shot.call_count, 1)
-        for _ in range(6):
-            self.tick()
+        self.now += 1.1
+        self.tick()
         self.assertEqual(self.controller.request_shot.call_count, 2)
 
     def test_never_fires_while_aim_not_ready(self):
@@ -886,6 +884,35 @@ class SettleNextShotTests(unittest.TestCase):
         self.assertIsNone(trigger.take(plan, 1, True))   # new hold, back to 0.15 s
         clock[0] = 2.2
         self.assertIsNotNone(trigger.take(plan, 1, True))
+
+
+class SettleDuringMechanismTests(unittest.TestCase):
+    def test_settle_runs_while_the_pusher_finishes_then_fires_at_once(self):
+        from turret_control.panel_launcher import AutoFireTrigger
+        clock = [0.0]
+        trigger = AutoFireTrigger(0.15, clock=lambda: clock[0])
+        plan = EngagementPlan([BoardTarget(u_px=0.0, v_px=0.0, width_px=1.0, height_px=1.0,
+                                           confidence=1.0, hole_id='H06')])
+        self.assertIsNone(trigger.take(plan, 1, True, can_fire=False))  # aim ready, pusher busy
+        clock[0] = 0.5
+        self.assertIsNone(trigger.take(plan, 1, True, can_fire=False))  # settled, still busy
+        self.assertIn('等待推球機構', trigger.state)
+        clock[0] = 0.55
+        self.assertIsNotNone(trigger.take(plan, 1, True, can_fire=True))  # no new 0.15 s wait
+
+    def test_losing_the_aim_still_restarts_the_settle(self):
+        from turret_control.panel_launcher import AutoFireTrigger
+        clock = [0.0]
+        trigger = AutoFireTrigger(0.15, clock=lambda: clock[0])
+        plan = EngagementPlan([BoardTarget(u_px=0.0, v_px=0.0, width_px=1.0, height_px=1.0,
+                                           confidence=1.0, hole_id='H06')])
+        trigger.take(plan, 1, True, can_fire=False)
+        clock[0] = 0.5
+        trigger.take(plan, 1, False, can_fire=True)                       # aim lost
+        clock[0] = 0.55
+        self.assertIsNone(trigger.take(plan, 1, True, can_fire=True))      # timer restarted
+        clock[0] = 0.75
+        self.assertIsNotNone(trigger.take(plan, 1, True, can_fire=True))
 
 
 class ShotToolTests(unittest.TestCase):

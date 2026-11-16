@@ -334,8 +334,11 @@ class UnreachableHoleSkipper:
         return hole, count
 
 
-def _auto_fire_ready(driver, launcher, plan, pose_ready, previous_status):
-    """True when the previous tick already had a fire-allowed aim on this hole."""
+def _auto_fire_aim_ready(launcher, plan, pose_ready, previous_status):
+    """The aim part: the previous tick had a fire-allowed aim on this hole.
+
+    Starts the auto-fire settle timer, also while the pusher still finishes
+    the previous stage."""
     current = plan.current() if plan is not None else None
     return bool(
         current is not None
@@ -345,11 +348,20 @@ def _auto_fire_ready(driver, launcher, plan, pose_ready, previous_status):
         and previous_status.target is not None
         and previous_status.target.hole_id == current.hole_id
         and previous_status.command.fire_allowed
-        and not launcher.pending
-        and not launcher.mechanism_busy
         and launcher.flywheel_ready
-        and driver.fire_cooldown_ready
     )
+
+
+def _auto_fire_mechanism_ready(driver, launcher):
+    """The mechanism part: nothing pending or moving, cooldown over."""
+    return bool(not launcher.pending and not launcher.mechanism_busy
+                and driver.fire_cooldown_ready)
+
+
+def _auto_fire_ready(driver, launcher, plan, pose_ready, previous_status):
+    """True when the previous tick already had a fire-allowed aim on this hole."""
+    return (_auto_fire_aim_ready(launcher, plan, pose_ready, previous_status)
+            and _auto_fire_mechanism_ready(driver, launcher))
 
 
 def _update_panel_engagement(driver, launcher, dashboard, plan, pose_ready, blocked_reason,
@@ -379,7 +391,8 @@ def _update_panel_engagement(driver, launcher, dashboard, plan, pose_ready, bloc
     if auto_fire is not None:
         action = auto_fire.take(
             plan, driver.plan_revision,
-            _auto_fire_ready(driver, launcher, plan, pose_ready, previous_status),
+            _auto_fire_aim_ready(launcher, plan, pose_ready, previous_status),
+            can_fire=_auto_fire_mechanism_ready(driver, launcher),
         )
     launcher.arm(action, plan, driver.plan_revision)
     try:
