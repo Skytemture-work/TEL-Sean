@@ -1376,6 +1376,8 @@ class ManualController:
         self._shot_thread = None
         self._shot_cancel = threading.Event()
         self.current_slot = 1
+        # 自上次裝填後已射空的格數；射空 SLOTS_PER_MAGAZINE 格（整匣）時省略轉格。
+        self.slots_fired_since_reload = 0
         # 這只是下一筆 FIRE 的階段；實際原點必須在第 1 階段開始前完成回零。
         self.shot_stage = 0
         # 每次接受 FIRE 遞增 shot_request_seq；ID1 本階段完成（第 3 階段為推到底並
@@ -1666,6 +1668,7 @@ class ManualController:
 
             self.reload_pending = True
             self._rotate_ammo_slots(RELOAD_PULSES)
+            self.slots_fired_since_reload = 0  # a freshly loaded magazine
             self.current_slot = (
                 (self.current_slot - 1 + RELOAD_SLOTS) % SLOTS_PER_MAGAZINE + 1
             )
@@ -1707,6 +1710,16 @@ class ManualController:
 
             if self.current_mode != "M":
                 print("[Manual] ID1 已回零；ID2 待轉格，切回手動後重新按 FIRE。", flush=True)
+                return
+            self.slots_fired_since_reload = getattr(self, "slots_fired_since_reload", 0) + 1
+            if self.slots_fired_since_reload >= SLOTS_PER_MAGAZINE:
+                # Every slot of a full magazine is now empty.  The team loads
+                # the slots under the opening and the reload always turns two
+                # slots to bring them to the pusher, so this turn is wasted time.
+                self.reload_pending = False
+                self.shot_stage = 0
+                print("[Manual] 彈藥倉 {} 格皆已射空：省略本次轉格（裝填後照常轉 {} 格上膛）。".format(
+                    SLOTS_PER_MAGAZINE, RELOAD_SLOTS), flush=True)
                 return
             print("[Manual] ID1 回零完成，準備檢查 ID2 轉格條件。", flush=True)
             self._rotate_ammo_one_slot()
@@ -1762,6 +1775,12 @@ class ManualController:
                                     speed_rpm=self.push_end_speed_rpm)
                 if isinstance(before, int) and isinstance(end, int):
                     print("[Manual] 第三階段推到底 Encoder 位移：{}".format(end - before), flush=True)
+                # Ball 3 is out once the pusher reached the end: count the shot
+                # now, so the turret turns to the next hole and, after the last
+                # ball of the magazine, the flywheels start their soft stop
+                # while ID1 returns home and ID2 turns.  The next push still
+                # waits for this stage (controller busy) to finish.
+                self._mark_shot_released()
                 time.sleep(SETTLE_TIME)
                 fast_back = int(PUSH_END_POSITION_PULSES * PUSH_FAST_FRACTION)
                 if fast_back > 0:

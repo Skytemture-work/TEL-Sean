@@ -775,8 +775,13 @@ def _run_board_real(
         help="切換一般模式",
     )
     parser.add_argument(
-        "--light-wait", type=float, default=5.0,
-        help="上半場：開賽後等待確認亮燈的秒數，逾時先射 H11（之後確認亮燈即改射亮燈孔）；預設 5，範圍 0～55",
+        # 0 (2026-11-16): the bonus light is on from the start, so do not wait
+        # with the turret idle.  Aim at H11 at once; the light is confirmed in
+        # ~3 frames, usually before the first push, and the remaining bonus
+        # balls then switch to the lit hole.  In every test run the 5 s wait
+        # ended without a light anyway.
+        "--light-wait", type=float, default=0.0,
+        help="上半場：開賽後等待確認亮燈的秒數，逾時先射 H11（之後確認亮燈即改射亮燈孔）；預設 0（燈開賽即亮，不等），範圍 0～55",
     )
     parser.add_argument(
         "--match-phase",
@@ -1518,7 +1523,9 @@ def _run_board_real(
 
         def _power_loss_during_reload(exc):
             """Handle a launcher/DM failure: True = recovered, False = stop; re-raise otherwise."""
-            if match is None or not match.reload_wait or launcher is None:
+            # Only once "可以按急停" was announced: before that the pusher or the
+            # magazine may still be moving and a power cut there is a real fault.
+            if match is None or not match.reload_wait or not reload_estop_ready or launcher is None:
                 raise exc
             return _wait_out_power_loss(exc)
 
@@ -1529,7 +1536,8 @@ def _run_board_real(
         repositioning = False
         reposition_vision = False
         reload_was_waiting = False
-        board_center_m = np.array([[BOARD_WIDTH_CM / 200.0, BOARD_HEIGHT_CM / 200.0, 0.0]])
+        reload_estop_ready = False
+        board_center_m =np.array([[BOARD_WIDTH_CM / 200.0, BOARD_HEIGHT_CM / 200.0, 0.0]])
 
         def _begin_reposition():
             """Reload confirmed = departure from the start zone (once)."""
@@ -1834,10 +1842,20 @@ def _run_board_real(
                 forced_reload_confirm = False
                 if reload_was_waiting and not match.reload_wait and match.stopped is None:
                     _begin_reposition()  # no-op if the e-stop recovery already did it
-                if not reload_was_waiting and match.reload_wait and event_callback is not None:
-                    # From the reload until this program ends main.py keeps auto
-                    # mode (the e-stop reboots the ESP32, which may report M).
-                    event_callback("RELOAD_WAIT")
+                if (match.reload_wait and not reload_estop_ready
+                        and not (launcher is not None and launcher.mechanism_busy)):
+                    # The flywheels already stopped inside match.step and the
+                    # pusher / magazine are at rest: only now is an e-stop safe
+                    # (a magazine stopped between two slots would be lost).
+                    reload_estop_ready = True
+                    print("[Aim] 可以按急停：飛輪已停，推球與彈藥倉已停妥；拉回出發區裝填後，"
+                          "按遙控器 RELOAD 出發。", flush=True)
+                    if event_callback is not None:
+                        # From the reload until this program ends main.py keeps
+                        # auto mode (the e-stop reboots the ESP32, which may say M).
+                        event_callback("RELOAD_WAIT")
+                if not match.reload_wait:
+                    reload_estop_ready = False
                 reload_was_waiting = match.reload_wait
                 plan = match.plan if match.plan is not None else plan
                 if match.bonus_hole_id is not None:

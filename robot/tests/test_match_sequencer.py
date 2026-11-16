@@ -123,6 +123,17 @@ class UpperHalfTests(unittest.TestCase):
         self.assertEqual(h.match.bonus_hole_id, "H12")
         self.assertEqual(h.fire(1), ["H03"])
 
+    def test_no_wait_starts_on_h11_at_once_and_switches_to_the_light(self):
+        # Default since 2026-11-16: light_wait 0, the light is on from the start.
+        h = Harness("upper", light_wait=0.0)
+        h.tick()
+        self.assertFalse(h.match.waiting_light)
+        self.assertEqual(h.match.plan.current().hole_id, "H11")
+        h.tick(lit="H10")               # light confirmed before the first push
+        self.assertEqual(h.match.bonus_hole_id, "H10")
+        self.assertEqual(h.fire(9), ["H10"] * 9)
+        self.assertEqual(h.fire(1), ["H03"])
+
     def test_light_confirmed_late_after_60_s_never_shoots_a_small_hole(self):
         h = Harness("upper", light_wait=55.0)
         h.tick()
