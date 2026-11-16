@@ -151,6 +151,19 @@ class SharedMotorBackendTests(unittest.TestCase):
         self.backend.send_targets(self.targets)
         self.assertFalse(self.backend.motion_ready(self.yaw, self.pitch))
 
+    def test_held_motor_feedback_noise_does_not_block_but_a_moving_trajectory_does(self):
+        # 2026-11-16: a held DM reports a few tenths of a deg/s of feedback
+        # noise; at 0.00 deg error the turret still looked like it was moving.
+        self.backend.send_targets(self.targets)
+        noise = math.radians(1.0)
+        self.worker.state = replace(self.worker.state, velocity_rad_s=noise, yaw_velocity_rad_s=-noise)
+        self.assertTrue(self.backend.motion_ready(self.yaw, self.pitch))
+        self.worker.state = replace(self.worker.state, velocity_rad_s=math.radians(2.0))
+        self.assertFalse(self.backend.motion_ready(self.yaw, self.pitch))
+        self.worker.state = replace(self.worker.state, velocity_rad_s=0.0,
+                                    command_velocity_rad_s=math.radians(1.0))
+        self.assertFalse(self.backend.motion_ready(self.yaw, self.pitch))
+
     def test_stale_feedback_cannot_authorize_firing(self):
         self.backend.send_targets(self.targets)
         self.worker.state = replace(self.worker.state, yaw_feedback_at=time.monotonic() - 1.)

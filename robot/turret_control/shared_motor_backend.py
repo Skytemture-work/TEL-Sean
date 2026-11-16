@@ -27,6 +27,11 @@ MAX_AIM_ACCELERATION_RAD_S2 = 3.0
 # motion and resets aim stability.  0.1 deg is ~1 cm at 5.5 m.  (Was 0.02 deg,
 # which kept the 3-stable-frame gate failing for ~5 s after each shot.)
 AIM_RETARGET_DEADBAND_DEG = 0.1
+# A held DM reports a few tenths of a deg/s of feedback velocity noise; with
+# the 0.5 deg/s sequence threshold the turret looked "still moving" for
+# seconds at 0.00 deg error (2026-11-16: ~5 s per hole change).  The
+# commanded trajectory must still be finished (<= SEQUENCE_STOP_SPEED).
+AIM_SETTLED_FEEDBACK_SPEED_RAD_S = math.radians(1.5)
 DEFAULT_AIM_KP = 50.0
 DEFAULT_AIM_KD = 1.5
 DEFAULT_AIM_CONTROL_MODE = "posvel"
@@ -136,10 +141,12 @@ class SharedMotorBackend:
                 or self._last_requested is None
                 or snapshot.yaw_target_rad is None or snapshot.target_rad is None):
             return False
-        velocities = (snapshot.velocity_rad_s, snapshot.yaw_velocity_rad_s,
-                      snapshot.command_velocity_rad_s, snapshot.yaw_command_velocity_rad_s)
-        if any(value is None or not math.isfinite(value)
-               or abs(value) > SEQUENCE_STOP_SPEED_RAD_S for value in velocities):
+        limits = ((snapshot.velocity_rad_s, AIM_SETTLED_FEEDBACK_SPEED_RAD_S),
+                  (snapshot.yaw_velocity_rad_s, AIM_SETTLED_FEEDBACK_SPEED_RAD_S),
+                  (snapshot.command_velocity_rad_s, SEQUENCE_STOP_SPEED_RAD_S),
+                  (snapshot.yaw_command_velocity_rad_s, SEQUENCE_STOP_SPEED_RAD_S))
+        if any(value is None or not math.isfinite(value) or abs(value) > limit
+               for value, limit in limits):
             return False
         exact = math.radians(.025)
         # The worker must be on exactly the last requested target; the caller's

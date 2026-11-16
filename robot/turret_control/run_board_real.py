@@ -259,6 +259,9 @@ def _all_holes_confirmed(plan, confirmed_holes):
 
 
 UNREACHABLE_SKIP_S = 3.0
+# Headless: draw the dashboard overlay at most this often (~5 Hz); it cost
+# ~60 ms on every frame of a ~375 ms control loop.
+PREVIEW_RENDER_S = 0.2
 # E-stop during a reload: how often to retry the DM until the 24 V is back.
 POWER_RETRY_S = 3.0
 
@@ -660,12 +663,12 @@ def _run_board_real(
         help="推球馬達 ID1 回原點速度 RPM（預設沿用 HOME_SPEED_RPM=40；範圍 20～120；調高可能誤判到底）",
     )
     parser.add_argument(
-        "--auto-fire-settle", type=float, default=0.3,
-        help="全自動模式：同一孔位需連續符合發射條件的秒數（預設 0.3，範圍 0.2～5）",
+        "--auto-fire-settle", type=float, default=0.15,
+        help="全自動模式：同一孔位需連續符合發射條件的秒數（預設 0.15，範圍 0.1～5；原 0.3）",
     )
     parser.add_argument(
-        "--stable-frames", type=int, default=3,
-        help="砲口需連續幾個辨識畫面都在容許誤差內才算到位（預設 3，範圍 1～10；原本 5）",
+        "--stable-frames", type=int, default=2,
+        help="砲口需連續幾個辨識畫面都在容許誤差內才算到位（預設 2，範圍 1～10；原 3）",
     )
     parser.add_argument("--restore-completed-aim", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
@@ -823,8 +826,8 @@ def _run_board_real(
         parser.error("--zed-calibration 必須配合 --zed-uvc 使用")
     if args.restore_completed_aim and (not args.aim_only or args.score_mode):
         parser.error("--restore-completed-aim 需要 --aim-only --no-score-mode")
-    if not math.isfinite(args.auto_fire_settle) or not 0.2 <= args.auto_fire_settle <= 5.0:
-        parser.error("--auto-fire-settle 必須在 0.2～5 秒之間")
+    if not math.isfinite(args.auto_fire_settle) or not 0.1 <= args.auto_fire_settle <= 5.0:
+        parser.error("--auto-fire-settle 必須在 0.1～5 秒之間")
     for flag, value, low, high in (("--push-rpm", args.push_rpm, 20, 600),
                                    ("--push-accel", args.push_accel, 1, 255),
                                    ("--push-home-rpm", args.push_home_rpm, 20, 120)):
@@ -1307,6 +1310,8 @@ def _run_board_real(
     restore_completed = args.restore_completed_aim
     auto_fire = None
     previous_status = None
+    score_probe_state = None
+    last_render_at = float("-inf")
     # Match firing never times a hole out, so skip holes the turret cannot reach.
     unreachable_skipper = UnreachableHoleSkipper() if args.match_fire else None
     match = (MatchSequencer(
@@ -1800,11 +1805,14 @@ def _run_board_real(
                 last_report = now
 
             reference_plan = board_plan or plan
-            score_probe_state = score_round.update(
-                vision_frame,
-                reference_plan,
-                trusted_quad,
-            )
+            if score_probe_state is None or match is None or not match.bonus_closed:
+                # ~30 ms per frame; once the match's bonus window is closed (or
+                # in the lower half) the light no longer matters.
+                score_probe_state = score_round.update(
+                    vision_frame,
+                    reference_plan,
+                    trusted_quad,
+                )
             score_done_at = time.perf_counter()
             score_light_scores = (
                 score_probe_state.scores
@@ -2081,91 +2089,97 @@ def _run_board_real(
                         flush=True,
                     )
                 last_target_id = target_id
-            display = vision_result.render(vision_frame)
-            if score_light_scores is not None:
-                draw_score_light_overlay(
-                    display,
-                    score_light_scores,
-                    reference_plan,
-                    trusted_quad,
-                    active_hole_id=(
+            render_due = (not args.headless
+                          or (dashboard is not None
+                              and time.monotonic() - last_render_at >= PREVIEW_RENDER_S))
+            display = None
+            if render_due:
+                last_render_at = time.monotonic()
+                display = vision_result.render(vision_frame)
+                if score_light_scores is not None:
+                    draw_score_light_overlay(
+                        display,
+                        score_light_scores,
+                        reference_plan,
+                        trusted_quad,
+                        active_hole_id=(
+                            score_state.active_hole_id
+                            if score_state is not None
+                            else None
+                        ),
+                        min_score=config.score_light_min_score,
+                    )
+                if args.score_mode and status.target is not None:
+                    current_point = (
+                        round(status.target.u_px),
+                        round(status.target.v_px),
+                    )
+                    cv2.circle(display, current_point, 20, (255, 0, 255), 3, cv2.LINE_AA)
+                    cv2.putText(
+                        display,
+                        f"NEXT {status.target.hole_id}",
+                        (current_point[0] + 10, current_point[1] + 20),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.55,
+                        (255, 0, 255),
+                        2,
+                        cv2.LINE_AA,
+                    )
+                if args.score_mode and score_state is not None:
+                    score_label = (
                         score_state.active_hole_id
-                        if score_state is not None
-                        else None
-                    ),
-                    min_score=config.score_light_min_score,
-                )
-            if args.score_mode and status.target is not None:
-                current_point = (
-                    round(status.target.u_px),
-                    round(status.target.v_px),
-                )
-                cv2.circle(display, current_point, 20, (255, 0, 255), 3, cv2.LINE_AA)
+                        or last_bonus_hole_id
+                        or "未鎖定"
+                    )
+                    text = (
+                        f"SCORE {score_state.phase} {score_label} "
+                        f"{score_state.remaining_s:.1f}s | remaining={status.remaining}"
+                    )
+                else:
+                    text = f"12-hole {'READY' if plan else 'WAIT'} | remaining={status.remaining}"
+                cv2.putText(display, text, (12, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 220, 0), 2)
+                if score_light_scores is not None:
+                    score_text = " ".join(
+                        f"{hole_id}:{score_light_scores.get(hole_id, 0.0):.2f}"
+                        for hole_id in ("H10", "H11", "H12")
+                    )
+                    cv2.putText(
+                        display,
+                        f"RED {score_text}",
+                        (12, 56),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.55,
+                        (0, 0, 255),
+                        2,
+                    )
+                if not frame_size_ok:
+                    pose_text = "CAMERA SIZE MISMATCH - FIRE BLOCKED"
+                    pose_color = (0, 0, 255)
+                elif args.virtual_board:
+                    pose_text = "POSE virtual bypass"
+                    pose_color = (0, 220, 0)
+                elif pose is None:
+                    pose_text = "POSE invalid - FIRE BLOCKED"
+                    pose_color = (0, 165, 255)
+                else:
+                    pose_text = (
+                        f"POSE {pose.source.upper()} {'READY' if pose_ready else 'SETTLING'} "
+                        f"n={pose.correspondence_count} "
+                        f"err={pose.reprojection_error_px:.1f}px "
+                        f"v={pose.translation_speed_m_s:.2f}m/s "
+                        f"w={pose.rotation_speed_rad_s:.2f}rad/s"
+                    )
+                    pose_color = (0, 220, 0) if pose_ready else (0, 165, 255)
                 cv2.putText(
                     display,
-                    f"NEXT {status.target.hole_id}",
-                    (current_point[0] + 10, current_point[1] + 20),
+                    pose_text,
+                    (12, 82 if args.score_mode or score_light_scores is not None else 56),
                     cv2.FONT_HERSHEY_SIMPLEX,
-                    0.55,
-                    (255, 0, 255),
+                    0.52,
+                    pose_color,
                     2,
                     cv2.LINE_AA,
                 )
-            if args.score_mode and score_state is not None:
-                score_label = (
-                    score_state.active_hole_id
-                    or last_bonus_hole_id
-                    or "未鎖定"
-                )
-                text = (
-                    f"SCORE {score_state.phase} {score_label} "
-                    f"{score_state.remaining_s:.1f}s | remaining={status.remaining}"
-                )
-            else:
-                text = f"12-hole {'READY' if plan else 'WAIT'} | remaining={status.remaining}"
-            cv2.putText(display, text, (12, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 220, 0), 2)
-            if score_light_scores is not None:
-                score_text = " ".join(
-                    f"{hole_id}:{score_light_scores.get(hole_id, 0.0):.2f}"
-                    for hole_id in ("H10", "H11", "H12")
-                )
-                cv2.putText(
-                    display,
-                    f"RED {score_text}",
-                    (12, 56),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.55,
-                    (0, 0, 255),
-                    2,
-                )
-            if not frame_size_ok:
-                pose_text = "CAMERA SIZE MISMATCH - FIRE BLOCKED"
-                pose_color = (0, 0, 255)
-            elif args.virtual_board:
-                pose_text = "POSE virtual bypass"
-                pose_color = (0, 220, 0)
-            elif pose is None:
-                pose_text = "POSE invalid - FIRE BLOCKED"
-                pose_color = (0, 165, 255)
-            else:
-                pose_text = (
-                    f"POSE {pose.source.upper()} {'READY' if pose_ready else 'SETTLING'} "
-                    f"n={pose.correspondence_count} "
-                    f"err={pose.reprojection_error_px:.1f}px "
-                    f"v={pose.translation_speed_m_s:.2f}m/s "
-                    f"w={pose.rotation_speed_rad_s:.2f}rad/s"
-                )
-                pose_color = (0, 220, 0) if pose_ready else (0, 165, 255)
-            cv2.putText(
-                display,
-                pose_text,
-                (12, 82 if args.score_mode or score_light_scores is not None else 56),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.52,
-                pose_color,
-                2,
-                cv2.LINE_AA,
-            )
             render_done_at = time.perf_counter()
             jpeg_encode_ms = None
             preview_stats = {}
@@ -2173,11 +2187,11 @@ def _run_board_real(
                 # Parallax of the barrel point depends on the target range.
                 muzzle_preview.set_distance(
                     status.target.distance_m if status.target is not None else None)
-            if preview is not None:
+            if preview is not None and display is not None:
                 preview.set_overlay(display, vision_frame)
                 preview_stats = preview.stats()
                 jpeg_encode_ms = preview_stats.get("preview_jpeg_encode_ms")
-            elif dashboard is not None:
+            elif dashboard is not None and display is not None:
                 encode_started_at = time.perf_counter()
                 ok_jpg, encoded = cv2.imencode(
                     ".jpg", display, [cv2.IMWRITE_JPEG_QUALITY, 80]

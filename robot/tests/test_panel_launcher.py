@@ -578,7 +578,7 @@ class AutoFireTests(unittest.TestCase):
     @patch('builtins.print')
     def test_cli_auto_fire_validation_before_hardware(self, _):
         for args in (['--auto-fire', '--aim-only'], ['--auto-fire', '--panel-fire'],
-                     ['--auto-fire', '--web-port', '0'], ['--auto-fire', '--auto-fire-settle', '0.1'],
+                     ['--auto-fire', '--web-port', '0'], ['--auto-fire', '--auto-fire-settle', '0.05'],
                      ['--auto-fire', '--auto-fire-settle', 'nan'],
                      ['--match-fire', '--no-score-mode'], ['--match-fire', '--auto-fire'],
                      ['--match-fire', '--balls-loaded', '19'], ['--match-fire', '--balls-loaded', '0'],
@@ -620,11 +620,23 @@ class PusherSpeedTests(unittest.TestCase):
         controller.shot_stage = 2
         calls = []
         controller._go_home = lambda servo, direction, label, speed_rpm=None: (
-            calls.append((direction, speed_rpm)) or 100)
+            calls.append(('home', direction, speed_rpm)) or 100)
+        controller._move_relative = lambda servo, pulses, direction, speed: (
+            calls.append(('move', direction, pulses, speed)))
+        controller._push_position = 2675  # after ball 2 and its 25 % back-off
         with patch.object(manual.time, 'sleep'):
             controller._run_one_shot_cycle()
-        self.assertEqual(calls, [(manual.MOVE_DIRECTION, manual.PUSH_END_SPEED_RPM),
-                                 (manual.HOME_DIRECTION, None)])
+        fast = manual.PUSH_FAST_FRACTION
+        # Fast push most of the way, slow current-sensed push to the end; fast
+        # back most of the way, slow current-sensed home.
+        self.assertEqual(calls, [
+            ('move', manual.MOVE_DIRECTION, int((manual.PUSH_END_POSITION_PULSES - 2675) * fast),
+             controller.shooting_speed_rpm),
+            ('home', manual.MOVE_DIRECTION, manual.PUSH_END_SPEED_RPM),
+            ('move', manual.HOME_DIRECTION, int(manual.PUSH_END_POSITION_PULSES * fast),
+             controller.shooting_speed_rpm),
+            ('home', manual.HOME_DIRECTION, None),
+        ])
         self.assertEqual(manual.PUSH_END_SPEED_RPM, 40)
         self.assertTrue(controller.reload_pending)
 

@@ -118,16 +118,19 @@ class BoardVision:
     def analyze(self, frame: np.ndarray, result, *, now: float, depth_data=None) -> BoardVisionResult:
         config = self.config
         raw = boxes_to_board_targets(result, self.confidence, depth_data)
-        surface = detect_dark_board_surface(
-            frame, value_threshold=config.board_dark_value_threshold,
-            min_area_fraction=config.board_min_area_fraction, targets=raw,
-        )
         estimated_quad, tracked = self.tracker.update(raw, frame.shape, now)
         estimated_surface = estimated_quad is not None
         if estimated_surface:
+            # The hole-based outline wins; the full-frame dark-surface search
+            # (~33 ms) would only be overwritten, so skip it.
             surface = _surface_from_estimated_quad(estimated_quad, frame.shape)
-        elif surface is not None and surface.quad is None:
-            surface = None
+        else:
+            surface = detect_dark_board_surface(
+                frame, value_threshold=config.board_dark_value_threshold,
+                min_area_fraction=config.board_min_area_fraction, targets=raw,
+            )
+            if surface is not None and surface.quad is None:
+                surface = None
         targets = filter_targets_to_surface(raw, surface)
         quad = estimated_quad if estimated_quad is not None else (
             surface.quad if surface is not None else None)

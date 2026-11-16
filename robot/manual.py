@@ -156,6 +156,14 @@ TARGET_POSITIONS = (1700, 3000)
 # 目的：推完不要一直頂著彈藥倉裡剩下的球，減少擠壓變形（待實測驗證）。
 # 0 = 關閉，恢復原本連續往前推的行為。
 PUSH_RETRACT_FRACTION = 0.25
+# 第 3 段：推到底的終點位置（pulses，從原點起算）。2026-11-16 實測每次推到底
+# Encoder 位移 54774±3（20.48 counts/pulse）= 2675 pulses，起點 2675 → 終點 5350。
+PUSH_END_POSITION_PULSES = 5350
+# 推到底與回原點的前段改用推球速度（200 RPM）快走這個比例，最後一段才用
+# 40 RPM 無限位（電流判斷到底／原點），安全確認不變。原本全程 40 RPM，第 3 段
+# 約 5.6 s。第 3 顆球約在 4300 pulses 推出，仍在快段（與第 1、2 顆同速）。
+# 0 = 關閉，恢復全程 40 RPM。
+PUSH_FAST_FRACTION = 0.75
 SLOTS_PER_MAGAZINE = 6
 
 MOVE_TIMEOUT = 30.0
@@ -1741,14 +1749,30 @@ class ManualController:
             if not self.reload_pending:
                 self._shoot_home_encoder = None
                 before = self.shoot_servo.read_encoder_value_addition()
+                start = getattr(self, "_push_position", None)
+                if start is None:
+                    start = TARGET_POSITIONS[1]
+                fast_out = int((PUSH_END_POSITION_PULSES - start) * PUSH_FAST_FRACTION)
+                if fast_out > 0:
+                    print("[Manual] 第三階段快推 {} pulses（{} RPM），再慢推到底。".format(
+                        fast_out, self.shooting_speed_rpm), flush=True)
+                    self._move_relative(self.shoot_servo, fast_out, MOVE_DIRECTION,
+                                        self.shooting_speed_rpm)
                 end = self._go_home(self.shoot_servo, MOVE_DIRECTION, "反向無限位回零",
                                     speed_rpm=self.push_end_speed_rpm)
                 if isinstance(before, int) and isinstance(end, int):
                     print("[Manual] 第三階段推到底 Encoder 位移：{}".format(end - before), flush=True)
                 time.sleep(SETTLE_TIME)
+                fast_back = int(PUSH_END_POSITION_PULSES * PUSH_FAST_FRACTION)
+                if fast_back > 0:
+                    print("[Manual] 快退 {} pulses（{} RPM），再慢速回原點。".format(
+                        fast_back, self.shooting_speed_rpm), flush=True)
+                    self._move_relative(self.shoot_servo, fast_back, HOME_DIRECTION,
+                                        self.shooting_speed_rpm)
                 self._shoot_home_encoder = self._go_home(
                     self.shoot_servo, HOME_DIRECTION, "正向無限位回零"
                 )
+                self._push_position = 0
                 self.reload_pending = True
         else:
             raise RuntimeError("未知射擊階段：{}".format(self.shot_stage))
