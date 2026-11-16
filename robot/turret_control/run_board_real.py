@@ -333,8 +333,11 @@ def _update_panel_engagement(driver, launcher, dashboard, plan, pose_ready, bloc
     by exactly the same launcher and engagement gates.
     """
     launcher.check_health()
-    if launcher.busy and not pose_ready:
-        raise RuntimeError("發射期間靶板姿態失效，停止發射控制")
+    # A pose lost during a push (someone walks past the camera, the chassis
+    # is bumped, a few holes missed for a frame) must not end the match.  The
+    # push finishes on its own and is counted on release without a pose; the
+    # turret already holds still while the launcher is busy, and no new shot
+    # starts until the pose is valid again (firing is gated on pose_ready).
     # hold_reason (e.g. waiting for a reload) keeps the turret still and
     # blocks firing; fire_hold only blocks firing.
     driver.set_aiming_enabled(

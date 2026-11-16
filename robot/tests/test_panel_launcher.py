@@ -228,12 +228,22 @@ class PanelLauncherTests(unittest.TestCase):
         self.tick()
         self.controller.request_shot.assert_not_called()
 
-    def test_loss_of_pose_during_active_stage_is_fatal(self):
+    def test_loss_of_pose_during_active_stage_is_not_fatal(self):
+        # 2026-11-16: a pose lost mid-push ended the whole match.  Now the push
+        # finishes, nothing new starts while blind, and the stage is counted
+        # once the pose is back.
         self.click()
         self.tick()
-        with self.assertRaisesRegex(RuntimeError, '姿態失效'):
-            self.tick(False)
+        self.tick(False)
         self.assertEqual(self.controller.request_shot.call_count, 1)
+        self.assertEqual(self.plan.index, 0)
+        self.complete_stage()
+        self.tick(False)
+        self.assertEqual(self.controller.request_shot.call_count, 1)
+        self.assertEqual(self.plan.index, 0)
+        self.tick()
+        self.assertEqual(self.controller.request_shot.call_count, 1)
+        self.assertEqual(self.plan.index, 1)
 
     def test_launcher_or_aiming_failure_cannot_advance_plan(self):
         self.click()
