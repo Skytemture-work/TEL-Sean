@@ -34,6 +34,12 @@ MODE_TO_MANUAL_CONFIRM_S = 0.5
 # locked (the e-stop reboots the ESP32, which may report M for a moment).
 # Emergency exit: hold SWA at M this long.
 MODE_LOCK_ESCAPE_S = 3.0
+# The ESP32 reboots during the upper-half reload.  For this long after the
+# reload is confirmed, an M in the packet's mode field is ignored (treated as
+# the current mode); every other field -- reload included -- is still read.
+# 'X' (no receiver) is left alone: it already keeps the mode, and its fields
+# are placeholders (reload reads 0) that must never count as a switch edge.
+RELOAD_MODE_MASK_S = 10.0
 NORMAL_STRAFE_DURATION_SCALE = 1.5
 OCCLUSION_BRAKE_SECONDS = 0.15
 
@@ -258,6 +264,8 @@ def main():
         reposition_release_at = 0.0
         manual_request_since = None
         mode_locked = False
+        mode_mask_until = 0.0
+        release_phase = None  # half switch latched at the SWA release
         print("[System] 已啟動，等待 ESP32 第一筆有效封包...", flush=True)
 
         while True:
@@ -265,6 +273,11 @@ def main():
                 manual.check_health()
             packet = uart.read_esp32_packet()
 
+            if (packet is not None and current_mode == "A"
+                    and time.monotonic() < mode_mask_until
+                    and packet.get("mode") == "M"):
+                # ESP32 rebooting after the reload: keep auto, read the rest.
+                packet["mode"] = current_mode
             if packet is not None:
                 packet_mode = packet.get("mode", "?")
                 if packet_mode != last_received_mode:
@@ -340,6 +353,8 @@ def main():
                     awaiting_phase = False
                     repositioning = False
                     mode_locked = False
+                    mode_mask_until = 0.0
+                    release_phase = None
                     locked_vy = None
                     latest_vy = None
                     vision_valid_after = time.monotonic()
@@ -429,10 +444,18 @@ def main():
                     mode_locked = True
                     print("[Mode Switch] 進入裝填：自動模式鎖定到射擊程式結束"
                           f"（緊急時 SWA 保持 M {MODE_LOCK_ESCAPE_S:g} 秒可切回手動）", flush=True)
+                    if last_auto_reload == 1:
+                        # Only 0 -> 1 confirms.  Flipped down and up again while
+                        # the ESP32 reboots, both edges would be missed.
+                        print("[Aim] RELOAD 開關目前在 1：請先撥回 0，裝填好再撥到 1 出發",
+                              flush=True)
                 if "REPOSITION" in aim_events:
                     # Reload done in the start zone: the reload confirmation is
                     # the departure.  Same positioning as at the match start.
                     repositioning = True
+                    mode_mask_until = time.monotonic() + RELOAD_MODE_MASK_S
+                    print(f"[Mode Switch] 裝填完成：{RELOAD_MODE_MASK_S:g} 秒內忽略封包模式"
+                          "（ESP32 重啟），reload 等其他欄位照常讀取", flush=True)
                     reposition_release_at = time.monotonic() + REPOSITION_VY_WAIT_S
                     auto_complete = False
                     auto_started = False
@@ -481,6 +504,9 @@ def main():
                         if latest_vy is not None:
                             locked_vy = latest_vy[1]
                         send_aim_command(aim_process, "VISION_OFF")
+                        if not repositioning:
+                            # Latch the half here: pre-aim and START share it.
+                            release_phase = "lower" if packet.get("fire") == 1 else "upper"
                         if not aim_prepared and aim_process is not None and aim_process.poll() is None:
                             if manual is not None:
                                 manual.close()
@@ -488,9 +514,7 @@ def main():
                             # The half switch is already set on release: tell the aim
                             # process now, so the turret pre-aims at the right first
                             # hole (upper H11, lower H01) while the chassis drives.
-                            send_aim_command(
-                                aim_process,
-                                "PHASE lower" if packet.get("fire") == 1 else "PHASE upper")
+                            send_aim_command(aim_process, f"PHASE {release_phase}")
                             aim_prepared = send_aim_command(aim_process, "PREPARE_MOTORS")
                             if aim_prepared:
                                 print("[Aim] SWA 已放行，背景準備 DM／VESC", flush=True)
@@ -523,10 +547,12 @@ def main():
                     continue
 
             # SWA already authorized motor preparation for this auto session.
-            # The next A packet supplies only the half selection.
+            # The half was latched at the SWA release (SWD moved during
+            # positioning is ignored); the next A packet sets the reload baseline.
             if awaiting_phase and packet is not None and packet.get("mode") == "A":
                 awaiting_phase = False
-                match_phase = "lower" if packet.get("fire") == 1 else "upper"
+                match_phase = release_phase or (
+                    "lower" if packet.get("fire") == 1 else "upper")
                 if aim_prepared:
                     last_auto_reload = packet.get("reload")
                     aim_started = send_aim_command(aim_process, f"START {match_phase}")
@@ -541,6 +567,8 @@ def main():
             ):
                 reload_value = packet.get("reload")
                 if reload_value in (0, 1):
+                    if mode_locked and reload_value != last_auto_reload:
+                        print(f"[Aim] RELOAD 開關 {last_auto_reload} → {reload_value}", flush=True)
                     if last_auto_reload == 0 and reload_value == 1:
                         if send_aim_command(aim_process, "RELOAD"):
                             print("[Aim] 已轉送遙控器裝填確認", flush=True)
