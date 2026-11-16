@@ -77,6 +77,19 @@ class ManualDMStartupTests(unittest.TestCase):
             dm.close.assert_called_once()
             vesc.close.assert_called_once()
 
+    def test_auto_launcher_spins_the_flywheels_before_the_mks_setup(self):
+        order = []
+        vesc = Mock()
+        vesc.start.side_effect = lambda: order.append('vesc')
+        vesc.set_speed.side_effect = lambda speed: order.append(('speed', speed))
+        with patch.object(manual, 'VESCDualMotorController', return_value=vesc), \
+             patch.object(manual, 'validate_mks_can_interfaces'), \
+             patch.object(manual.ManualController, '_initialize_can', side_effect=lambda: order.append('mks')):
+            controller = manual.ManualController(None, dm_controller=Mock(),
+                                                 initial_flywheel_speed=100)
+            self.assertEqual(order, ['vesc', ('speed', 100), 'mks'])
+            controller.close()
+
     def test_mks_startup_failure_also_stops_dm(self):
         dm, vesc = Mock(), Mock()
         with patch.object(manual, 'DMStartupController', return_value=dm), \

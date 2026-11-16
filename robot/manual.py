@@ -1428,7 +1428,11 @@ class _AmmoMove:
 
 
 class ManualController:
-    def __init__(self, uart, *, log_status=True, dm_controller=None):
+    def __init__(self, uart, *, log_status=True, dm_controller=None,
+                 initial_flywheel_speed=None):
+        """``initial_flywheel_speed`` (auto launcher only): spin the flywheels
+        up as soon as the VESCs answer, before the MKS setup, so they reach
+        speed while the chassis is still driving.  None keeps them stopped."""
         if DM_STARTUP_CLI_TEST_ONLY and dm_controller is None:
             run_dm_startup_test()
             raise SystemExit(0)
@@ -1482,10 +1486,16 @@ class ManualController:
         self.last_wz = 0
         try:
             validate_mks_can_interfaces()
+            if initial_flywheel_speed is not None:
+                # Auto launcher: VESC first, the flywheels take the longest
+                # to reach speed (the chassis is already driving).
+                self.vesc_controller.start()
+                self.vesc_controller.set_speed(initial_flywheel_speed)
             if self._owns_dm_controller:
                 self.dm_controller.start()
             self._initialize_can()
-            self.vesc_controller.start()
+            if initial_flywheel_speed is None:
+                self.vesc_controller.start()  # manual mode: unchanged order
         except BaseException:
             self.close()
             raise

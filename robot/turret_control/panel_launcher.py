@@ -65,8 +65,14 @@ class PanelLauncher:
         self._last_released_at = None
         self.message = "等待瞄準到位後，點擊「射擊」執行一個階段"
         self.target_rpm = VESC_MIN_RPM + PANEL_FLYWHEEL_SPEED * VESC_RPM_PER_SPEED_UNIT
-        factory = controller_factory or ManualController
-        self.controller = factory(uart=None, log_status=False, dm_controller=SharedAimMonitor(motors))
+        if controller_factory is None:
+            # Spin up as soon as the VESCs answer, before the MKS setup.
+            self.controller = ManualController(
+                uart=None, log_status=False, dm_controller=SharedAimMonitor(motors),
+                initial_flywheel_speed=PANEL_FLYWHEEL_SPEED if spin_up else None)
+        else:
+            self.controller = controller_factory(
+                uart=None, log_status=False, dm_controller=SharedAimMonitor(motors))
         # Pusher (MKS ID1) overrides for the auto pipeline only; None keeps the
         # manual.py defaults so manual mode is unaffected.
         if push_rpm is not None:
