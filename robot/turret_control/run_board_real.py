@@ -114,6 +114,9 @@ DEFAULT_CAMERA_PITCH_DEG = 19.2
 EQUAL_SPEED_MUZZLE_SPEED_M_S = 32.0  # 2026-11-13 fit, both wheels 4000 RPM
 DEFAULT_MUZZLE_SPEED_M_S = 35.0
 DEFAULT_LAUNCH_ANGLE_RATIO = 0.942
+# Pre-aim on release: H11 muzzle targets were 31.6-31.9 deg in the
+# 2026-11-16 runs (robot stopped ~5.2-5.5 m from the board).
+DEFAULT_PREAIM_PITCH_DEG = 31.7
 
 
 def _parse_shot_order(text):
@@ -702,6 +705,14 @@ def _run_board_real(
              "儀表板 board_lean_avg_deg 應接近 0）",
     )
     parser.add_argument(
+        "--preaim-pitch-deg", type=float, default=DEFAULT_PREAIM_PITCH_DEG,
+        help=f"放行後（車還在跑）砲口先轉到的仰角，約為 H11（預設 {DEFAULT_PREAIM_PITCH_DEG}；0 = 不預瞄）",
+    )
+    parser.add_argument(
+        "--preaim-yaw-deg", type=float, default=0.0,
+        help="預瞄的水平角（度，相對中心；預設 0 = 正前方）",
+    )
+    parser.add_argument(
         "--no-muzzle-camera", action="store_true",
         help="不開啟砲口 ZED 相機（儀表板只顯示車體相機）",
     )
@@ -793,6 +804,11 @@ def _run_board_real(
         parser.error("--shot-order 只能搭配 --no-score-mode，且不能搭配 --restore-completed-aim")
     if not math.isfinite(args.camera_pitch_deg) or not 10.0 <= args.camera_pitch_deg <= 30.0:
         parser.error("--camera-pitch-deg 必須在 10～30 度之間")
+    from .limits import PITCH_MAX_DEG, YAW_DESIGN_LIMIT_DEG
+    if not math.isfinite(args.preaim_pitch_deg) or not 0.0 <= args.preaim_pitch_deg <= PITCH_MAX_DEG:
+        parser.error(f"--preaim-pitch-deg 必須在 0～{PITCH_MAX_DEG:g} 度之間（0 = 不預瞄）")
+    if not math.isfinite(args.preaim_yaw_deg) or abs(args.preaim_yaw_deg) > YAW_DESIGN_LIMIT_DEG:
+        parser.error(f"--preaim-yaw-deg 必須在 ±{YAW_DESIGN_LIMIT_DEG:g} 度之內")
     if not math.isfinite(args.muzzle_speed) or not 10.0 <= args.muzzle_speed <= 60.0:
         parser.error("--muzzle-speed 必須在 10～60 m/s 之間")
     if not math.isfinite(args.launch_angle_ratio) or not 0.8 <= args.launch_angle_ratio <= 1.1:
@@ -1072,6 +1088,22 @@ def _run_board_real(
                 motors = create_motors()
                 startup_cleanup.callback(motors.close)
                 motors.enable()
+                # Pre-aim while the chassis is still driving: head for the usual
+                # first target (H11, top centre) now, so after the stop only a
+                # small correction is left.  Sent before the launcher init so the
+                # turret moves while the MKS / VESC start up.
+                if args.preaim_pitch_deg > 0:
+                    try:
+                        motors.send_targets({
+                            0x03: (motors.yaw_calibration.motor_from_muzzle(
+                                math.radians(args.preaim_yaw_deg)), 0.0, 0.0, 0.0),
+                            0x01: (motors.pitch_calibration.motor_from_muzzle(
+                                math.radians(args.preaim_pitch_deg)), 0.0, 0.0, 0.0),
+                        })
+                        print(f"[Aim] 預瞄：砲口先轉到 yaw {args.preaim_yaw_deg:+.1f}°、"
+                              f"仰角 {args.preaim_pitch_deg:.1f}°（約 H11）", flush=True)
+                    except (ValueError, RuntimeError) as exc:
+                        print(f"[Aim] 預瞄未執行：{exc}", flush=True)
                 # Early exit (Ctrl+C / main.py stopping us before START): the
                 # same shutdown as after a match -- flywheels off and pusher
                 # home (launcher.close), then the turret home, then disable.

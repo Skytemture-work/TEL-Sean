@@ -609,10 +609,13 @@ def main():
                         flush=True,
                     )
                     if not positioning_succeeded:
-                        print("[Aim] 定位未成功，取消本輪投球；請切回 M 模式後重試", flush=True)
-                        if aim_process is not None:
-                            aim_process.stdin.close()
-                    elif aim_prepared and send_aim_command(aim_process, "VISION_OFF"):
+                        # Never give up the round here: a cancelled round scores
+                        # zero, while the turret (+/-28..34.5 deg) still reaches
+                        # most holes from an imperfect stop, and holes it cannot
+                        # reach are skipped after 3 s by the aim process.
+                        print(f"[Aim] 定位不完整（{completion_reason}），仍照常開始投球；"
+                              "打不到的孔會自動跳過", flush=True)
+                    if aim_prepared and send_aim_command(aim_process, "VISION_OFF"):
                         awaiting_phase = True
                         print("[Aim] 沿用 ZED，等待下一筆 A 模式封包選擇半場", flush=True)
                     else:

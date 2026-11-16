@@ -82,8 +82,16 @@ def _targets_by_id(plan: EngagementPlan) -> Dict[str, BoardTarget]:
 UPPER_BONUS_BALLS = 9
 UPPER_BONUS_WINDOW_S = 60.0
 UPPER_FALLBACK_BONUS_ID = "H11"
+# Team decision (2026-11-16): after the bonus balls the muzzle is at the top
+# (H10-H12), so walk the grid from the top of column 1 instead of dropping to
+# H01: column 1 down, centre column up, right column down.
+UPPER_SERPENTINE_IDS: Tuple[str, ...] = (
+    "H03", "H02", "H01",
+    "H04", "H05", "H06",
+    "H09", "H08", "H07",
+)
 UPPER_GRID_IDS: Tuple[str, ...] = tuple(
-    hole_id for hole_id in LOWER_SERPENTINE_IDS for _ in range(2))
+    hole_id for hole_id in UPPER_SERPENTINE_IDS for _ in range(2))
 
 
 def build_max_score_strategy(

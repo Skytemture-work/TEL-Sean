@@ -40,11 +40,10 @@ class ScoringStrategyTests(unittest.TestCase):
 
         self.assertEqual(len(strategy.plan), 27)
         self.assertEqual(strategy.hole_ids[:9], ("H11",) * 9)
+        # From the top bonus hole, column 1 down, centre up, right column down.
         self.assertEqual(strategy.hole_ids[9:], (
-            "H01", "H01", "H02", "H02", "H03", "H03", "H06", "H06", "H05",
-            "H05", "H04", "H04", "H07", "H07", "H08", "H08", "H09", "H09"))
-        self.assertEqual(strategy.hole_ids[9:],
-                         build_max_score_strategy(_board_plan(), None, "lower").hole_ids)
+            "H03", "H03", "H02", "H02", "H01", "H01", "H04", "H04", "H05",
+            "H05", "H06", "H06", "H09", "H09", "H08", "H08", "H07", "H07"))
         self.assertEqual(strategy.hole_ids[9:], UPPER_GRID_IDS)
 
     def test_lower_skips_bonus_and_shoots_each_cell_twice_in_serpentine(self):

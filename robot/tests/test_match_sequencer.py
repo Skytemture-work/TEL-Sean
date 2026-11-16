@@ -67,8 +67,8 @@ class UpperHalfTests(unittest.TestCase):
         self.assertEqual(len(h.match.plan), 0)  # hold still until the light is found
         h.tick(lit="H11")
         first = h.fire(30)
-        self.assertEqual(first, ["H11"] * 9 + ["H01", "H01", "H02", "H02", "H03", "H03",
-                                              "H06", "H06", "H05"])
+        self.assertEqual(first, ["H11"] * 9 + ["H03", "H03", "H02", "H02", "H01", "H01",
+                                              "H04", "H04", "H05"])
         h.tick()
         self.assertTrue(h.match.reload_wait)
         self.assertEqual(h.match.reload_balls, 9)
