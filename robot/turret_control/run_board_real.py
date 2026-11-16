@@ -229,6 +229,17 @@ def _parse_pitch_trims(items):
     return trims
 
 
+def _stereo_depth_needed(use_zed_sdk, range_source, zed_depth_compare=False):
+    """Whether the control loop must wait for a stereo depth map.
+
+    Aiming ranges come from the board PnP pose in the default ``pnp`` mode, so
+    waiting for (and computing) a fresh ZED ULTRA depth frame every loop only
+    feeds the dashboard's PnP/ZED comparison.  Request depth only when the
+    range source is ``zed`` or the comparison was asked for explicitly.
+    """
+    return bool(use_zed_sdk and (range_source == "zed" or zed_depth_compare))
+
+
 def _yolo_ms(vision_result):
     """Ultralytics preprocess+inference+postprocess time, excluding board analysis."""
     speed = getattr(getattr(vision_result, "result", None), "speed", None) or {}
@@ -765,6 +776,10 @@ def _run_board_real(
         help="孔的距離來源：pnp = 整片靶的 PnP 位置（預設）；zed = ZED 深度（舊行為，孔內深度會偏遠）",
     )
     parser.add_argument(
+        "--zed-depth-compare", action="store_true",
+        help="pnp 模式下仍每圈計算 ZED 深度，只供儀表板「距離 PnP / ZED」對照（會拖慢迴圈；預設關閉）",
+    )
+    parser.add_argument(
         "--muzzle-speed", type=float, default=DEFAULT_MUZZLE_SPEED_M_S,
         help=f"彈道模型出球速度 m/s（預設 {DEFAULT_MUZZLE_SPEED_M_S}，飛輪 speed=100 實測擬合）",
     )
@@ -1063,6 +1078,10 @@ def _run_board_real(
         )
 
     use_zed_sdk = not (args.zed_uvc or args.opencv_camera)
+    depth_needed = _stereo_depth_needed(use_zed_sdk, args.range_source, args.zed_depth_compare)
+    if use_zed_sdk and not depth_needed:
+        print("ZED 立體深度：pnp 模式不需要，每圈不再等待深度圖（--zed-depth-compare 可恢復對照）。",
+              flush=True)
     if use_zed_sdk:
         try:
             camera = ZedDepthCamera(config)
@@ -1650,14 +1669,14 @@ def _run_board_real(
             capture_started_at = loop_started_at
             if grabber is not None:
                 ok, frame, depth_data, frame_seq, frame_ready_at = grabber.wait_next(
-                    frame_seq, timeout=1.0, need_depth=use_zed_sdk)
+                    frame_seq, timeout=1.0, need_depth=depth_needed)
                 if not ok:
                     if grabber.failed:
                         break
                     continue  # no frame yet; re-check stop_event and health
             else:
                 if use_zed_sdk:
-                    ok, frame, depth_data = camera.read()
+                    ok, frame, depth_data = camera.read(want_depth=depth_needed)
                 else:
                     ok, frame = camera.read()
                     depth_data = None
