@@ -718,6 +718,50 @@ class StallProtectionTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, '堵轉保護'):
             controller._rotate_ammo_slots(manual.AMMO_SLOT_PULSES)
 
+    @patch('builtins.print')
+    def test_rotation_waits_on_run_status_without_polling_the_encoder(self, _):
+        controller = self._manual()
+        controller.ammo_servo, controller.shoot_servo = Mock(), Mock()
+        controller.ammo_servo.run_motor_relative_motion_by_pulses.return_value = (
+            SimpleNamespace(name='RunStarting'))
+        polls = []
+
+        def running():
+            polls.append(1)
+            return len(polls) <= 3  # running for three polls, then stopped
+        controller.ammo_servo.is_motor_running.side_effect = running
+        controller._read_encoder_once = Mock(return_value=(None, None))  # ID2 silent
+        controller._query_status = Mock(return_value=manual.MotorStatus.MotorStop)
+        controller._verify_shooter_home_before_reload = Mock()
+        with patch.object(manual.time, 'sleep'):
+            controller._rotate_ammo_slots(manual.AMMO_SLOT_PULSES)
+        # One encoder try before the move, none while it runs or after it.
+        self.assertEqual(controller._read_encoder_once.call_count, 1)
+        self.assertEqual(
+            controller.ammo_servo.run_motor_relative_motion_by_pulses.call_args.args[2],
+            manual.AMMO_ACCELERATION)
+
+    def _homed(self, confirmed_ago_s, encoder_now):
+        controller = self._manual()
+        controller.shoot_servo = Mock()
+        controller.shoot_servo.query_motor_status.return_value = manual.MotorStatus.MotorStop
+        controller._read_encoder = Mock(return_value=encoder_now)
+        controller._wait_shooter_stopped = Mock(return_value=encoder_now)
+        controller.reload_pending = True
+        controller.current_mode = 'M'
+        controller._shoot_home_encoder = 5
+        controller._shoot_home_confirmed_at = manual.time.monotonic() - confirmed_ago_s
+        controller._verify_shooter_home_before_reload()
+        return controller
+
+    def test_fresh_home_confirmation_needs_one_sample_only(self):
+        self.assertFalse(self._homed(0.1, 8)._wait_shooter_stopped.called)
+
+    def test_stale_or_moved_home_gets_the_full_stability_check(self):
+        self.assertTrue(self._homed(5.0, 8)._wait_shooter_stopped.called)
+        self.assertTrue(self._homed(0.1, 5 + manual.SHOOT_HOME_TOLERANCE_COUNTS + 1)
+                        ._wait_shooter_stopped.called)
+
 
 class ShotToolTests(unittest.TestCase):
     def test_shot_order_parses_repeats_and_rejects_bad_ids(self):

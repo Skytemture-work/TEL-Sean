@@ -137,6 +137,12 @@ SHOOTING_ACCELERATION = 200   # 推球 ID1（手動與自動共用）
 # 彈藥倉 ID2 轉格加速度（MKS 0-255，越大加速越快）。原為 2，轉一格約 4 秒；
 # 2026-11-16 調為與推球 ID1 相同的 200。若轉格卡球或甩球再調小。
 ACCELERATION = 200
+# ID2 彈藥倉轉格的加速度（MKS 0-255，越大加速越快；0 = 不做加減速、直接全速，
+# 不要用）。原本與 ACCELERATION 共用 200：一格約 1.7 s，主要卡在加速段。
+# 2026-11-16 先試 230；轉格時球若晃動或驅動器堵轉保護，改回 200。
+AMMO_ACCELERATION = 230
+# 推球機構回零確認後這段時間內，轉格前只需單次確認仍停在原點（B）。
+SHOOT_HOME_FRESH_S = 1.0
 
 HOME_DIRECTION = Direction.CW
 MOVE_DIRECTION = (
@@ -2016,6 +2022,7 @@ class ManualController:
             servo.notifier.remove_listener(receive_home_result)
 
         encoder = self._wait_shooter_stopped(servo, label)
+        self._shoot_home_confirmed_at = time.monotonic()
         print("[Manual] {}成功，已停止且位置穩定，Encoder={}。".format(label, encoder), flush=True)
         return encoder
 
@@ -2057,11 +2064,27 @@ class ManualController:
             raise RuntimeError("推球機構尚未確認回零成功，禁止轉格")
         if self.current_mode != "M":
             raise RuntimeError("目前不是手動模式，禁止轉格")
+        confirmed_at = getattr(self, "_shoot_home_confirmed_at", None)
+        if (confirmed_at is not None
+                and time.monotonic() - confirmed_at < SHOOT_HOME_FRESH_S
+                and self._shooter_still_home()):
+            # Homing just confirmed it stopped and stable: one sample that it
+            # is still stopped at the same place is enough.
+            return
         self._wait_shooter_stopped(
             self.shoot_servo, "轉格前推球機構確認", self._shoot_home_encoder
         )
         if self.current_mode != "M":
             raise RuntimeError("確認期間已離開手動模式，禁止轉格")
+
+    def _shooter_still_home(self):
+        """One status + encoder sample: ID1 stopped within tolerance of home."""
+        status = self.shoot_servo.query_motor_status()
+        if status != MotorStatus.MotorStop:
+            return False
+        encoder = self._read_encoder(self.shoot_servo, attempts=1)
+        return (isinstance(encoder, int) and not isinstance(encoder, bool)
+                and abs(encoder - self._shoot_home_encoder) <= SHOOT_HOME_TOLERANCE_COUNTS)
 
     def _rotate_ammo_one_slot(self):
         self._rotate_ammo_slots(AMMO_SLOT_PULSES)
@@ -2077,8 +2100,10 @@ class ManualController:
             flush=True,
         )
         # ID2 encoder replies are unreliable and only informational: one quick
-        # try (<= 2 x 0.3 s), then judge the rotation from the run status.
-        before = self._read_encoder(self.ammo_servo, attempts=1)
+        # 0x30 try (<= 0.3 s), then judge the rotation from the run status.
+        before = self._read_encoder_once(self.ammo_servo, 0x30)[0]
+        if before == -1:
+            before = None
         if before is None:
             # The ID2 encoder replies come and go while its status replies stay
             # reliable.  Rotation completion is already judged from the run
@@ -2095,7 +2120,7 @@ class ManualController:
         self._shoot_home_encoder = None
         print("[Manual] 推球機構已確認回零，允許儲存盤移動。", flush=True)
         result = self.ammo_servo.run_motor_relative_motion_by_pulses(
-            Direction.CW, AMMO_SPEED_RPM, ACCELERATION, pulses
+            Direction.CW, AMMO_SPEED_RPM, AMMO_ACCELERATION, pulses
         )
         print("[Manual] 彈藥倉移動指令回傳：", result)
         if result is None:
@@ -2120,13 +2145,13 @@ class ManualController:
                 raise TimeoutError("彈藥倉轉格逾時")
 
             running = self.ammo_servo.is_motor_running()
-            now_encoder = self._read_encoder_once(self.ammo_servo, 0x30)[0]  # 0.3 s max
-            if (
-                before not in (None, -1)
-                and now_encoder not in (None, -1)
-                and now_encoder != before
-            ):
-                movement_seen = True
+            if not seen_running and not movement_seen and before is not None:
+                # Only needed when a short move ends between two status polls;
+                # once running was seen the run status alone ends the wait
+                # (each unanswered ID2 encoder read costs 0.3 s).
+                now_encoder = self._read_encoder_once(self.ammo_servo, 0x30)[0]
+                if now_encoder not in (None, -1) and now_encoder != before:
+                    movement_seen = True
 
             if running:
                 seen_running = True
@@ -2141,7 +2166,8 @@ class ManualController:
 
             time.sleep(POLL_INTERVAL)
 
-        after = self._read_encoder_once(self.ammo_servo, 0x30)[0]
+        after = (self._read_encoder_once(self.ammo_servo, 0x30)[0]
+                 if before is not None else None)
         if before in (None, -1) or after in (None, -1):
             print(
                 "[Manual] 彈藥倉 Encoder 回授無效；以馬達運轉狀態確認動作停止。"
