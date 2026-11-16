@@ -641,7 +641,8 @@ def _run_board_real(
     )
     parser.add_argument(
         "--match-duration", type=float, default=240.0,
-        help="比賽模式：從開賽（辨識到靶板）起算的發射時限秒數（預設 240，預留時間避免中途停機；範圍 30～300）",
+        help="比賽模式：發射時限秒數（預設 240，刻意比 3 分鐘賽制長，避免程式提早停機；"
+             "賽後以急停結束。由 main.py 執行時從 VRA 發車起算，單獨執行時從辨識到靶板起算；範圍 30～300）",
     )
     parser.add_argument(
         "--fire-tolerance-deg", type=float, default=None,
@@ -1161,6 +1162,12 @@ def _run_board_real(
                 reset_positioning()
             elif command == "VISION_OFF":
                 positioning = False
+            elif command.startswith("DEPART "):
+                # VRA release in main.py: the match clock (time.monotonic()).
+                try:
+                    args.match_clock_origin = float(command.split()[1])
+                except (IndexError, ValueError):
+                    print(f"[Aim] 無法解析發車時間：{command!r}", flush=True)
             elif command in ("START upper", "START lower"):
                 if launcher is None:
                     raise RuntimeError("未完成 SWA 機構交接，拒絕開始投球")
@@ -1251,7 +1258,9 @@ def _run_board_real(
             + (f"，先射亮燈加分孔 9 顆（{args.light_wait:g} 秒內未確認亮燈先射 H11；限開賽後 60 秒內），"
                "再照蛇形順序射九宮格，射完 18 顆後等待裝填" if args.match_phase == "upper"
                else "，不射加分孔")
-            + f"；已裝 {args.balls_loaded} 顆，時限 {args.match_duration:g} 秒（自建立計畫起算）；"
+            + f"；已裝 {args.balls_loaded} 顆，時限 {args.match_duration:g} 秒"
+            + ("（自 VRA 發車起算）" if getattr(args, "match_clock_origin", None) is not None
+               else "（自建立計畫起算）") + "；"
             f"到位容許誤差 大孔 {args.fire_tolerance_deg:g}°／小孔 {args.small_fire_tolerance_deg:g}°。",
             flush=True,
         )
@@ -1351,6 +1360,7 @@ def _run_board_real(
     match = (MatchSequencer(
         args.match_phase, args.match_duration, args.balls_loaded,
         lambda new_plan: driver.set_plan(new_plan), light_wait_s=args.light_wait,
+        clock_origin=getattr(args, "match_clock_origin", None),
         start_reload_rotation=lambda: bool(launcher is not None and launcher.start_reload_rotation()),
         stop_flywheels=lambda: launcher.stop_flywheels() if launcher is not None else None,
         start_flywheels=lambda: launcher.start_flywheels() if launcher is not None else None)

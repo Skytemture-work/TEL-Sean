@@ -133,7 +133,7 @@ def read_commands():
         if command == "RELOAD":
             reload_event.set()
         elif command in ("PREPARE_MOTORS", "VISION_ON", "VISION_OFF", "START upper", "START lower",
-                         "POSITIONED", "PHASE upper", "PHASE lower"):
+                         "POSITIONED", "PHASE upper", "PHASE lower") or command.startswith("DEPART "):
             handoff.put(command)
     handoff.put(None)
 
@@ -265,7 +265,8 @@ def main():
         manual_request_since = None
         mode_locked = False
         mode_mask_until = 0.0
-        release_phase = None  # half switch latched at the SWA release
+        release_phase = None  # half switch latched at the VRA release
+        depart_at = None  # time.monotonic() of the VRA release: the match clock
         print("[System] 已啟動，等待 ESP32 第一筆有效封包...", flush=True)
 
         while True:
@@ -355,6 +356,7 @@ def main():
                     mode_locked = False
                     mode_mask_until = 0.0
                     release_phase = None
+                    depart_at = None
                     locked_vy = None
                     latest_vy = None
                     vision_valid_after = time.monotonic()
@@ -507,6 +509,12 @@ def main():
                         if not repositioning:
                             # Latch the half here: pre-aim and START share it.
                             release_phase = "lower" if packet.get("fire") == 1 else "upper"
+                        if depart_at is None and not repositioning:
+                            # The match clock runs from the first VRA release
+                            # (the departure); both processes share CLOCK_MONOTONIC.
+                            depart_at = now
+                            send_aim_command(aim_process, f"DEPART {depart_at:.3f}")
+                            print("[Match] VRA 發車：比賽計時開始", flush=True)
                         if not aim_prepared and aim_process is not None and aim_process.poll() is None:
                             if manual is not None:
                                 manual.close()

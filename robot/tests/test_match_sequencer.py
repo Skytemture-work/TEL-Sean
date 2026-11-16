@@ -8,7 +8,8 @@ from turret_control.scoring_strategy import UPPER_GRID_IDS
 class Harness:
     """Drive a MatchSequencer like the control loop does."""
 
-    def __init__(self, phase, duration=240.0, balls=18, light_wait=5.0, rotation_ok=True):
+    def __init__(self, phase, duration=240.0, balls=18, light_wait=5.0, rotation_ok=True,
+                 clock_origin=None):
         self.plans = []
         self.logs = []
         self.rotations = 0
@@ -22,7 +23,8 @@ class Harness:
         self.match = MatchSequencer(phase, duration, balls, self.plans.append, self.logs.append,
                                     light_wait_s=light_wait, start_reload_rotation=rotate,
                                     stop_flywheels=lambda: self.flywheels.append("off"),
-                                    start_flywheels=lambda: self.flywheels.append("on"))
+                                    start_flywheels=lambda: self.flywheels.append("on"),
+                                    clock_origin=clock_origin)
         self.board = _board_plan()
         self.now = 0.0
 
@@ -184,6 +186,49 @@ class UpperHalfTests(unittest.TestCase):
         self.assertTrue(data["waiting_light"])
         self.assertEqual(data["balls_remaining"], 18)
         self.assertEqual(data["remaining_s"], 239.9)
+
+
+class DepartureClockTests(unittest.TestCase):
+    """main.py passes the VRA departure; positioning took 30 s before now=0."""
+
+    def test_time_limit_counts_from_the_departure(self):
+        h = Harness("lower", duration=180.0, clock_origin=-30.0)
+        h.tick()
+        self.assertEqual(h.match.started_at, 0.0)
+        self.assertEqual(h.match.telemetry(h.now)["remaining_s"], 149.9)
+        h.fire(2)
+        h.now = 149.9
+        h.tick()
+        self.assertIsNone(h.match.stopped)
+        h.now = 150.0
+        h.tick()
+        self.assertEqual(h.match.stopped, "比賽時間到，停止發射")
+
+    def test_bonus_window_counts_from_the_departure(self):
+        h = Harness("upper", duration=180.0, clock_origin=-30.0)
+        h.tick()
+        h.tick(lit="H10")
+        self.assertEqual(h.fire(4), ["H10"] * 4)
+        h.now = 30.0  # 60 s after the departure
+        h.tick()
+        rest = h.fire(30)
+        self.assertNotIn("H10", rest)
+        self.assertTrue(any("略過 5 顆小孔" in line for line in h.logs))
+
+    def test_light_wait_still_counts_from_the_first_shot_chance(self):
+        h = Harness("upper", duration=180.0, light_wait=5.0, clock_origin=-30.0)
+        h.tick()
+        h.now = 4.9
+        h.tick()
+        self.assertTrue(h.match.waiting_light)
+        h.now = 5.0
+        h.tick()
+        self.assertEqual(h.match.bonus_hole_id, "H11")
+
+    def test_departure_more_than_60_s_ago_skips_the_bonus(self):
+        h = Harness("upper", duration=180.0, clock_origin=-61.0)
+        h.tick(lit="H10")
+        self.assertNotIn("H10", h.fire(18))
 
 
 if __name__ == "__main__":

@@ -1,7 +1,9 @@
 """Match flow for --match-fire, one control tick at a time.
 
-The remote switches the robot to auto mode at the whistle, so the match
-starts as soon as the board is seen (no waiting for the light):
+Shooting starts as soon as the board is seen (no waiting for the light).
+The match clock -- the time limit and the upper half's bonus window -- runs
+from ``clock_origin`` (main.py's VRA departure) when given, else from that
+first sight of the board:
 
 * lower half: the 18-ball serpentine plan, no bonus hole;
 * upper half: shoot the lit bonus hole ``UPPER_BONUS_BALLS`` times, only
@@ -40,8 +42,10 @@ class MatchSequencer:
                  *, light_wait_s: float = 5.0,
                  start_reload_rotation: Callable[[], bool] = lambda: True,
                  stop_flywheels: Callable[[], None] = lambda: None,
-                 start_flywheels: Callable[[], None] = lambda: None):
+                 start_flywheels: Callable[[], None] = lambda: None,
+                 clock_origin: Optional[float] = None):
         self.phase = phase
+        self.clock_origin = clock_origin
         self.duration_s = duration_s
         self.magazine_size = balls_loaded
         self.balls_remaining = balls_loaded
@@ -73,7 +77,9 @@ class MatchSequencer:
         return None
 
     def elapsed(self, now: float) -> Optional[float]:
-        return None if self.started_at is None else now - self.started_at
+        """Match time: since the departure, else since shooting started."""
+        origin = self.clock_origin if self.clock_origin is not None else self.started_at
+        return None if origin is None else now - origin
 
     # ---- one tick ---------------------------------------------------------
     def step(self, now: float, board_plan, lit_hole_id: Optional[str], launcher_idle: bool,
@@ -86,18 +92,22 @@ class MatchSequencer:
             if self._board_plan is None or not launcher_idle:
                 return
             self.started_at = now
+            clock = ("自 VRA 發車起算，已過 "
+                     f"{now - self.clock_origin:.1f} 秒" if self.clock_origin is not None
+                     else "自現在起算")
             if self.phase == UPPER_PHASE:
                 self.waiting_light = True
                 self._hand_over(EngagementPlan([]))
-                self._log(f"開賽（遙控器切自動即開始）：上半場，時限 {self.duration_s:g} 秒。"
+                self._log(f"開始射擊：上半場，時限 {self.duration_s:g} 秒（{clock}）。"
                           f"先找亮燈加分孔射 {UPPER_BONUS_BALLS} 顆（限開賽後 "
                           f"{UPPER_BONUS_WINDOW_S:g} 秒內），再射九宮格。")
             else:
-                self._build(None, f"開賽（遙控器切自動即開始）：下半場，時限 "
-                                  f"{self.duration_s:g} 秒，不射加分孔。")
+                self._build(None, f"開始射擊：下半場，時限 {self.duration_s:g} 秒"
+                                  f"（{clock}），不射加分孔。")
 
-        elapsed = now - self.started_at
+        elapsed = self.elapsed(now)
         late = elapsed >= UPPER_BONUS_WINDOW_S
+        shooting_s = now - self.started_at  # the light wait counts from here
         if self.waiting_light:
             if late:
                 self.waiting_light = False
@@ -106,7 +116,7 @@ class MatchSequencer:
                 self.waiting_light = False
                 self.bonus_hole_id = lit_hole_id
                 self._build(lit_hole_id, f"亮燈加分孔 {lit_hole_id}：先射 {UPPER_BONUS_BALLS} 顆。")
-            elif elapsed >= self.light_wait_s:
+            elif shooting_s >= self.light_wait_s:
                 self.waiting_light = False
                 self.bonus_hole_id = UPPER_FALLBACK_BONUS_ID
                 self.bonus_is_fallback = True
@@ -121,7 +131,7 @@ class MatchSequencer:
             self.bonus_closed = True
             self._close_bonus_window()
 
-        if now - self.started_at >= self.duration_s:
+        if elapsed >= self.duration_s:
             self._stop("比賽時間到，停止發射", launcher_idle)
             return
 
