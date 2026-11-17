@@ -711,6 +711,21 @@ def main():
                     brake_until = now + OCCLUSION_BRAKE_SECONDS
                     print("[Auto Drive] 移動中遇到遮擋，緊急停止", flush=True)
 
+                if (
+                    brake_until is not None
+                    and now >= brake_until
+                    and vy_recorded_before_release
+                    and locked_vy
+                    and valid_distance
+                    and not blocked
+                ):
+                    brake_until = None
+                    avoid_until = None
+                    # 避障後只沿 X 軸續行，原本的視覺橫移不再送出。
+                    strafe_until = now
+                    next_auto_status_at = 0.0
+                    print("[Auto Drive] LiDAR 前方已清空，恢復目標距離定位", flush=True)
+
                 if brake_until is not None:
                     lidar_status = "遮擋後緊急停止"
                     if now >= brake_until:
@@ -720,9 +735,6 @@ def main():
                         elif not valid_distance:
                             # 距離不明時停車，等待下一筆有效回波。
                             lidar_status = "遮擋後等待有效 LiDAR 距離"
-                        elif not blocked:
-                            auto_complete = True
-                            completion_reason = "LiDAR 前方已清空，停止避障橫移"
                         elif avoid_until is not None and now >= avoid_until:
                             lidar_status = "避障橫移達時限，停車等待前方清空"
                         else:
