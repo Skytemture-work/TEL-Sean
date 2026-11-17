@@ -1745,6 +1745,16 @@ class ManualController:
                 raise
         return True
 
+    def turn_startup_indicator(self):
+        """Turn two slots before main starts dispatching mode or motor commands."""
+        self._go_home(self.shoot_servo, HOME_DIRECTION, "開機提示轉格前 ID1 回原點")
+        move = self._start_ammo_move(AMMO_SLOT_PULSES * 2, verify_home=False)
+        while not move.poll():
+            time.sleep(POLL_INTERVAL)
+        move.finish()
+        self.check_health()
+        print("[System] 開機提示轉格完成。", flush=True)
+
     def signal_model_ready(self, slots=None):
         """Auto mode, before the release: turn the magazine as a visible
         "model loaded" sign.  Not counted as fired slots."""
@@ -1780,6 +1790,7 @@ class ManualController:
             print("[Manual] 提示轉格完成。", flush=True)
         except Exception as exc:
             print("[Manual Error] 提示轉格失敗：{}".format(exc), flush=True)
+            self.shot_error = "YOLO 就緒提示轉格失敗：{}".format(exc)
             self._emergency_stop(self.ammo_servo, "彈藥倉")
             self._emergency_stop(self.shoot_servo, "射擊機構")
         finally:
@@ -1788,11 +1799,16 @@ class ManualController:
                 self.busy = False
 
     def wait_signal_turn(self, timeout=20.0):
-        """Let a running model-ready turn finish (close() would e-stop it)."""
+        """Return whether the model-ready turn finished successfully."""
         thread = getattr(self, "_signal_thread", None)
-        if thread is not None and thread.is_alive():
-            print("[Manual] 等提示轉格完成再交接機構…", flush=True)
-            thread.join(timeout)
+        if thread is None:
+            return False
+        thread.join(timeout)
+        if thread.is_alive():
+            return False
+        if self.shot_error is not None:
+            raise RuntimeError(self.shot_error)
+        return True
 
     def request_reload(self):
         """啟動一次補彈，與 FIRE 共用馬達的忙碌狀態。"""
