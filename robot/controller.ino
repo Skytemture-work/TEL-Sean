@@ -4,8 +4,8 @@
 // =====================
 // FlySky iBUS (自行解析)
 // =====================
-#define IBUS_RX 13
-#define IBUS_TX 14
+#define IBUS_RX 40
+#define IBUS_TX 39
 #define IBUS_CH_NUM 14
 #define IBUS_TIMEOUT 500
 
@@ -13,6 +13,7 @@ HardwareSerial ibusSerial(1);
 
 uint16_t ibusCh[IBUS_CH_NUM];
 unsigned long lastIbusTime = 0;
+bool hasIbusPacket = false;
 
 // =====================
 // Xavier UART (Serial2)
@@ -58,9 +59,69 @@ HardwareSerial xavierSerial(2);
 #define PWM_RESOLUTION 8
 
 // =====================
+// 三顆 Sharp GP2Y0A21 類比紅外線距離感測器
+// =====================
+constexpr unsigned long SHARP_SAMPLE_INTERVAL_MS = 50;
+constexpr uint32_t SHARP_MIN_VALID_MV = 150;
+
+struct SharpSensor {
+  uint8_t pin;
+  uint32_t stopMv;
+  uint32_t releaseMv;
+  uint32_t previousMv;
+  bool blocked;
+};
+
+// 900 / 800 mV 是約 30 / 35 cm 的初始值。
+// 請依各感測器在這兩個距離量到的電壓分別校正。
+SharpSensor sharpSensors[] = {
+  {12, 900, 800, 0, false},  // 左
+  {13, 900, 800, 0, false},  // 中
+  {14, 900, 800, 0, false},  // 右
+};
+
+void updateSharpSensors() {
+  static unsigned long lastSampleMs = 0;
+  const unsigned long now = millis();
+  if (now - lastSampleMs < SHARP_SAMPLE_INTERVAL_MS)
+    return;
+  lastSampleMs = now;
+
+  for (auto &sensor : sharpSensors) {
+    const uint32_t a = analogReadMilliVolts(sensor.pin);
+    const uint32_t b = analogReadMilliVolts(sensor.pin);
+    const uint32_t c = analogReadMilliVolts(sensor.pin);
+    const uint32_t mv = a + b + c - min(a, min(b, c)) - max(a, max(b, c));
+
+    if (mv < SHARP_MIN_VALID_MV) {
+      // 無效讀值不能解除已觸發的煞車。
+      sensor.previousMv = 0;
+      continue;
+    }
+
+    if (mv <= sensor.releaseMv) {
+      sensor.blocked = false;
+    }
+    else if (sensor.previousMv != 0 && mv > sensor.stopMv &&
+             mv > sensor.previousMv) {
+      sensor.blocked = true;
+    }
+    sensor.previousMv = mv;
+  }
+}
+
+bool sharpObstacleBlocked() {
+  for (const auto &sensor : sharpSensors) {
+    if (sensor.blocked)
+      return true;
+  }
+  return false;
+}
+
+// =====================
 // 系統狀態變數
 // =====================
-char currentMode = 'M';  // 'M' = Manual, 'A' = Auto
+char currentMode = 'A';  // 'M' = Manual, 'A' = Auto
 
 int manual_yaw = 50;
 int manual_pitch = 50;
@@ -318,6 +379,10 @@ void setup() {
 
   setBrake(true);
 
+  for (const auto &sensor : sharpSensors) {
+    analogSetPinAttenuation(sensor.pin, ADC_11db);
+  }
+
   Serial.println("MECANUM & XAVIER UART READY");
 }
 
@@ -332,7 +397,7 @@ void loop() {
   ibusUpdate();
 
   bool ibusConnected =
-    (millis() - lastIbusTime <= IBUS_TIMEOUT);
+    hasIbusPacket && (millis() - lastIbusTime <= IBUS_TIMEOUT);
 
   // ==========================================
   // 1. 讀取遙控器 iBUS 通道資料
@@ -350,8 +415,8 @@ void loop() {
   int swC = safeRead(8);
   int swD = safeRead(9);
 
-  // 模式切換
-  currentMode = (swA == 1) ? 'A' : 'M';
+  // 首筆有效 iBUS 封包抵達前採用預設 A，之後由 SWA 決定。
+  currentMode = (!hasIbusPacket || swA == 1) ? 'A' : 'M';
 
   // SW2：底盤 / 砲台控制
   bool isTurretControl = (swB > 1500);
@@ -413,8 +478,10 @@ void loop() {
   // ==========================================
   // 3. 底盤馬達控制與安全保護
   // ==========================================
-  if (!ibusConnected) {
-    // 遙控器失聯：停止底盤並啟動煞車
+  updateSharpSensors();
+  const bool obstacleStop = sharpObstacleBlocked();
+  if (obstacleStop || !ibusConnected) {
+    // 紅外線避障或遙控器失聯：四輪 PWM 歸零並啟動煞車
     driveMecanum(0, 0, 0, 0);
   }
   else if (currentMode == 'M') {
@@ -461,6 +528,12 @@ void loop() {
   // VRA 轉到高端時，自動模式才送出啟動訊號。
   int send_auto_start = (currentMode == 'A' && vrA >= 1800) ? 1 : 0;
 
+  if (obstacleStop) {
+    send_vx = 0;
+    send_vy = 0;
+    send_wz = 0;
+  }
+
   String txPacket =
     "E," + String(currentMode) + "," +
     String(send_vx) + "," +
@@ -494,7 +567,15 @@ void loop() {
   Serial.print(strafe);
 
   Serial.print("\tRotate:");
-  Serial.println(rotate);
+  Serial.print(rotate);
+  Serial.print("\tSharp mV(L/C/R):");
+  Serial.print(sharpSensors[0].previousMv);
+  Serial.print('/');
+  Serial.print(sharpSensors[1].previousMv);
+  Serial.print('/');
+  Serial.print(sharpSensors[2].previousMv);
+  Serial.print("\tSharpBrake:");
+  Serial.println(obstacleStop ? "ON" : "OFF");
 
   delay(20);
 
@@ -573,6 +654,7 @@ void ibusUpdate() {
         }
 
         lastIbusTime = millis();
+        hasIbusPacket = true;
       }
     }
   }
