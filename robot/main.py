@@ -270,11 +270,19 @@ def main():
     # 手動模式控制器：接收遙控器封包，管理砲台指令、射擊與彈藥倉格位
     manual = None
     try:
+        if uart.ser is None or not uart.ser.is_open:
+            raise RuntimeError("Xavier UART 未開啟，停止啟動")
+        print("[System] 開機檢查 DM、MKS CAN 與雙 VESC", flush=True)
+        manual = ManualController(uart=uart)
+        manual.check_health()
+        print("[System] 設備初始化成功，彈藥倉轉兩格", flush=True)
+        manual.turn_startup_indicator()
         current_mode = None
         startup_mode_deadline = time.monotonic() + STARTUP_MODE_TIMEOUT_S
         awaiting_phase = False
         aim_started = False
         aim_prepared = False
+        model_turn_started = False
         last_auto_reload = None
         next_auto_status_at = 0.0
         last_received_mode = None
@@ -318,8 +326,14 @@ def main():
                     and packet.get("mode") == "M"):
                 # ESP32 rebooting after the reload: keep auto, read the rest.
                 packet["mode"] = current_mode
-            if packet is not None:
-                packet_mode = packet.get("mode", "?")
+            default_to_auto = (
+                current_mode is None
+                and raw_packet_mode not in ("M", "A")
+                and time.monotonic() >= startup_mode_deadline
+            )
+            if packet is not None or default_to_auto:
+                mode_packet = packet if packet is not None else {}
+                packet_mode = mode_packet.get("mode", "?")
                 if packet_mode != last_received_mode:
                     print(f"[ESP32 MODE] 收到 {packet_mode!r}，目前模式 {current_mode}", flush=True)
                     last_received_mode = packet_mode
@@ -350,9 +364,13 @@ def main():
                 #     ),
                 #     flush=True,
                 # )
-                new_mode = packet.get("mode", current_mode)
-                if new_mode not in ("M", "A"):
-                    new_mode = current_mode  # 'X' = ESP32 has no remote signal
+                if default_to_auto:
+                    new_mode = "A"
+                    print("[System] 等待 ESP32 模式逾時，預設 A，等待放行。", flush=True)
+                else:
+                    new_mode = mode_packet.get("mode", current_mode)
+                    if new_mode not in ("M", "A"):
+                        new_mode = current_mode  # 'X' = ESP32 has no remote signal
                 if current_mode == "A" and new_mode == "M":
                     mode_now = time.monotonic()
                     confirm_s = MODE_LOCK_ESCAPE_S if mode_locked else MODE_TO_MANUAL_CONFIRM_S
@@ -388,6 +406,7 @@ def main():
                         if lidar is not None:
                             lidar.stop()
 
+                    model_turn_started = False
                     auto_complete = False
                     auto_started = False
                     awaiting_phase = False
@@ -416,7 +435,7 @@ def main():
                         print("[System] 手動控制器初始化完成", flush=True)
                     if manual is not None:
                         manual.on_mode_change(
-                            new_mode, fire=packet.get("fire", 0), reload=packet.get("reload")
+                            new_mode, fire=mode_packet.get("fire", 0), reload=mode_packet.get("reload")
                         )
 
                     if new_mode == "A":
@@ -449,10 +468,6 @@ def main():
                     continue
 
             else:
-                if current_mode is None and time.monotonic() >= startup_mode_deadline:
-                    current_mode = "M"
-                    print("[System] 等待 ESP32 逾時，預設 M；收到有效封包後才初始化機構。",
-                          flush=True)
                 uart.report_if_silent()
 
             # 自動瞄準子程序意外結束（例如機構故障）時，不要默默停在原地：
@@ -548,9 +563,13 @@ def main():
                 pre_events = []
                 latest_vy = read_positioning_vy(vision_socket, vision_valid_after, latest_vy,
                                                 pre_events)
-                if "MODEL_READY" in pre_events and manual is not None and not aim_prepared:
-                    # Visible sign that the model is loaded: the magazine turns.
-                    manual.signal_model_ready()
+                if "MODEL_READY" in pre_events and manual is not None and not model_turn_started:
+                    model_turn_started = manual.signal_model_ready()
+                    if not model_turn_started:
+                        raise RuntimeError("無法啟動 YOLO 就緒提示轉格")
+                model_turn_ready = manual is None or (
+                    model_turn_started and manual.wait_signal_turn(timeout=0)
+                )
                 if packet is not None and packet.get("mode") == "A":
                     # A re-departure after the reload needs no VRA release.
                     swa_enabled = packet.get("auto_start") == 1 or repositioning
@@ -570,7 +589,7 @@ def main():
                         positioning_moved = False
                         brake_until = None
                         avoid_until = None
-                    elif not auto_started and not reposition_hold:
+                    elif not auto_started and not reposition_hold and model_turn_ready:
                         # Keep the last seen vy: a single stale sample at the
                         # moment of release must not drop the strafe direction.
                         if latest_vy is not None:
@@ -587,7 +606,6 @@ def main():
                             print("[Match] VRA 發車：比賽計時開始", flush=True)
                         if not aim_prepared and aim_process is not None and aim_process.poll() is None:
                             if manual is not None:
-                                manual.wait_signal_turn()  # close() would e-stop it
                                 manual.close()
                                 manual = None
                             # The half switch is already set on release: tell the aim
@@ -615,7 +633,9 @@ def main():
                     )
                     if now >= next_auto_status_at:
                         next_auto_status_at = now + AUTO_STATUS_INTERVAL_SECONDS
-                        if locked_vy is None:
+                        if not model_turn_ready:
+                            print("[Auto Drive] 等待 YOLO 就緒與提示轉格完成", flush=True)
+                        elif locked_vy is None:
                             print("[Auto Drive] 等待 auto_start=1", flush=True)
                         else:
                             print(
