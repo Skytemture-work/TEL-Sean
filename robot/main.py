@@ -275,8 +275,6 @@ def main():
         print("[System] 開機檢查 DM、MKS CAN 與雙 VESC", flush=True)
         manual = ManualController(uart=uart)
         manual.check_health()
-        print("[System] 設備初始化成功，彈藥倉轉兩格", flush=True)
-        manual.turn_startup_indicator()
         current_mode = None
         startup_mode_deadline = time.monotonic() + STARTUP_MODE_TIMEOUT_S
         awaiting_phase = False
@@ -433,11 +431,6 @@ def main():
                         print("[System] 正在初始化手動控制器（DM / MKS CAN / VESC）", flush=True)
                         manual = ManualController(uart=uart)
                         print("[System] 手動控制器初始化完成", flush=True)
-                    if manual is not None:
-                        manual.on_mode_change(
-                            new_mode, fire=mode_packet.get("fire", 0), reload=mode_packet.get("reload")
-                        )
-
                     if new_mode == "A":
                         uart.send_packet(
                             mode="A", vx=0, vy=0, wz=0, yaw=50, pitch=50, fire=0, speed=0
@@ -457,8 +450,21 @@ def main():
                             lidar = LidarAvoidance()
                             lidar.start()
                         next_auto_status_at = 0.0
+                    initial_mode = current_mode is None
+                    if initial_mode:
+                        # Keep MODEL_READY queued until the startup indicator finishes.
+                        print("[System] 設備初始化成功，彈藥倉轉兩格", flush=True)
+                        manual.turn_startup_indicator()
+                    if manual is not None:
+                        manual.on_mode_change(
+                            new_mode, fire=mode_packet.get("fire", 0), reload=mode_packet.get("reload")
+                        )
+
                     current_mode = new_mode
                     print(f"[Mode Switch] 已切換至 {current_mode}", flush=True)
+                    if initial_mode:
+                        # Only a fresh packet after the startup motion can release the chassis.
+                        continue
 
                 if current_mode == "M":
                     # 手動模式：使用遙控器 yaw/pitch 控制砲台方向，
