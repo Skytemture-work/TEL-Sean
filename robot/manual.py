@@ -1428,7 +1428,13 @@ class _AmmoMove:
             if self._stopped_at is None:
                 self._stopped_at = time.monotonic()
             elif time.monotonic() - self._stopped_at >= SETTLE_TIME:
+                # A driver without power also reads "not running": only a
+                # status reply proves the move ended, not the 24 V.
+                status = ctrl._query_status(ctrl.ammo_servo)
+                if status is None or status == MotorStatus.Fail:
+                    raise RuntimeError("彈藥倉轉格結束時沒有狀態回應（可能已斷電），轉格可能未完成")
                 self.done = True
+                ctrl._job_turn_state = "done"
         elif elapsed > 2.0:
             raise RuntimeError("彈藥倉未偵測到移動")
         return self.done
@@ -1494,6 +1500,12 @@ class ManualController:
         self._shoot_home_encoder = None
         self._startup_home_encoder = None
         self.shot_error = None
+        # Emergency stop at any time: what the failed job was doing, so the
+        # match can carry on after the power is back (see recover_after_power_loss).
+        self._fault = None
+        self._job_start = (self.current_slot, self.slots_fired_since_reload)
+        self._job_turn_state = "none"  # magazine turn of the running job: none/active/done
+        self._resume_turn_pulses = 0
         self.current_mode = "M"
         self.last_yaw = 50
         self.last_pitch = 50
@@ -1839,6 +1851,7 @@ class ManualController:
                 raise
 
     def _reload_worker(self):
+        self._begin_job()
         try:
             if self.current_mode != "M":
                 return
@@ -1858,6 +1871,7 @@ class ManualController:
             self.shot_stage = 0
             print(f"[Reload] ID2 補彈完成，目前格位 {self.current_slot}。", flush=True)
         except Exception as exc:
+            self._record_fault("reload")
             self.shot_error = f"補彈失敗：{exc}"
             print(f"[Reload Error] {self.shot_error}", flush=True)
             self._emergency_stop(self.shoot_servo, "射擊機構")
@@ -1868,7 +1882,119 @@ class ManualController:
                 self.reload_pending = False
                 self.busy = False
 
+    # ---- emergency stop at any time --------------------------------------
+    def _begin_job(self):
+        self._job_start = (self.current_slot, self.slots_fired_since_reload)
+        self._job_turn_state = "none"
+
+    def _record_fault(self, job):
+        """Remember where a failing job stopped (an e-stop shows up as a failure)."""
+        with self.lock:
+            released = self.shot_released_seq >= getattr(self, "_active_request_seq", 1 << 62)
+        self._fault = {
+            "job": job,
+            "stage": self.shot_stage,
+            "released": job == "shot" and released,
+            "turn": getattr(self, "_job_turn_state", "none"),
+            "slot": self._job_start[0],
+            "slots_fired": self._job_start[1],
+            "pulses": getattr(self, "_resume_turn_pulses", 0),
+        }
+
+    def recover_after_power_loss(self):
+        """Bookkeeping once the 24 V is back (after reconfigure_mks_after_power_loss).
+
+        Keeps the balls still in the magazine: an interrupted stage is shot
+        again unless its ball was already out; a magazine turn that never
+        started is made up by the resume job.  Returns ``(note, turn_pulses)``:
+        ``note`` asks the team to align the magazine by hand when the power
+        was cut while it was turning (its position is lost), else None.
+        """
+        with self.lock:
+            if self.busy:
+                raise RuntimeError("發射機構工作尚未結束，稍後再恢復")
+            fault, self._fault = self._fault, None
+            self.shot_error = None
+        self._push_position = None  # the resume job homes ID1 first
+        self._turned_in_stage3 = False
+        needed, note = 0, None
+        if fault is not None:
+            job = fault["job"]
+            if job == "shot" and fault["released"] and fault["stage"] < 2:
+                self.shot_stage = fault["stage"] + 1
+            elif job == "shot" and fault["released"]:
+                # Ball 3 is out: this slot is empty, the next one comes up.
+                self.shot_stage = 0
+                self.slots_fired_since_reload = fault["slots_fired"] + 1
+                self.current_slot = fault["slot"] % SLOTS_PER_MAGAZINE + 1
+                if self.slots_fired_since_reload < SLOTS_PER_MAGAZINE:
+                    needed = AMMO_SLOT_PULSES
+            elif job == "shot":
+                self.shot_stage = fault["stage"]  # the ball did not leave: same stage again
+            elif job == "reload":
+                self.shot_stage = 0
+                self.slots_fired_since_reload = 0
+                self.current_slot = (fault["slot"] - 1 + RELOAD_SLOTS) % SLOTS_PER_MAGAZINE + 1
+                needed = RELOAD_PULSES
+            elif job == "resume":
+                needed = fault["pulses"]
+            if needed and fault["turn"] == "done":
+                needed = 0
+            elif needed and fault["turn"] == "active":
+                needed = 0
+                note = ("斷電時彈藥倉正在轉格，位置已不準：請手動把彈藥倉轉到下一格對準推球口"
+                        "（格位 {}）".format(self.current_slot))
+        self._resume_turn_pulses = needed
+        print("[Manual] 復電後恢復：彈藥倉格位 {}，下一發第 {}/3 階段{}。".format(
+            self.current_slot, self.shot_stage + 1,
+            "，ID1 回原點後補轉 {} pulses".format(needed) if needed else ""), flush=True)
+        return note, needed
+
+    def request_resume_after_power_loss(self):
+        """Background job after the reload switch: ID1 home, then any owed turn."""
+        with self.lock:
+            if self.busy or self.shot_error is not None:
+                return False
+            self.busy = True
+            # Joined by close() like a reload.
+            self.reload_thread = threading.Thread(target=self._resume_worker, name="power-resume")
+            try:
+                self.reload_thread.start()
+            except RuntimeError:
+                self.busy = False
+                self.reload_thread = None
+                raise
+        return True
+
+    def _resume_worker(self):
+        self._begin_job()
+        try:
+            self.reload_pending = False
+            home = self._go_home(self.shoot_servo, HOME_DIRECTION, "復電後 ID1 回原點")
+            self._push_position = 0
+            self._pusher_home_encoder = home
+            pulses = getattr(self, "_resume_turn_pulses", 0)
+            if pulses:
+                self._shoot_home_encoder = home
+                self.reload_pending = True
+                self._rotate_ammo_slots(pulses)
+                self._resume_turn_pulses = 0
+            print("[Manual] 復電恢復完成：ID1 在原點{}。".format(
+                "，彈藥倉已補轉格" if pulses else ""), flush=True)
+        except Exception as exc:
+            self._record_fault("resume")
+            self.shot_error = "復電恢復失敗：{}".format(exc)
+            print("[Manual Error] {}".format(self.shot_error), flush=True)
+            self._emergency_stop(self.shoot_servo, "射擊機構")
+            self._emergency_stop(self.ammo_servo, "彈藥倉")
+        finally:
+            with self.lock:
+                self._shoot_home_encoder = None
+                self.reload_pending = False
+                self.busy = False
+
     def _shot_worker(self):
+        self._begin_job()
         try:
             if self._shot_cancel.is_set():
                 return
@@ -1918,6 +2044,7 @@ class ManualController:
                 self.current_slot
             ), flush=True)
         except Exception as exc:
+            self._record_fault("shot")
             self._pusher_home_encoder = None
             self._turned_in_stage3 = False
             with self.lock:
@@ -2403,6 +2530,8 @@ class ManualController:
             # 此次確認只能用於一筆轉格指令，失敗或完成後都不能重複使用。
             self._shoot_home_encoder = None
             print("[Manual] 推球機構已確認回零，允許儲存盤移動。", flush=True)
+        # From here on a power cut leaves the magazine between two slots.
+        self._job_turn_state = "active"
         result = self.ammo_servo.run_motor_relative_motion_by_pulses(
             Direction.CW, AMMO_SPEED_RPM, AMMO_ACCELERATION, pulses
         )

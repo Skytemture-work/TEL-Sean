@@ -150,6 +150,43 @@ class PanelLauncher:
         self._vesc_paused = False
         print("[VESC] 復電後已重新連線，飛輪保持不轉，等待裝填完成。", flush=True)
 
+    def release_flywheels_after_power_loss(self):
+        """Emergency stop / mechanism fault at any time: let the flywheels go.
+
+        Without power the VESC thread has already failed and closes at once;
+        after a fault with the power still on this is the normal soft stop
+        (hands will be near the launcher).  Never raises.
+        """
+        if self._vesc_paused:
+            return
+        try:
+            self.controller.vesc_controller.close()
+        except Exception as exc:
+            print(f"[VESC] 斷電／故障時關閉飛輪控制：{exc}", flush=True)
+        self._vesc_paused = True
+
+    def recover_after_power_loss(self):
+        """Carry the match on after the power is back (worker already idle).
+
+        A stage that released its ball stays pending, so the engagement counts
+        it on the next tick; one that did not is dropped and the hole is shot
+        again.  Returns the controller's note for the team (or None).
+        """
+        note, _ = self.controller.recover_after_power_loss()
+        self._authorization = None
+        if self.pending and not self._pending_shot_released():
+            self._pending_target = self._pending_plan = self._pending_index = None
+            self._pending_revision = self._pending_seq = None
+            print("[Aim] 斷電時這一發尚未推出：同一孔重新發射。", flush=True)
+        self.message = "斷電後恢復中"
+        return note
+
+    def start_resume_after_power_loss(self):
+        """ID1 home (and a turn the power cut skipped); firing waits on mechanism_busy."""
+        if self.controller.busy:
+            return False
+        return bool(self.controller.request_resume_after_power_loss())
+
     def start_flywheels(self):
         """Reopen both ports at zero before requesting operating speed."""
         if self._vesc_paused:

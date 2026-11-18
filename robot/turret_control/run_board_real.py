@@ -1096,6 +1096,104 @@ def _run_board_real(
             spin_up=spin_up,
         )
 
+    # ---- emergency stop at any time after PREPARE_MOTORS -------------------
+    # The motor 24 V drops (DM worker trips, MKS drivers reboot, VESC USB
+    # drops); the Xavier, the cameras and this process stay up.  The match
+    # state is kept; the team pulls the robot back to the start zone, repairs
+    # it, and the remote's reload switch (0 -> 1) is the new departure.
+    start_repositioning = False  # START arrived during a recovery before START
+    motor_users = []  # objects that follow a DM replacement (.motors)
+
+    def _swap_dm_after_power_loss():
+        nonlocal motors
+        try:
+            motors.close()
+        except Exception as exc:
+            print(f"[E-STOP] 關閉斷電前的雙軸控制：{exc}", flush=True)
+        new_motors = create_motors()
+        new_motors.enable()  # closes itself if the motors do not answer
+        motors = new_motors
+        for user in motor_users:
+            user.motors = new_motors
+        monitor = getattr(launcher.controller, "dm_controller", None)
+        if monitor is not None and hasattr(monitor, "motors"):
+            monitor.motors = new_motors
+
+    def _power_recovery_try(state):
+        """One attempt to bring the mechanism back; True once DM, MKS and VESC answer.
+
+        The magazine and the flywheels stay still (hands are near the
+        launcher) until the reload switch confirms the departure.
+        """
+        controller = launcher.controller
+        if controller.busy:
+            return False  # the interrupted stage is still timing out
+        try:
+            if not state["dm"]:
+                try:
+                    controller.dm_controller.check_health()
+                except Exception:
+                    _swap_dm_after_power_loss()
+                    print("[E-STOP] 偵測到復電：DM 已重新使能（砲口鎖住）。", flush=True)
+                state["dm"] = True
+            if not state["mks"]:
+                controller.reconfigure_mks_after_power_loss()
+                state["note"] = launcher.recover_after_power_loss()
+                state["mks"] = True
+            if not state["vesc"]:
+                launcher.reconnect_flywheels_stopped()
+                state["vesc"] = True
+        except Exception as exc:
+            if state["dm"]:  # power is back, a later step failed: say why
+                print(f"[E-STOP] 復電後準備未完成（{exc}），{POWER_RETRY_S:g} 秒後重試。", flush=True)
+            return False
+        print("[E-STOP] 機構已就緒（DM、MKS、VESC），飛輪不轉、推球與彈藥倉不動；"
+              "車拉回出發區、修好後，遙控器 RELOAD 撥 0 再撥 1 出發。", flush=True)
+        if state["note"]:
+            print(f"[E-STOP] 注意：{state['note']}", flush=True)
+        return True
+
+    def _enter_power_loss(cause):
+        print(f"[E-STOP] 馬達斷電或機構異常（{cause}）：保留比賽進度與剩餘球數，飛輪停止。"
+              "復電後自動準備機構；車拉回出發區、修好後，遙控器 RELOAD 撥 0 再撥 1，"
+              "就從出發區重新出發，接著射下一孔。", flush=True)
+        if reload_event is not None:
+            reload_event.clear()  # only a press after the stop counts
+        launcher.release_flywheels_after_power_loss()
+        if event_callback is not None:
+            event_callback("POWER_LOST")  # main.py stops the chassis
+        now_s = time.monotonic()
+        return {"dm": False, "mks": False, "vesc": False, "note": None, "ready": False,
+                "confirmed": False, "next_try": now_s, "next_note": now_s + 5.0}
+
+    def _step_power_loss(state, extra_confirm=False):
+        """Non-blocking tick of a recovery; True once ready and confirmed."""
+        now_s = time.monotonic()
+        # A press before the mechanism is ready is kept, not lost.
+        state["confirmed"] = bool(state["confirmed"] or extra_confirm
+                                  or _take_external_reload(reload_event, True))
+        if not state["ready"] and now_s >= state["next_try"]:
+            state["next_try"] = now_s + POWER_RETRY_S
+            state["ready"] = _power_recovery_try(state)
+            return False
+        if state["ready"] and state["confirmed"]:
+            return True
+        if now_s >= state["next_note"]:
+            state["next_note"] = now_s + 5.0
+            if state["ready"]:
+                print("[E-STOP] 機構就緒，等待 RELOAD（撥 0 再撥 1）…"
+                      + (f"（{state['note']}）" if state["note"] else ""), flush=True)
+            else:
+                print("[E-STOP] 等待復電…" + ("（已收到 RELOAD，復電後立即出發）"
+                                             if state["confirmed"] else ""), flush=True)
+        return False
+
+    def _resume_mechanism_after_power_loss():
+        """Departure after a recovery outside the reload: wheels up, ID1 home."""
+        launcher.start_flywheels()
+        if not launcher.start_resume_after_power_loss():
+            print("[E-STOP] 推球回原點未能開始（機構忙碌或故障）。", flush=True)
+
     use_zed_sdk = not (args.zed_uvc or args.opencv_camera)
     depth_needed = _stereo_depth_needed(use_zed_sdk, args.range_source, args.zed_depth_compare)
     if use_zed_sdk and not depth_needed:
@@ -1174,7 +1272,32 @@ def _run_board_real(
             positioning_pose = BoardPoseTracker(config)
             reference_plan = None
 
+        power_lost = None  # recovery state after an emergency stop before START
+        deferred_start = None  # START received during that recovery
+        next_health_at = 0.0
+
         while stop_event is None or not stop_event.is_set():
+            if launcher is not None:
+                # Emergency stop while the chassis is still on its way.
+                now_s = time.monotonic()
+                if power_lost is None and now_s >= next_health_at:
+                    next_health_at = now_s + 0.1
+                    try:
+                        launcher.check_health()
+                    except Exception as exc:
+                        power_lost = _enter_power_loss(exc)
+                if power_lost is not None and _step_power_loss(power_lost):
+                    power_lost = None
+                    _resume_mechanism_after_power_loss()
+                    if event_callback is not None:
+                        event_callback("REPOSITION")  # main.py: depart again
+                    print("[E-STOP] 已收到 RELOAD：從出發區重新出發；飛輪起轉、推球回原點。",
+                          flush=True)
+                    if deferred_start is not None:
+                        # main.py already sent START: shoot once it reports POSITIONED.
+                        args.match_phase = deferred_start
+                        start_repositioning = True
+                        break
             if not model_ready and not model_thread.is_alive():
                 model_thread.join()
                 if "model" not in model_box:
@@ -1198,7 +1321,8 @@ def _run_board_real(
                 return
             if command == "PREPARE_MOTORS" and launcher is None:
                 motors = create_motors()
-                startup_cleanup.callback(motors.close)
+                # Lambdas: an emergency stop may replace ``motors`` before START.
+                startup_cleanup.callback(lambda: motors.close())
                 motors.enable()
                 # Pre-aim while the chassis is still driving: head for the usual
                 # first target (H11, top centre) now, so after the stop only a
@@ -1209,7 +1333,7 @@ def _run_board_real(
                 # same shutdown as after a match -- flywheels off and pusher
                 # home (launcher.close), then the turret home, then disable.
                 # ExitStack is LIFO, so register in reverse order.
-                startup_cleanup.callback(_home_turret_and_wait, motors)
+                startup_cleanup.callback(lambda: _home_turret_and_wait(motors))
                 launcher = create_launcher(spin_up=True)
                 startup_cleanup.callback(launcher.close, home_pusher=True)
                 print("[Aim] DM 已使能，飛輪預轉中，等待定位完成"
@@ -1233,6 +1357,10 @@ def _run_board_real(
             elif command in ("START upper", "START lower"):
                 if launcher is None:
                     raise RuntimeError("未完成 SWA 機構交接，拒絕開始投球")
+                if power_lost is not None:
+                    deferred_start = command.split()[1]
+                    print("[Aim] 斷電復原中收到 START：復電並收到 RELOAD 後再開始。", flush=True)
+                    continue
                 args.match_phase = command.split()[1]
                 break
             elif command == "" and positioning and positioning_vision is not None:
@@ -1340,6 +1468,7 @@ def _run_board_real(
         flush=True,
     )
     turret = TurretController(config, motors)
+    motor_users.append(turret)
     driver = BoardEngagement(
         config,
         turret,
@@ -1543,91 +1672,48 @@ def _run_board_real(
         # then rebuild the DM control, re-enable the MKS and carry on.
         forced_reload_confirm = False
 
-        def _replace_dm_after_power_loss():
-            nonlocal motors
-            try:
-                motors.close()
-            except Exception as exc:
-                print(f"[E-STOP] 關閉斷電前的雙軸控制：{exc}", flush=True)
-            new_motors = create_motors()
-            new_motors.enable()  # closes itself if the motors do not answer
-            motors = new_motors
-            turret.motors = new_motors
-            monitor = getattr(launcher.controller, "dm_controller", None)
-            if monitor is not None and hasattr(monitor, "motors"):
-                monitor.motors = new_motors
-
         def _wait_out_power_loss(cause):
-            """Recover by itself once the 24 V is back; depart on the reload confirmation.
+            """Emergency stop (or a mechanism fault) at any time during the match.
 
-            While the team pulls the robot back and refills it, keep trying the
-            DM (every POWER_RETRY_S).  As soon as it answers the power is back:
-            re-enable the DM (turret held, no sagging), set the MKS up again and
-            reconnect the VESC with the wheels released.  The magazine and the
-            flywheels still wait for the reload confirmation (hands are near the
-            launcher), which is also the departure.  Returns True to continue,
-            False on stop.
+            Keep the match state and the balls left.  Once the 24 V is back the
+            DM is re-enabled (turret held), the MKS set up again and the VESC
+            reconnected with the wheels released; the reload switch (or the
+            dashboard's reload button) is the departure from the start zone.
+            During the reload wait that confirmation is also the reload.
+            Returns True to continue, False on stop.
             """
-            print(f"[E-STOP] 裝填中馬達斷電（{cause}）：保留比賽進度。復電後會自動準備機構；"
-                  "裝好球後按遙控器 RELOAD（或儀表板「裝填完成」）即出發。", flush=True)
-            next_note = time.monotonic() + 5.0
-            next_try = time.monotonic()
-            dm_back = mks_back = vesc_back = False
-            confirmed = False
+            state = _enter_power_loss(cause)
             while True:
                 if stop_event is not None and stop_event.is_set():
                     return False
-                now_s = time.monotonic()
-                ready = dm_back and mks_back and vesc_back
                 if dashboard is not None:
                     # Keep the dashboard's reload button accepted (3 s freshness).
                     snapshot = dashboard.telemetry_snapshot()
                     snapshot["generated_at_ms"] = int(time.time() * 1000)
-                    snapshot["match"] = match.telemetry(now_s)
-                    snapshot["power_lost"] = ("已復電，機構就緒，裝填完成後按 RELOAD 出發" if ready
-                                              else "裝填中斷電，等待復電")
+                    snapshot["match"] = match.telemetry(time.monotonic())
+                    snapshot["power_lost"] = ("已復電，機構就緒，修好後按 RELOAD 出發" if state["ready"]
+                                              else "急停斷電，等待復電")
                     dashboard.update_telemetry(snapshot)
-                # A press before the mechanism is ready is kept, not lost.
-                confirmed = confirmed or bool(
-                    (dashboard is not None and dashboard.take_reload_done())
-                    | _take_external_reload(reload_event, True))
-                if not ready and now_s >= next_try:
-                    next_try = now_s + POWER_RETRY_S
-                    try:
-                        if not dm_back:
-                            _replace_dm_after_power_loss()
-                            dm_back = True
-                            print("[E-STOP] 偵測到復電：DM 已重新使能（砲口鎖住）。", flush=True)
-                        if not mks_back:
-                            launcher.controller.reconfigure_mks_after_power_loss()
-                            mks_back = True
-                        if not vesc_back:
-                            launcher.reconnect_flywheels_stopped()
-                            vesc_back = True
-                        print("[E-STOP] 機構已就緒（DM、MKS、VESC），飛輪不轉、彈藥倉不動；"
-                              "裝填完成後按 RELOAD 出發。", flush=True)
-                    except Exception as exc:
-                        if dm_back:  # power is back, a later step failed: say why
-                            print(f"[E-STOP] 復電後準備未完成（{exc}），{POWER_RETRY_S:g} 秒後重試。",
-                                  flush=True)
-                    continue
-                if confirmed and ready:
-                    _begin_reposition()  # the reload confirmation is the departure
-                    print("[E-STOP] 已收到裝填完成：出發；彈藥倉轉格（ID1 先回原點）與飛輪起轉"
-                          "同時進行。", flush=True)
-                    return True
-                if now_s >= next_note:
-                    next_note = now_s + 5.0
-                    print("[E-STOP] " + ("機構就緒，等待 RELOAD…" if ready
-                                         else "等待復電…" + ("（已收到 RELOAD，復電後立即出發）"
-                                                             if confirmed else "")), flush=True)
+                if _step_power_loss(state, bool(dashboard is not None
+                                                and dashboard.take_reload_done())):
+                    break
                 time.sleep(0.1)
+            if match.reload_wait:
+                # The confirmation is the reload: match.step turns the
+                # magazine (ID1 homes first) and starts the flywheels.
+                print("[E-STOP] 已收到裝填完成：出發；彈藥倉轉格（ID1 先回原點）與飛輪起轉"
+                      "同時進行。", flush=True)
+            else:
+                _resume_mechanism_after_power_loss()
+                print("[E-STOP] 已收到 RELOAD：從出發區重新出發；飛輪起轉、推球回原點，"
+                      f"到定點後接著射 {' '.join(match.remaining_ids()[:1]) or '下一孔'}"
+                      f"（剩 {match.balls_remaining} 顆）。", flush=True)
+            _begin_reposition(force=True)
+            return True
 
-        def _power_loss_during_reload(exc):
-            """Handle a launcher/DM failure: True = recovered, False = stop; re-raise otherwise."""
-            # Only once "可以按急停" was announced: before that the pusher or the
-            # magazine may still be moving and a power cut there is a real fault.
-            if match is None or not match.reload_wait or not reload_estop_ready or launcher is None:
+        def _recover_from_fault(exc):
+            """Handle a launcher/DM failure: True = recovered, False = stop."""
+            if match is None or launcher is None or next_handoff_command is None:
                 raise exc
             return _wait_out_power_loss(exc)
 
@@ -1635,8 +1721,10 @@ def _run_board_real(
         # confirmation is the new departure: main.py drives the positioning
         # again (vy from here), the magazine turns and the flywheels spin up
         # meanwhile, and shooting resumes once main.py reports POSITIONED.
-        repositioning = False
-        reposition_vision = False
+        # An emergency stop before START already sent REPOSITION: hold the
+        # first shot until main.py reports POSITIONED.
+        repositioning = start_repositioning
+        reposition_vision = start_repositioning
         reload_was_waiting = False
         reload_estop_ready = False
         # The turret goes home during the reload: an e-stop there leaves the
@@ -1668,10 +1756,13 @@ def _run_board_real(
                 event_callback("RETURN_START")
         board_center_m =np.array([[BOARD_WIDTH_CM / 200.0, BOARD_HEIGHT_CM / 200.0, 0.0]])
 
-        def _begin_reposition():
-            """Reload confirmed = departure from the start zone (once)."""
+        def _begin_reposition(force=False):
+            """Reload confirmed = departure from the start zone (once).
+
+            ``force``: an emergency stop during a re-positioning starts it over.
+            """
             nonlocal repositioning, reposition_vision, pose_tracker
-            if repositioning or event_callback is None:
+            if (repositioning and not force) or event_callback is None:
                 return
             repositioning = True
             reposition_vision = True
@@ -1716,9 +1807,9 @@ def _run_board_real(
                 try:
                     launcher.check_health()
                 except RuntimeError as exc:
-                    if not _power_loss_during_reload(exc):
+                    if not _recover_from_fault(exc):
                         break
-                    forced_reload_confirm = True
+                    forced_reload_confirm = match.reload_wait
                     continue
             loop_started_at = time.perf_counter()
             capture_started_at = loop_started_at
@@ -1964,16 +2055,23 @@ def _run_board_real(
             )
             score_state = score_probe_state if args.score_mode else None
             if match is not None:
-                match.step(
-                    now, board_plan,
-                    score_state.active_hole_id if score_state.phase == "active" else None,
-                    launcher_idle=not (launcher is not None and launcher.pending),
-                    mechanism_busy=bool(launcher is not None and launcher.mechanism_busy),
-                    reload_confirmed=(
-                        bool(dashboard is not None and dashboard.take_reload_done())
-                        | _take_external_reload(reload_event, match.reload_wait)
-                        | forced_reload_confirm),
-                )
+                try:
+                    match.step(
+                        now, board_plan,
+                        score_state.active_hole_id if score_state.phase == "active" else None,
+                        launcher_idle=not (launcher is not None and launcher.pending),
+                        mechanism_busy=bool(launcher is not None and launcher.mechanism_busy),
+                        reload_confirmed=(
+                            bool(dashboard is not None and dashboard.take_reload_done())
+                            | _take_external_reload(reload_event, match.reload_wait)
+                            | forced_reload_confirm),
+                    )
+                except RuntimeError as exc:
+                    # e.g. the flywheel stop before the reload lost the VESC.
+                    if not _recover_from_fault(exc):
+                        break
+                    forced_reload_confirm = match.reload_wait
+                    continue
                 forced_reload_confirm = False
                 if reload_was_waiting and not match.reload_wait and match.stopped is None:
                     _begin_reposition()  # no-op if the e-stop recovery already did it
@@ -2128,9 +2226,9 @@ def _run_board_real(
                             "裝填後重新定位中，到定點前不發射" if repositioning else None)),
                         hold_reason=match.hold_reason if match is not None else None)
                 except RuntimeError as exc:
-                    if not _power_loss_during_reload(exc):
+                    if not _recover_from_fault(exc):
                         break
-                    forced_reload_confirm = True
+                    forced_reload_confirm = match.reload_wait
                     continue
             else:
                 status = driver.update()
