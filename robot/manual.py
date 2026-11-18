@@ -1492,6 +1492,7 @@ class ManualController:
         self.push_end_speed_rpm = PUSH_END_SPEED_RPM
         self.reload_pending = False
         self._shoot_home_encoder = None
+        self._startup_home_encoder = None
         self.shot_error = None
         self.current_mode = "M"
         self.last_yaw = 50
@@ -1553,6 +1554,7 @@ class ManualController:
         """
         print("[Manual] 復電後重新設定 MKS 推球 ID1 與彈藥倉 ID2。", flush=True)
         self._pusher_home_encoder = None
+        self._startup_home_encoder = None
         with self.lock:
             self._shoot_home_encoder = None
             self.reload_pending = False
@@ -1619,6 +1621,8 @@ class ManualController:
 
     def on_mode_change(self, mode, fire=None, reload=None):
         self._pusher_home_encoder = None
+        if mode == "M":
+            self._startup_home_encoder = None
         # 排空舊的馬達工作期間拒絕新的 FIRE / RELOAD。
         with self.lock:
             previous_mode = self.current_mode
@@ -1643,7 +1647,7 @@ class ManualController:
                     worker.join()
 
             try:
-                self._go_home(self.shoot_servo, HOME_DIRECTION, "切換自動前 ID1 正向無限位回零")
+                self._confirm_startup_pusher_home("切換自動前 ID1 正向無限位回零")
             except Exception:
                 self._emergency_stop(self.shoot_servo, "切換自動前 ID1 回零失敗")
                 raise
@@ -1745,9 +1749,17 @@ class ManualController:
                 raise
         return True
 
+    def _confirm_startup_pusher_home(self, label):
+        encoder = getattr(self, "_startup_home_encoder", None)
+        if isinstance(encoder, int) and not isinstance(encoder, bool) and self._pusher_still_at(encoder):
+            print(f"[Manual] {label}：Encoder 確認 ID1 已停在原點，略過重複回零。", flush=True)
+            return
+        self._startup_home_encoder = None
+        self._startup_home_encoder = self._go_home(self.shoot_servo, HOME_DIRECTION, label)
+
     def turn_startup_indicator(self):
         """Turn two slots before main starts dispatching mode or motor commands."""
-        self._go_home(self.shoot_servo, HOME_DIRECTION, "開機提示轉格前 ID1 回原點")
+        self._confirm_startup_pusher_home("開機提示轉格前 ID1 回原點")
         move = self._start_ammo_move(AMMO_SLOT_PULSES * 2, verify_home=False)
         while not move.poll():
             time.sleep(POLL_INTERVAL)
@@ -1778,9 +1790,7 @@ class ManualController:
 
     def _signal_worker(self, slots):
         try:
-            # Turning needs ID1 at home: find it again (ID1 was homed on the
-            # switch to auto, but nothing may have moved since is not proven).
-            self._go_home(self.shoot_servo, HOME_DIRECTION, "提示轉格前 ID1 回原點")
+            self._confirm_startup_pusher_home("提示轉格前 ID1 回原點")
             print("[Manual] 模型載入完成：彈藥倉轉 {} 格作為提示（不計入格位）。".format(slots),
                   flush=True)
             move = self._start_ammo_move(AMMO_SLOT_PULSES * slots, verify_home=False)
@@ -1795,6 +1805,7 @@ class ManualController:
             self._emergency_stop(self.shoot_servo, "射擊機構")
         finally:
             with self.lock:
+                self._startup_home_encoder = None
                 self._shoot_home_encoder = None
                 self.busy = False
 
