@@ -379,6 +379,10 @@ def main():
                               + f"{confirm_s:g} 秒才切回手動", flush=True)
                     if mode_now - manual_request_since < confirm_s:
                         new_mode = current_mode
+                    elif (model_turn_started and manual is not None
+                          and not manual.wait_signal_turn(timeout=0)):
+                        # The magazine still owns the MKS hardware.
+                        new_mode = current_mode
                 else:
                     manual_request_since = None
 
@@ -462,9 +466,8 @@ def main():
 
                     current_mode = new_mode
                     print(f"[Mode Switch] 已切換至 {current_mode}", flush=True)
-                    if initial_mode:
-                        # Only a fresh packet after the startup motion can release the chassis.
-                        continue
+                    # Handoff can block on motors. Read a new packet before acting.
+                    continue
 
                 if current_mode == "M":
                     # 手動模式：使用遙控器 yaw/pitch 控制砲台方向，
@@ -596,6 +599,11 @@ def main():
                         brake_until = None
                         avoid_until = None
                     elif not auto_started and not reposition_hold and model_turn_ready:
+                        if manual is not None:
+                            manual.close()
+                            manual = None
+                            # Housekeeping can block. Recheck VRA before driving or timing the match.
+                            continue
                         # Keep the last seen vy: a single stale sample at the
                         # moment of release must not drop the strafe direction.
                         if latest_vy is not None:
@@ -611,9 +619,6 @@ def main():
                             send_aim_command(aim_process, f"DEPART {depart_at:.3f}")
                             print("[Match] VRA 發車：比賽計時開始", flush=True)
                         if not aim_prepared and aim_process is not None and aim_process.poll() is None:
-                            if manual is not None:
-                                manual.close()
-                                manual = None
                             # The half switch is already set on release: tell the aim
                             # process now, so the turret pre-aims at the right first
                             # hole (upper H11, lower H01) while the chassis drives.
