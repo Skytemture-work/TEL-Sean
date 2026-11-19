@@ -60,6 +60,7 @@ DM_UART_DEG_PER_UNIT = 0.1
 DM_UART_YAW_SIGN = 1.0  # 遙控器左右方向反轉。
 DM_UART_PITCH_SIGN = 1.0  # 遙控器上下方向反轉。
 DM_POSITION_TOLERANCE_DEG = 2.5  # 實際角度到位容許誤差；負載下約有 1.14° 穩態誤差。
+DM_RETURN_PITCH_ABOVE_TOLERANCE_DEG = 5.0  # 關閉前回位：仰角偏高較安全，往上容許較寬。
 DM_FEEDBACK_MAX_AGE_S = 0.5
 DM_FEEDBACK_RECOVERY_TIMEOUT_S = 1.0
 AMMO_CAN_INTERFACE = "can0"
@@ -766,89 +767,20 @@ class VESCDualMotorController:
             self._ready_event.set()
 
             while not self._stop_event.is_set():
-                now = time.monotonic()
-                dt = self._clamp(now - last_time, 0.01, 0.5)
-                last_time = now
-
-                left = self._read_runtime_motor(reader_left, "LEFT", self._ser_left)
-                if self._stop_event.is_set():
-                    break
-                right = self._read_runtime_motor(reader_right, "RIGHT", self._ser_right)
-                if self._stop_event.is_set():
-                    break
-                self.last_rpm = (
-                    left["erpm"] / VESC_LEFT_POLE_PAIRS,
-                    right["erpm"] / VESC_RIGHT_POLE_PAIRS,
-                    time.monotonic(),
-                )
-
-                speed_value = self._get_speed_value()
-                target_rpm = (
-                    None if speed_value is None
-                    else VESC_MIN_RPM + speed_value * VESC_RPM_PER_SPEED_UNIT
-                )
-                target_rpm = self._apply_restart_interval(target_rpm)
-
-                if target_rpm is None:
-                    # 自動模式或關閉時清除積分並軟停止（減速→輕煞→放開）。
-                    pi_left_integral = 0.0
-                    pi_right_integral = 0.0
-                    cmd_left, cmd_right = self._soft_stop_commands(
-                        left["erpm"] / VESC_LEFT_POLE_PAIRS,
-                        right["erpm"] / VESC_RIGHT_POLE_PAIRS,
-                        time.monotonic(),
-                    )
-                else:
-                    self._soft_stop = None
-                    self._released_event.clear()
-                    rpm_left = left["erpm"] / VESC_LEFT_POLE_PAIRS
-                    rpm_right = right["erpm"] / VESC_RIGHT_POLE_PAIRS
-                    goal_left, goal_right = flywheel_wheel_targets(target_rpm)
-                    base_left = goal_left * VESC_LEFT_POLE_PAIRS
-                    base_right = goal_right * VESC_RIGHT_POLE_PAIRS
-
-                    error_left = goal_left - rpm_left
-                    error_right = goal_right - rpm_right
-                    pi_left_integral += error_left * dt
-                    pi_right_integral += error_right * dt
-                    trim_left = self._clamp(
-                        VESC_SPEED_KP * error_left + VESC_SPEED_KI * pi_left_integral,
-                        -VESC_MAX_TRIM_ERPM, VESC_MAX_TRIM_ERPM,
-                    )
-                    trim_right = self._clamp(
-                        VESC_SPEED_KP * error_right + VESC_SPEED_KI * pi_right_integral,
-                        -VESC_MAX_TRIM_ERPM, VESC_MAX_TRIM_ERPM,
-                    )
-                    # 同步修正維持「設定的轉速差」，而不是把兩輪拉成同速。
-                    sync = self._clamp(
-                        VESC_SYNC_KP * (error_right - error_left),
-                        -VESC_MAX_SYNC_CORRECTION_ERPM,
-                        VESC_MAX_SYNC_CORRECTION_ERPM,
-                    )
-                    target_left = int(base_left + trim_left - sync)
-                    target_right = int(base_right + trim_right + sync)
-
-                if target_rpm is not None:
-                    cmd_left, cmd_right = ("rpm", target_left), ("rpm", target_right)
-                self._write_cmd("LEFT", self._ser_left, cmd_left)
-                self._write_cmd("RIGHT", self._ser_right, cmd_right)
-                target_left = cmd_left[1] if cmd_left[0] == "rpm" else cmd_left[0]
-                target_right = cmd_right[1] if cmd_right[0] == "rpm" else cmd_right[0]
-                print(
-                    "[VESC] VRB={} -> target={} RPM | "
-                    "L cmd={} ERPM actual={} ERPM ({:.1f} RPM) | "
-                    "R cmd={} ERPM actual={} ERPM ({:.1f} RPM)".format(
-                        "STOP" if speed_value is None else speed_value,
-                        0 if target_rpm is None else int(target_rpm),
-                        target_left,
-                        left["erpm"],
-                        left["erpm"] / VESC_LEFT_POLE_PAIRS,
-                        target_right,
-                        right["erpm"],
-                        right["erpm"] / VESC_RIGHT_POLE_PAIRS,
-                    ),
-                    flush=True,
-                )
+                try:
+                    pi_left_integral, pi_right_integral = self._control_step(
+                        reader_left, reader_right, pi_left_integral, pi_right_integral,
+                        last_time)
+                    last_time = time.monotonic()
+                except RuntimeError as exc:
+                    if not self._usb_dropped(exc):
+                        raise
+                    readers = self._reconnect_after_usb_drop(exc)
+                    if readers is None:
+                        break  # close() requested while waiting
+                    reader_left, reader_right = readers
+                    last_time = time.monotonic()
+                    continue
                 self._stop_event.wait(VESC_LOOP_INTERVAL)
 
         except Exception as exc:
@@ -869,6 +801,138 @@ class VESCDualMotorController:
                     except Exception:
                         pass
             print("[VESC] 雙馬達控制執行緒已關閉。")
+
+    @staticmethod
+    def _usb_dropped(exc):
+        """A serial-port failure (the USB link), not a VESC fault or a power loss.
+
+        EMI makes the hub drop a VESC ("disabled by hub (EMI?)") for about a
+        second.  A voltage out of range or a VESC that stops answering on a
+        working port is not this, and still stops the flywheels.
+        """
+        cause = exc
+        while cause is not None:
+            if isinstance(cause, (serial.SerialException, OSError)) and not isinstance(
+                    cause, TimeoutError):
+                return True
+            cause = cause.__cause__
+        return False
+
+    def _reconnect_after_usb_drop(self, exc):
+        """Reopen both ports and keep the current target; None if close() was asked."""
+        print("[VESC] USB 斷線（{}）：重新連線，飛輪目標轉速不變；連回前不發射。".format(exc),
+              flush=True)
+        self.last_rpm = None  # flywheel_ready is False until fresh telemetry
+        for ser in (self._ser_left, self._ser_right):
+            if ser is not None:
+                try:
+                    ser.close()
+                except Exception:
+                    pass
+        self._ser_left = self._ser_right = None
+        self._ser_left = self._open_port_waiting(VESC_LEFT_PORT, "LEFT")
+        if self._ser_left is None:
+            return None
+        self._ser_right = self._open_port_waiting(VESC_RIGHT_PORT, "RIGHT")
+        if self._ser_right is None:
+            return None
+        if self._stop_event.wait(0.5):
+            return None
+        self._ser_left.reset_input_buffer()
+        self._ser_right.reset_input_buffer()
+        reader_left = VESCReader(self._ser_left)
+        reader_right = VESCReader(self._ser_right)
+        self._read_startup_motor(reader_left, "LEFT")
+        self._read_startup_motor(reader_right, "RIGHT")
+        print("[VESC] USB 已重新連線，恢復飛輪控制。", flush=True)
+        return reader_left, reader_right
+
+    def _control_step(self, reader_left, reader_right, pi_left_integral, pi_right_integral,
+                      last_time):
+        """One telemetry + command cycle; returns the updated PI integrals."""
+        now = time.monotonic()
+        dt = self._clamp(now - last_time, 0.01, 0.5)
+
+        left = self._read_runtime_motor(reader_left, "LEFT", self._ser_left)
+        if self._stop_event.is_set():
+            return pi_left_integral, pi_right_integral
+        right = self._read_runtime_motor(reader_right, "RIGHT", self._ser_right)
+        if self._stop_event.is_set():
+            return pi_left_integral, pi_right_integral
+        self.last_rpm = (
+            left["erpm"] / VESC_LEFT_POLE_PAIRS,
+            right["erpm"] / VESC_RIGHT_POLE_PAIRS,
+            time.monotonic(),
+        )
+
+        speed_value = self._get_speed_value()
+        target_rpm = (
+            None if speed_value is None
+            else VESC_MIN_RPM + speed_value * VESC_RPM_PER_SPEED_UNIT
+        )
+        target_rpm = self._apply_restart_interval(target_rpm)
+
+        if target_rpm is None:
+            # 自動模式或關閉時清除積分並軟停止（減速→輕煞→放開）。
+            pi_left_integral = 0.0
+            pi_right_integral = 0.0
+            cmd_left, cmd_right = self._soft_stop_commands(
+                left["erpm"] / VESC_LEFT_POLE_PAIRS,
+                right["erpm"] / VESC_RIGHT_POLE_PAIRS,
+                time.monotonic(),
+            )
+        else:
+            self._soft_stop = None
+            self._released_event.clear()
+            rpm_left = left["erpm"] / VESC_LEFT_POLE_PAIRS
+            rpm_right = right["erpm"] / VESC_RIGHT_POLE_PAIRS
+            goal_left, goal_right = flywheel_wheel_targets(target_rpm)
+            base_left = goal_left * VESC_LEFT_POLE_PAIRS
+            base_right = goal_right * VESC_RIGHT_POLE_PAIRS
+
+            error_left = goal_left - rpm_left
+            error_right = goal_right - rpm_right
+            pi_left_integral += error_left * dt
+            pi_right_integral += error_right * dt
+            trim_left = self._clamp(
+                VESC_SPEED_KP * error_left + VESC_SPEED_KI * pi_left_integral,
+                -VESC_MAX_TRIM_ERPM, VESC_MAX_TRIM_ERPM,
+            )
+            trim_right = self._clamp(
+                VESC_SPEED_KP * error_right + VESC_SPEED_KI * pi_right_integral,
+                -VESC_MAX_TRIM_ERPM, VESC_MAX_TRIM_ERPM,
+            )
+            # 同步修正維持「設定的轉速差」，而不是把兩輪拉成同速。
+            sync = self._clamp(
+                VESC_SYNC_KP * (error_right - error_left),
+                -VESC_MAX_SYNC_CORRECTION_ERPM,
+                VESC_MAX_SYNC_CORRECTION_ERPM,
+            )
+            target_left = int(base_left + trim_left - sync)
+            target_right = int(base_right + trim_right + sync)
+
+        if target_rpm is not None:
+            cmd_left, cmd_right = ("rpm", target_left), ("rpm", target_right)
+        self._write_cmd("LEFT", self._ser_left, cmd_left)
+        self._write_cmd("RIGHT", self._ser_right, cmd_right)
+        target_left = cmd_left[1] if cmd_left[0] == "rpm" else cmd_left[0]
+        target_right = cmd_right[1] if cmd_right[0] == "rpm" else cmd_right[0]
+        print(
+            "[VESC] VRB={} -> target={} RPM | "
+            "L cmd={} ERPM actual={} ERPM ({:.1f} RPM) | "
+            "R cmd={} ERPM actual={} ERPM ({:.1f} RPM)".format(
+                "STOP" if speed_value is None else speed_value,
+                0 if target_rpm is None else int(target_rpm),
+                target_left,
+                left["erpm"],
+                left["erpm"] / VESC_LEFT_POLE_PAIRS,
+                target_right,
+                right["erpm"],
+                right["erpm"] / VESC_RIGHT_POLE_PAIRS,
+            ),
+            flush=True,
+        )
+        return pi_left_integral, pi_right_integral
 
     def close(self, timeout=3.0):
         self.set_speed(None)
@@ -992,11 +1056,17 @@ def return_dm_before_shutdown(motors):
                     or time.monotonic() - state.feedback_at > 0.5
                     or not math.isfinite(state.position_rad)):
                 raise RuntimeError(f"DM 回位時 0x{i:02X} 回授異常")
-        arrived = elapsed >= duration and all(
-            abs(math.degrees(cal[i].muzzle_from_motor(states[i].position_rad)
-                             - cal[i].muzzle_from_motor(destination[i]))) <= DM_POSITION_TOLERANCE_DEG
+        error_deg = {
+            i: math.degrees(cal[i].muzzle_from_motor(states[i].position_rad)
+                            - cal[i].muzzle_from_motor(destination[i]))
             for i in (3, 1)
-        )
+        }
+        # The pitch feed-forward with the low return gain settles 2-2.5 deg
+        # above the park target, so +-2.5 deg sometimes never arrived.  Higher
+        # is the safe side (the pitch holds there once disabled).
+        arrived = (elapsed >= duration
+                   and abs(error_deg[3]) <= DM_POSITION_TOLERANCE_DEG
+                   and -DM_POSITION_TOLERANCE_DEG <= error_deg[1] <= DM_RETURN_PITCH_ABOVE_TOLERANCE_DEG)
         if now >= next_status:
             print(f"[Manual DM 回位] {elapsed:.1f}s " + " ".join(
                 f"{name}={math.degrees(cal[i].muzzle_from_motor(states[i].position_rad)):+.1f}°"
