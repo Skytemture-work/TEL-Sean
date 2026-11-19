@@ -673,6 +673,11 @@ def _run_board_real(
              "依規則配球，比賽時間到或彈藥打完即停止發射",
     )
     parser.add_argument(
+        "--light-calibrate", type=int, nargs="?", const=18, default=None, metavar="N",
+        help="紅燈校正：啟動後等辨識到亮紅燈的小孔，就對那一孔連射 N 顆（不加 N 預設 18，範圍 1～18）；"
+             "不排九宮格、燈熄也不換孔。未指定 --aim-only/--panel-fire 時自動發射",
+    )
+    parser.add_argument(
         "--balls-loaded", type=int, default=18,
         help="比賽模式：彈藥倉已裝球數（預設 18＝6 格 × 3 顆；範圍 1～18）",
     )
@@ -918,6 +923,13 @@ def _run_board_real(
         parser.error("--stable-frames 必須在 1～10 之間")
     if args.match_fire and not args.score_mode:
         parser.error("--match-fire 使用計分模式，不能搭配 --no-score-mode")
+    if args.light_calibrate is not None:
+        if not 1 <= args.light_calibrate <= 18:
+            parser.error("--light-calibrate 必須在 1～18 顆之間")
+        if args.match_fire or not args.score_mode:
+            parser.error("--light-calibrate 不能搭配 --match-fire 或 --no-score-mode")
+        if not (args.aim_only or args.panel_fire or args.auto_fire):
+            args.auto_fire = True
     if args.match_fire or args.panel_fire or args.auto_fire:
         # Shots: the servo settles to ~0.05 deg, so a tight gate costs no time.
         if args.fire_tolerance_deg is None:
@@ -1454,6 +1466,12 @@ def _run_board_real(
             f"到位容許誤差 大孔 {args.fire_tolerance_deg:g}°／小孔 {args.small_fire_tolerance_deg:g}°。",
             flush=True,
         )
+    elif args.light_calibrate is not None:
+        print(
+            f"紅燈校正模式：辨識到亮紅燈的小孔即鎖定，對該孔連射 {args.light_calibrate} 顆"
+            "（燈熄也不換孔、不打九宮格）。",
+            flush=True,
+        )
     elif args.score_mode:
         print(
             f"特殊得分燈模式（{args.match_phase}）：比賽哨聲時按 G，"
@@ -1507,10 +1525,11 @@ def _run_board_real(
         min_saturation=config.score_light_min_saturation,
         min_value=config.score_light_min_value,
     )
-    if args.match_fire:
+    if args.match_fire or args.light_calibrate is not None:
         # The remote switches to auto mode at the whistle, so firing starts as
         # soon as the board is seen.  The light is still watched: the upper
         # half inserts its bonus balls once the lit hole is confirmed.
+        # Light calibration likewise locks the first confirmed light itself.
         score_round.arm_auto_start()
     strategy_round_id = None
     expiry_processed_round_id = None
@@ -2120,7 +2139,26 @@ def _run_board_real(
                     print(f"比賽流程結束（{match.stopped}）：停止飛輪、推球回原點、砲台回 home、"
                           "釋放相機。", flush=True)
                     break
-            if args.score_mode and not args.match_fire:
+            if args.light_calibrate is not None:
+                # Calibration: every ball into the first confirmed lit hole.
+                # The 60 s light window and grid reallocation do not apply.
+                if (
+                    score_state.phase == "active"
+                    and score_state.active_hole_id is not None
+                    and strategy_round_id != score_round.round_id
+                    and reference_plan is not None
+                    and not (launcher is not None and launcher.pending)
+                ):
+                    lit = next((t for t in reference_plan.targets
+                                if t.hole_id == score_state.active_hole_id), None)
+                    if lit is not None:
+                        plan = EngagementPlan([lit] * args.light_calibrate)
+                        driver.set_plan(plan)
+                        strategy_round_id = score_round.round_id
+                        last_bonus_hole_id = lit.hole_id
+                        print(f"紅燈校正：鎖定 {lit.hole_id}，連射 {args.light_calibrate} 顆。",
+                              flush=True)
+            elif args.score_mode and not args.match_fire:
                 if (
                     score_state.phase == "active"
                     and score_state.active_hole_id is not None
@@ -2309,6 +2347,7 @@ def _run_board_real(
             pitch_motor_state = motors.get_state(config.pitch_motor_id)
             if (
                 args.score_mode
+                and args.light_calibrate is None
                 and status.skipped
                 and status.target is not None
                 and status.target.hole_id in ("H10", "H11", "H12")
