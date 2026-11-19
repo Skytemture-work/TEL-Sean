@@ -14,7 +14,10 @@ from manual import ManualController
 AUTO_STATUS_INTERVAL_SECONDS = 1.0
 AUTO_TARGET_DISTANCE_M = 2.80
 AUTO_FORWARD_VX = 40
-OCCLUSION_STRAFE_VY = 15
+# 移動中遇到遮擋：急停後直線後退，直到前方淨空 OCCLUSION_CLEARANCE_M（車尾需有空間）。
+OCCLUSION_REVERSE_VX = 15
+OCCLUSION_REVERSE_TIMEOUT_S = 3.0
+OCCLUSION_CLEARANCE_M = 1.0
 MAX_STRAFE_SECONDS = 1.0
 VISION_WAIT_SECONDS = 10.0
 # After a reload the robot sits in the start zone again; the remote's reload
@@ -270,7 +273,7 @@ class _DriveRun:
         self.vision_wait_until = None
         self.moved = False
         self.brake_until = None
-        self.avoid_until = None
+        self.recovery_hold_reason = None  # after the reverse: stay stopped, why
 
     def release(self, vy):
         self.started = True
@@ -719,37 +722,29 @@ def main():
                 run.brake_until = now + OCCLUSION_BRAKE_SECONDS
                 print("[Auto Drive] 移動中遇到遮擋，緊急停止", flush=True)
 
-            if (
-                run.brake_until is not None
-                and now >= run.brake_until
-                and run.vy_recorded_before_release
-                and run.locked_vy
-                and valid_distance
-                and not blocked
-            ):
-                run.brake_until = None
-                run.avoid_until = None
-                # 避障後只沿 X 軸續行，原本的視覺橫移不再送出。
-                run.strafe_until = now
-                next_status_at = 0.0
-                print("[Auto Drive] LiDAR 前方已清空，恢復目標距離定位", flush=True)
-
             if run.brake_until is not None:
                 lidar_status = "遮擋後緊急停止"
                 if now >= run.brake_until:
-                    if not run.vy_recorded_before_release or not run.locked_vy:
-                        complete = True
-                        completion_reason = "遮擋後停止，放行前沒有有效橫移方向"
-                    elif not valid_distance:
-                        # 距離不明時停車，等待下一筆有效回波。
-                        lidar_status = "遮擋後等待有效 LiDAR 距離"
-                    elif run.avoid_until is not None and now >= run.avoid_until:
-                        lidar_status = "避障橫移達時限，停車等待前方清空"
+                    rear_range_m = lidar.get_rear_range()
+                    if run.recovery_hold_reason is None:
+                        if (valid_distance and front_distance_m + config.LIDAR_TO_FRONT_M
+                                >= OCCLUSION_CLEARANCE_M):
+                            run.recovery_hold_reason = "前方達 100 cm 淨空，保持停車"
+                        elif now - run.brake_until >= OCCLUSION_REVERSE_TIMEOUT_S:
+                            run.recovery_hold_reason = "後退逾時，保持停車"
+                        elif (now - last_a_packet_at > RETURN_PACKET_TIMEOUT_S
+                              or raw_mode not in (None, "A")):
+                            run.recovery_hold_reason = "ESP32 通訊中斷或模式異常，保持停車"
+                        elif not valid_distance:
+                            run.recovery_hold_reason = "前方距離無效，保持停車"
+                        elif rear_range_m is None or rear_range_m <= config.RECOVERY_REAR_MIN_RANGE_M:
+                            run.recovery_hold_reason = "後方回波不足或有障礙，保持停車"
+                    if run.recovery_hold_reason is None:
+                        final_vx = -OCCLUSION_REVERSE_VX
+                        lidar_status = "遮擋後直線後退，等待前方達 100 cm"
                     else:
-                        if run.avoid_until is None:
-                            run.avoid_until = now + MAX_STRAFE_SECONDS
-                        final_vy = -OCCLUSION_STRAFE_VY if run.locked_vy < 0 else OCCLUSION_STRAFE_VY
-                        lidar_status = "遮擋後橫移，等待 LiDAR 前方清空"
+                        lidar_status = (run.recovery_hold_reason
+                                        + "（切手動模式可由駕駛接手，砲塔照常射擊）")
             elif (
                 run.vision_wait_until is not None
                 and run.locked_vy is None

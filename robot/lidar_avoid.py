@@ -49,6 +49,7 @@ class LidarAvoidance(threading.Thread):
         self.enemy_trail = deque(maxlen=30)
         self.point_history = deque(maxlen=150)
         self._front_hits = deque()
+        self._rear_hits = deque()
         self._last_scan_at = None
         self.search_radius_m = config.DETECTION_RADIUS_M
         self.safe_dist_m = config.FRONT_STOP_DISTANCE_M
@@ -145,6 +146,14 @@ class LidarAvoidance(threading.Thread):
                     front = batch_np[self._front_fan_mask(batch_np)]
                     obs_pos = tuple(front[front[:, 0].argmin(), :2]) if len(front) else None
 
+                    x, y, z = batch_np.T
+                    rear_ranges = -x[
+                        (x < 0.0)
+                        & (np.abs(y) <= config.RECOVERY_REAR_HALF_WIDTH_M)
+                        & (z > config.FRONT_LIDAR_MIN_Z_M)
+                        & (z < config.FRONT_LIDAR_MAX_Z_M)
+                    ]
+
                     with self.buffer_lock:
                         if sample_pt:
                             self.latest_sample_point = sample_pt
@@ -154,6 +163,9 @@ class LidarAvoidance(threading.Thread):
                             self._last_scan_at = now
                             if obs_pos[0] <= self.search_radius_m:
                                 self._front_hits.append((now, obs_pos))
+                        if len(rear_ranges):
+                            self._rear_hits.append((now, float(rear_ranges.min())))
+                        self._nearest_rear_range(now)
                         self.obstacle_rel_pos = self._nearest_front_hit(now)
                         if self.obstacle_rel_pos is not None:
                             self.enemy_trail.append(self.obstacle_rel_pos)
@@ -196,6 +208,16 @@ class LidarAvoidance(threading.Thread):
         distance = None if hit is None else max(0.0, hit[0] - config.LIDAR_TO_FRONT_M)
         return fresh, distance
 
+    def _nearest_rear_range(self, now):
+        while self._rear_hits and now - self._rear_hits[0][0] > config.FRONT_LIDAR_MAX_AGE_S:
+            self._rear_hits.popleft()
+        return min((distance for _, distance in self._rear_hits), default=None)
+
+    def get_rear_range(self):
+        """Return the nearest recent rear corridor return, measured from the LiDAR."""
+        with self.buffer_lock:
+            return self._nearest_rear_range(time.monotonic()) if self.is_active else None
+
     def apply_priority_override(self, raw_vx, raw_vy, raw_wz):
         fresh, distance = self.get_front_obstacle()
         if not fresh or (distance is not None and distance <= self.safe_dist_m):
@@ -233,6 +255,7 @@ class LidarAvoidance(threading.Thread):
             self.is_active = state
             self._last_scan_at = None
             self._front_hits.clear()
+            self._rear_hits.clear()
             self.enemy_trail.clear()
             self.obstacle_rel_pos = None
 
