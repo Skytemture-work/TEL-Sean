@@ -6,7 +6,14 @@ from ``clock_origin`` (main.py's VRA departure) when given, else from that
 first sight of the board:
 
 * lower half: the 18-ball serpentine plan, no bonus hole;
-* upper half: shoot the lit bonus hole ``UPPER_BONUS_BALLS`` times, only
+* lower half, small hole mode (``shoot_bonus`` True, remote SWB): the lit
+  hole ``LOWER_BONUS_BALLS`` times within the bonus window (H11 first when
+  the light is not confirmed, as below), then 16 big-hole balls
+  (``LOWER_BONUS_GRID_IDS``: H01 and H07 once); no reload;
+* upper half (``UPPER_SHOOT_BONUS`` False, the 2026-11-20 default): no bonus
+  hole, the 27 balls go three to each big hole in serpentine order, reload
+  after 18 as below;
+* upper half with the bonus: shoot the lit bonus hole ``UPPER_BONUS_BALLS`` times, only
   within ``UPPER_BONUS_WINDOW_S`` of the start (the light is off afterwards).
   If the light is not confirmed within ``light_wait_s`` the shots start on
   ``UPPER_FALLBACK_BONUS_ID`` (H11) and switch to the real hole as soon as it
@@ -24,10 +31,12 @@ from typing import Callable, List, Optional
 
 from .board import EngagementPlan
 from .scoring_strategy import (
+    LOWER_BONUS_BALLS,
     UPPER_BONUS_BALLS,
     UPPER_BONUS_WINDOW_S,
     UPPER_FALLBACK_BONUS_ID,
     UPPER_PHASE,
+    UPPER_SHOOT_BONUS,
     append_reallocated_grid_shots,
     build_max_score_strategy,
 )
@@ -44,8 +53,15 @@ class MatchSequencer:
                  stop_flywheels: Callable[[], None] = lambda: None,
                  start_flywheels: Callable[[], None] = lambda: None,
                  clock_origin: Optional[float] = None,
-                 on_magazine_empty: Callable[[], None] = lambda: None):
+                 on_magazine_empty: Callable[[], None] = lambda: None,
+                 shoot_bonus: Optional[bool] = None):
         self.phase = phase
+        # False = no bonus hole, straight to the big holes.  None = the
+        # phase default: upper UPPER_SHOOT_BONUS, lower no (SWB turns it on).
+        if shoot_bonus is None:
+            shoot_bonus = UPPER_SHOOT_BONUS if phase == UPPER_PHASE else False
+        self.shoot_bonus = shoot_bonus
+        self.bonus_balls = UPPER_BONUS_BALLS if phase == UPPER_PHASE else LOWER_BONUS_BALLS
         self.clock_origin = clock_origin
         self.duration_s = duration_s
         self.magazine_size = balls_loaded
@@ -64,7 +80,8 @@ class MatchSequencer:
         # Called once the last ball of a magazine is out and a reload follows,
         # before the (blocking) flywheel stop: the turret / chassis start now.
         self._on_magazine_empty = on_magazine_empty
-        self.bonus_closed = phase != UPPER_PHASE
+        # Closed = the light no longer matters (control loop stops scoring it).
+        self.bonus_closed = not shoot_bonus
         self.reload_wait = False
         self.reload_balls = 0
         self.stopped: Optional[str] = None
@@ -99,12 +116,16 @@ class MatchSequencer:
             clock = ("自 VRA 發車起算，已過 "
                      f"{now - self.clock_origin:.1f} 秒" if self.clock_origin is not None
                      else "自現在起算")
-            if self.phase == UPPER_PHASE:
+            half = "上半場" if self.phase == UPPER_PHASE else "下半場"
+            if self.shoot_bonus:
                 self.waiting_light = True
                 self._hand_over(EngagementPlan([]))
-                self._log(f"開始射擊：上半場，時限 {self.duration_s:g} 秒（{clock}）。"
-                          f"先找亮燈加分孔射 {UPPER_BONUS_BALLS} 顆（限開賽後 "
+                self._log(f"開始射擊：{half}（小孔模式），時限 {self.duration_s:g} 秒（{clock}）。"
+                          f"先找亮燈加分孔射 {self.bonus_balls} 顆（限開賽後 "
                           f"{UPPER_BONUS_WINDOW_S:g} 秒內），再射九宮格。")
+            elif self.phase == UPPER_PHASE:
+                self._build(None, f"開始射擊：上半場（保守策略），時限 {self.duration_s:g} 秒"
+                                  f"（{clock}），不射小孔，九個大孔各 3 顆。")
             else:
                 self._build(None, f"開始射擊：下半場，時限 {self.duration_s:g} 秒"
                                   f"（{clock}），不射加分孔。")
@@ -119,7 +140,7 @@ class MatchSequencer:
             elif lit_hole_id is not None:
                 self.waiting_light = False
                 self.bonus_hole_id = lit_hole_id
-                self._build(lit_hole_id, f"亮燈加分孔 {lit_hole_id}：先射 {UPPER_BONUS_BALLS} 顆。")
+                self._build(lit_hole_id, f"亮燈加分孔 {lit_hole_id}：先射 {self.bonus_balls} 顆。")
             elif shooting_s >= self.light_wait_s:
                 self.waiting_light = False
                 self.bonus_hole_id = UPPER_FALLBACK_BONUS_ID
@@ -181,7 +202,9 @@ class MatchSequencer:
 
     def _build(self, bonus_hole_id, message: str) -> None:
         try:
-            strategy = build_max_score_strategy(self._board_plan, bonus_hole_id, self.phase)
+            strategy = build_max_score_strategy(
+                self._board_plan, bonus_hole_id, self.phase,
+                lower_bonus=self.phase != UPPER_PHASE and self.shoot_bonus)
         except ValueError as exc:
             self._log(f"無法建立比賽射擊計畫：{exc}")
             self._hand_over(EngagementPlan([]))

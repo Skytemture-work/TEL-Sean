@@ -500,7 +500,7 @@ void loop() {
 
   // ==========================================
   // 4. 發送狀態封包給 Xavier
-  // E,MODE,VX,VY,WZ,YAW,PITCH,FIRE,SPEED,RELOAD,AUTO_START\n
+  // E,MODE,VX,VY,WZ,YAW,PITCH,FIRE,SPEED,RELOAD,AUTO_START,VIN\n
   // ==========================================
   int send_vx =
     (currentMode == 'M') ? forward : auto_vx;
@@ -528,6 +528,10 @@ void loop() {
   // VRA 轉到高端時，自動模式才送出啟動訊號。
   int send_auto_start = (currentMode == 'A' && vrA >= 1800) ? 1 : 0;
 
+  // SWB（CH8）：下半場小孔模式（VIN）。自動模式下 SWB 不控制底盤／砲台，
+  // Xavier 在 VRA 發車那一刻鎖定此值。
+  int send_vin = (swB > 1500) ? 1 : 0;
+
   if (obstacleStop) {
     send_vx = 0;
     send_vy = 0;
@@ -544,7 +548,8 @@ void loop() {
     String(send_fire) + "," +
     String(send_speed) + "," +
     String(send_reload) + "," +
-    String(send_auto_start) + "\n";
+    String(send_auto_start) + "," +
+    String(send_vin) + "\n";
 
   xavierSerial.print(txPacket);
 

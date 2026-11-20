@@ -45,6 +45,16 @@ LOWER_SERPENTINE_IDS: Tuple[str, ...] = (
     "H07", "H08", "H09",
 )
 LOWER_BALLS_PER_GRID_CELL = 2
+# Team decision (2026-11-21): optional lower-half "small hole" mode, chosen
+# per round on the remote (SWB -> packet field "vin", latched at the VRA
+# release).  2 balls into the lit hole within the first 60 s, then the same
+# serpentine with one ball each in H01 and H07: 2 + 16 = 18.
+LOWER_BONUS_BALLS = 2
+LOWER_BONUS_GRID_BALLS: Dict[str, int] = {"H01": 1, "H07": 1}
+LOWER_BONUS_GRID_IDS: Tuple[str, ...] = tuple(
+    hole_id
+    for hole_id in LOWER_SERPENTINE_IDS
+    for _ in range(LOWER_BONUS_GRID_BALLS.get(hole_id, LOWER_BALLS_PER_GRID_CELL)))
 
 
 @dataclass(frozen=True)
@@ -82,6 +92,11 @@ def _targets_by_id(plan: EngagementPlan) -> Dict[str, BoardTarget]:
 # (18) runs out exactly after the third H05; the team reloads and the plan
 # continues with H06.
 UPPER_BONUS_BALLS = 3
+# Team decision (2026-11-20, conservative): the upper half shoots no bonus
+# hole at all -- every ball goes to the big holes, three each, in
+# UPPER_SERPENTINE_IDS order (UPPER_GRID_NO_BONUS_IDS); the reload after 18 is
+# unchanged.  True restores the 3 bonus balls at the start.
+UPPER_SHOOT_BONUS = False
 UPPER_BONUS_WINDOW_S = 60.0
 UPPER_FALLBACK_BONUS_ID = "H11"
 # Team decision (2026-11-16): after the bonus balls the muzzle is at the top
@@ -106,6 +121,8 @@ def build_max_score_strategy(
     board_plan: EngagementPlan,
     active_bonus_hole_id: Optional[str],
     phase: str,
+    *,
+    lower_bonus: bool = False,
 ) -> FiringStrategy:
     """Build the firing plan for one upper/lower-half match.
 
@@ -118,6 +135,10 @@ def build_max_score_strategy(
     balls per grid cell, cells visited in ``LOWER_SERPENTINE_IDS`` order to
     minimise muzzle travel.  The scoring light is not used.
     The theoretical maximum is 36 + 34 = 70 points.
+
+    Lower half with ``lower_bonus`` (small hole mode) and a bonus hole:
+    ``LOWER_BONUS_BALLS`` into it, then ``LOWER_BONUS_GRID_IDS`` (H01 and H07
+    once).  Without a bonus hole (window over) it is the plain 18-ball plan.
     """
 
     if phase not in MATCH_PHASES:
@@ -127,7 +148,7 @@ def build_max_score_strategy(
 
     by_id = _targets_by_id(board_plan)
     required_ids = {f"H{number:02d}" for number in range(1, 10)}
-    if active_bonus_hole_id is not None and phase == UPPER_PHASE:
+    if active_bonus_hole_id is not None and (phase == UPPER_PHASE or lower_bonus):
         required_ids.add(active_bonus_hole_id)
     missing = sorted(required_ids - set(by_id))
     if missing:
@@ -150,6 +171,22 @@ def build_max_score_strategy(
             bonus_points=4 * bonus,
             line_points=0,
             theoretical_max_points=2 * grid + 4 * bonus,
+        )
+
+    if lower_bonus and active_bonus_hole_id is not None:
+        shots = [by_id[active_bonus_hole_id]] * LOWER_BONUS_BALLS
+        shots += [by_id[hole_id] for hole_id in LOWER_BONUS_GRID_IDS]
+        grid = len(LOWER_BONUS_GRID_IDS)
+        return FiringStrategy(
+            phase=phase,
+            plan=EngagementPlan(shots),
+            total_balls=LOWER_BONUS_BALLS + grid,
+            bonus_balls=LOWER_BONUS_BALLS,
+            grid_balls=grid,
+            base_points=2 * grid,
+            bonus_points=4 * LOWER_BONUS_BALLS,
+            line_points=34,
+            theoretical_max_points=2 * grid + 4 * LOWER_BONUS_BALLS + 34,
         )
 
     shots = [by_id[hole_id] for hole_id in LOWER_SERPENTINE_IDS

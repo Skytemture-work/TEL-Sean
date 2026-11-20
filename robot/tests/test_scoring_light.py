@@ -75,5 +75,57 @@ class ScoringLightRoundTests(unittest.TestCase):
         self.assertIsNone(expired.active_hole_id)
 
 
+class ScoringLightDetectionTests(unittest.TestCase):
+    def _board(self):
+        import cv2
+        import numpy as np
+
+        from turret_control.official_board import (
+            BOARD_HEIGHT_CM, BOARD_WIDTH_CM, hole_position_for_cell)
+
+        # 1 px per cm, board fills the frame: centres are easy to draw.
+        frame = np.full((int(BOARD_HEIGHT_CM), int(BOARD_WIDTH_CM), 3), 60, np.uint8)
+        quad = np.float32([[0, 0], [BOARD_WIDTH_CM, 0],
+                           [BOARD_WIDTH_CM, BOARD_HEIGHT_CM], [0, BOARD_HEIGHT_CM]])
+        centres = []
+        for column in range(3):
+            x, y = hole_position_for_cell(column, 0)
+            centre = (round(x * BOARD_WIDTH_CM), round(y * BOARD_HEIGHT_CM))
+            centres.append(centre)
+            cv2.circle(frame, centre, 10, (20, 20, 20), cv2.FILLED)  # black hole
+            cv2.circle(frame, centre, 16, (235, 240, 245), 2)          # white LED strip
+        return frame, quad, centres
+
+    def test_overexposed_strip_with_red_hole_is_detected(self):
+        import cv2
+
+        from turret_control.scoring_light import detect_score_light_scores
+
+        frame, quad, centres = self._board()
+        # Official field: the lit strip saturates to white, its light turns
+        # the hole itself red.
+        cv2.circle(frame, centres[1], 16, (250, 250, 255), 2)
+        cv2.circle(frame, centres[1], 9, (60, 60, 200), cv2.FILLED)
+
+        scores = detect_score_light_scores(frame, None, quad)
+
+        self.assertGreater(scores["H11"], 0.5)
+        self.assertLess(scores["H10"], 0.05)
+        self.assertLess(scores["H12"], 0.05)
+
+    def test_red_strip_still_detected(self):
+        import cv2
+
+        from turret_control.scoring_light import detect_score_light_scores
+
+        frame, quad, centres = self._board()
+        cv2.circle(frame, centres[0], 16, (30, 30, 230), 3)
+
+        scores = detect_score_light_scores(frame, None, quad)
+
+        self.assertGreater(scores["H10"], 0.12)
+        self.assertLess(scores["H11"], 0.05)
+
+
 if __name__ == "__main__":
     unittest.main()

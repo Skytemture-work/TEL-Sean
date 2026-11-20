@@ -73,6 +73,7 @@ from .scoring_light import ScoreRoundController, draw_score_light_overlay
 from .scoring_strategy import (
     MATCH_PHASES,
     UPPER_BONUS_BALLS,
+    UPPER_SHOOT_BONUS,
     append_reallocated_grid_shots,
     build_max_score_strategy,
 )
@@ -852,6 +853,11 @@ def _run_board_real(
         default="upper",
         help="比賽半場；決定 27/18 球上限與最大得分射擊順序",
     )
+    parser.add_argument(
+        "--lower-bonus", action="store_true",
+        help="下半場小孔模式（比賽時由遙控器 SWB 決定，main.py 發車時送 LOWER_BONUS）："
+             "開賽 60 秒內先射亮燈小孔 2 顆，再射 16 顆大孔（H01、H07 各 1 顆、其餘各 2 顆）",
+    )
     args = parser.parse_args(argv)
     if (not math.isfinite(args.aim_speed) or args.aim_speed <= 0
             or args.aim_speed > MAX_AIM_SPEED_RAD_S):
@@ -1261,7 +1267,8 @@ def _run_board_real(
             column 1), so only the elevation is pre-set there (13 deg; H01
             measured 12.7-13.5 deg) and the ~10 deg yaw is left for the stop.
             """
-            lower = phase == "lower"
+            # Lower-half small hole mode starts on a top hole: pre-aim like the upper half.
+            lower = phase == "lower" and not args.lower_bonus
             pitch_deg = args.preaim_lower_pitch_deg if lower else args.preaim_pitch_deg
             if pitch_deg <= 0 or motors is None:
                 return
@@ -1272,7 +1279,7 @@ def _run_board_real(
                     0x01: (motors.pitch_calibration.motor_from_muzzle(
                         math.radians(pitch_deg)), 0.0, 0.0, 0.0),
                 })
-                print(f"[Aim] 預瞄（{'下' if lower else '上'}半場）：砲口先轉到 yaw "
+                print(f"[Aim] 預瞄（{'下' if phase == 'lower' else '上'}半場）：砲口先轉到 yaw "
                       f"{args.preaim_yaw_deg:+.1f}°、仰角 {pitch_deg:.1f}°"
                       f"（約 {'H01' if lower else 'H11'}）", flush=True)
             except (ValueError, RuntimeError) as exc:
@@ -1327,7 +1334,12 @@ def _run_board_real(
             elif positioning:
                 timeout = 0.005  # a frame per loop; camera.read paces it
             else:
-                timeout = 0.2 if stop_event is not None else None
+                # Once the mechanism is ours, never block on the next command:
+                # the e-stop check above must keep running (2026-11-21: with
+                # VISION_OFF and no further command the loop blocked forever and
+                # a second e-stop during the re-departure went unnoticed).
+                timeout = 0.1 if launcher is not None else (
+                    0.2 if stop_event is not None else None)
             command = next_handoff_command(timeout)
             if command is None:
                 return
@@ -1350,6 +1362,10 @@ def _run_board_real(
                 startup_cleanup.callback(launcher.close, home_pusher=True)
                 print("[Aim] DM 已使能，飛輪預轉中，等待定位完成"
                       f"（子程序啟動後 {time.monotonic() - model_started_at:.1f} s）", flush=True)
+            elif command == "LOWER_BONUS":
+                # main.py: remote SWB (vin=1) latched at the VRA release, lower half.
+                args.lower_bonus = True
+                print("[Aim] 下半場小孔模式：先射亮燈小孔 2 顆，再射 16 顆大孔", flush=True)
             elif command in ("PHASE upper", "PHASE lower"):
                 # main.py reads the half switch on release, before positioning.
                 preaim_phase = command.split()[1]
@@ -1457,9 +1473,13 @@ def _run_board_real(
     if args.match_fire:
         print(
             f"比賽全自動模式（{args.match_phase}）：辨識到靶板即開賽並開始射擊"
-            + (f"，先射亮燈加分孔 {UPPER_BONUS_BALLS} 顆（{args.light_wait:g} 秒內未確認亮燈先射 H11；"
-               "限開賽後 60 秒內），再照蛇形順序射九宮格（每個大孔最多 3 顆），射完 18 顆後等待裝填" if args.match_phase == "upper"
-               else "，不射加分孔")
+            + (("，不射小孔（保守策略），照蛇形順序九個大孔各射 3 顆，射完 18 顆後等待裝填"
+                if not UPPER_SHOOT_BONUS else
+                f"，先射亮燈加分孔 {UPPER_BONUS_BALLS} 顆（{args.light_wait:g} 秒內未確認亮燈先射 H11；"
+                "限開賽後 60 秒內），再照蛇形順序射九宮格（每個大孔最多 3 顆），射完 18 顆後等待裝填")
+               if args.match_phase == "upper"
+               else "，小孔模式：開賽 60 秒內先射亮燈小孔 2 顆，再射 16 顆大孔（H01、H07 各 1 顆）"
+               if args.lower_bonus else "，不射加分孔")
             + f"；已裝 {args.balls_loaded} 顆，時限 {args.match_duration:g} 秒"
             + ("（自 VRA 發車起算）" if getattr(args, "match_clock_origin", None) is not None
                else "（自建立計畫起算）") + "；"
@@ -1574,7 +1594,8 @@ def _run_board_real(
         start_reload_rotation=lambda: bool(launcher is not None and launcher.start_reload_rotation()),
         stop_flywheels=lambda: launcher.stop_flywheels() if launcher is not None else None,
         start_flywheels=lambda: launcher.start_flywheels() if launcher is not None else None,
-        on_magazine_empty=lambda: _on_magazine_empty())
+        on_magazine_empty=lambda: _on_magazine_empty(),
+        shoot_bonus=(True if args.match_phase == "lower" and args.lower_bonus else None))
         if args.match_fire else None)
 
     def begin_home():
@@ -2053,6 +2074,18 @@ def _run_board_real(
                         f"機構忙={launcher.mechanism_busy}｜待發={launcher.pending}｜"
                         f"飛輪到速={launcher.flywheel_ready}｜"
                         f"冷卻完成={driver.fire_cooldown_ready}",
+                        flush=True,
+                    )
+                if score_probe_state is not None:
+                    # Red light diagnosis: confirm needs best >= min_score and
+                    # best - second >= min_margin for confirm_frames frames.
+                    print(
+                        f"紅燈分數：{score_probe_state.phase}｜"
+                        + " ".join(f"{h}={score_probe_state.scores.get(h, 0.0):.3f}"
+                                   for h in ("H10", "H11", "H12"))
+                        + f"｜門檻 {config.score_light_min_score:g}、領先 {config.score_light_min_margin:g}"
+                        + f"｜quad={'有' if trusted_quad is not None else '無'}"
+                        + f"｜鎖定={score_probe_state.active_hole_id or '-'}",
                         flush=True,
                     )
                 last_report = now

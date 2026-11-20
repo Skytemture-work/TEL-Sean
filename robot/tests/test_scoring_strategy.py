@@ -109,5 +109,22 @@ class NoLightTests(unittest.TestCase):
         self.assertEqual(build_max_score_strategy(_board_plan(), None, "lower").hole_ids,
                          build_max_score_strategy(_board_plan(), "H11", "lower").hole_ids)
 
+
+class LowerSmallHoleModeTests(unittest.TestCase):
+    def test_two_bonus_then_sixteen_with_h01_and_h07_once(self):
+        strategy = build_max_score_strategy(_board_plan(), "H12", "lower", lower_bonus=True)
+        self.assertEqual(strategy.hole_ids, (
+            "H12", "H12",
+            "H01", "H02", "H02", "H03", "H03", "H06", "H06", "H05", "H05",
+            "H04", "H04", "H07", "H08", "H08", "H09", "H09"))
+        self.assertEqual(len(strategy.plan), 18)
+        self.assertEqual(strategy.bonus_balls, 2)
+        self.assertEqual(strategy.grid_balls, 16)
+
+    def test_window_over_falls_back_to_the_plain_18(self):
+        self.assertEqual(
+            build_max_score_strategy(_board_plan(), None, "lower", lower_bonus=True).hole_ids,
+            build_max_score_strategy(_board_plan(), None, "lower").hole_ids)
+
 if __name__ == "__main__":
     unittest.main()
