@@ -5,7 +5,7 @@
 // FlySky iBUS (自行解析)
 // =====================
 #define IBUS_RX 40
-#define IBUS_TX 39
+#define IBUS_TX -1
 #define IBUS_CH_NUM 14
 #define IBUS_TIMEOUT 500
 
@@ -13,7 +13,6 @@ HardwareSerial ibusSerial(1);
 
 uint16_t ibusCh[IBUS_CH_NUM];
 unsigned long lastIbusTime = 0;
-bool hasIbusPacket = false;
 
 // =====================
 // Xavier UART (Serial2)
@@ -59,72 +58,10 @@ HardwareSerial xavierSerial(2);
 #define PWM_RESOLUTION 8
 
 // =====================
-// 三顆 Sharp GP2Y0A21 類比紅外線距離感測器
-// =====================
-constexpr unsigned long SHARP_SAMPLE_INTERVAL_MS = 50;
-constexpr uint32_t SHARP_MIN_VALID_MV = 150;
-
-struct SharpSensor {
-  uint8_t pin;
-  uint32_t stopMv;
-  uint32_t releaseMv;
-  uint32_t previousMv;
-  bool blocked;
-};
-
-// 900 / 800 mV 是約 30 / 35 cm 的初始值。
-// 請依各感測器在這兩個距離量到的電壓分別校正。
-SharpSensor sharpSensors[] = {
-  {12, 900, 800, 0, false},  // 左
-  {13, 900, 800, 0, false},  // 中
-  {14, 900, 800, 0, false},  // 右
-};
-
-void updateSharpSensors() {
-  static unsigned long lastSampleMs = 0;
-  const unsigned long now = millis();
-  if (now - lastSampleMs < SHARP_SAMPLE_INTERVAL_MS)
-    return;
-  lastSampleMs = now;
-
-  for (auto &sensor : sharpSensors) {
-    const uint32_t a = analogReadMilliVolts(sensor.pin);
-    const uint32_t b = analogReadMilliVolts(sensor.pin);
-    const uint32_t c = analogReadMilliVolts(sensor.pin);
-    const uint32_t mv = a + b + c - min(a, min(b, c)) - max(a, max(b, c));
-
-    if (mv < SHARP_MIN_VALID_MV) {
-      // 無效讀值不能解除已觸發的煞車。
-      sensor.previousMv = 0;
-      continue;
-    }
-
-    if (mv <= sensor.releaseMv) {
-      sensor.blocked = false;
-    }
-    else if (sensor.previousMv != 0 && mv > sensor.stopMv &&
-             mv > sensor.previousMv) {
-      sensor.blocked = true;
-    }
-    sensor.previousMv = mv;
-  }
-}
-
-bool sharpObstacleBlocked() {
-  for (const auto &sensor : sharpSensors) {
-    if (sensor.blocked)
-      return true;
-  }
-  return false;
-}
-
-// =====================
 // 系統狀態變數
 // =====================
 char currentMode = 'A';  // 'M' = Manual, 'A' = Auto
 
-int manual_yaw = 50;
-int manual_pitch = 50;
 
 // 自動模式接收來自 Xavier 的控制量
 int auto_vx = 0;
@@ -379,10 +316,6 @@ void setup() {
 
   setBrake(true);
 
-  for (const auto &sensor : sharpSensors) {
-    analogSetPinAttenuation(sensor.pin, ADC_11db);
-  }
-
   Serial.println("MECANUM & XAVIER UART READY");
 }
 
@@ -397,7 +330,7 @@ void loop() {
   ibusUpdate();
 
   bool ibusConnected =
-    hasIbusPacket && (millis() - lastIbusTime <= IBUS_TIMEOUT);
+    (millis() - lastIbusTime <= IBUS_TIMEOUT);
 
   // ==========================================
   // 1. 讀取遙控器 iBUS 通道資料
@@ -415,11 +348,11 @@ void loop() {
   int swC = safeRead(8);
   int swD = safeRead(9);
 
-  // 首筆有效 iBUS 封包抵達前採用預設 A，之後由 SWA 決定。
-  currentMode = (!hasIbusPacket || swA == 1) ? 'A' : 'M';
+  // 模式切換
+  currentMode = (swA == 1) ? 'M' : 'A';
 
-  // SW2：底盤 / 砲台控制
-  bool isTurretControl = (swB > 1500);
+  // SWB（CH8）：VIN 開關
+  int send_vin = toSwitch(swB);
 
   // SW1：射擊安全開關
   int fire_allow = (swD > 1500) ? 1 : 0;
@@ -433,28 +366,10 @@ void loop() {
   // 油門倍率
   int throttle = throttleMap(ch3);
 
-  // 手動控制變數
-  int forward = 0;
-  int strafe = 0;
+  // 手動底盤控制
+  int forward = joystickReverse(ch2);
+  int strafe = joystickNormal(ch1);
   int rotate = joystickNormal(ch4);
-
-  if (!isTurretControl) {
-    // 底盤控制模式
-    forward = joystickReverse(ch2);
-    strafe = joystickNormal(ch1);
-  }
-  else {
-    // 砲台控制模式
-    manual_yaw = map(
-      constrain(ch1, 1000, 2000),
-      1000, 2000, 0, 100
-    );
-
-    manual_pitch = map(
-      constrain(ch2, 1000, 2000),
-      1000, 2000, 0, 100
-    );
-  }
 
   // ==========================================
   // 2. 接收 Xavier UART 指令
@@ -478,10 +393,8 @@ void loop() {
   // ==========================================
   // 3. 底盤馬達控制與安全保護
   // ==========================================
-  updateSharpSensors();
-  const bool obstacleStop = sharpObstacleBlocked();
-  if (obstacleStop || !ibusConnected) {
-    // 紅外線避障或遙控器失聯：四輪 PWM 歸零並啟動煞車
+  if (!ibusConnected) {
+    // 遙控器失聯：停止底盤並啟動煞車
     driveMecanum(0, 0, 0, 0);
   }
   else if (currentMode == 'M') {
@@ -512,10 +425,10 @@ void loop() {
     (currentMode == 'M') ? rotate : auto_wz;
 
   int send_yaw =
-    (currentMode == 'M') ? manual_yaw : auto_yaw;
+    (currentMode == 'M') ? 50 : auto_yaw;
 
   int send_pitch =
-    (currentMode == 'M') ? manual_pitch : auto_pitch;
+    (currentMode == 'M') ? 50 : auto_pitch;
 
   int send_fire = fire_allow;
 
@@ -528,12 +441,6 @@ void loop() {
   // VRA 轉到高端時，自動模式才送出啟動訊號。
   int send_auto_start = (currentMode == 'A' && vrA >= 1800) ? 1 : 0;
 
-  if (obstacleStop) {
-    send_vx = 0;
-    send_vy = 0;
-    send_wz = 0;
-  }
-
   String txPacket =
     "E," + String(currentMode) + "," +
     String(send_vx) + "," +
@@ -544,7 +451,8 @@ void loop() {
     String(send_fire) + "," +
     String(send_speed) + "," +
     String(send_reload) + "," +
-    String(send_auto_start) + "\n";
+    String(send_auto_start) + "," +
+    String(send_vin) + "\n";
 
   xavierSerial.print(txPacket);
 
@@ -567,15 +475,7 @@ void loop() {
   Serial.print(strafe);
 
   Serial.print("\tRotate:");
-  Serial.print(rotate);
-  Serial.print("\tSharp mV(L/C/R):");
-  Serial.print(sharpSensors[0].previousMv);
-  Serial.print('/');
-  Serial.print(sharpSensors[1].previousMv);
-  Serial.print('/');
-  Serial.print(sharpSensors[2].previousMv);
-  Serial.print("\tSharpBrake:");
-  Serial.println(obstacleStop ? "ON" : "OFF");
+  Serial.println(rotate);
 
   delay(20);
 
@@ -654,7 +554,6 @@ void ibusUpdate() {
         }
 
         lastIbusTime = millis();
-        hasIbusPacket = true;
       }
     }
   }
