@@ -9,7 +9,9 @@ class Harness:
     """Drive a MatchSequencer like the control loop does."""
 
     def __init__(self, phase, duration=240.0, balls=18, light_wait=5.0, rotation_ok=True,
-                 clock_origin=None):
+                 clock_origin=None, shoot_bonus=None):
+        if shoot_bonus is None and phase == "upper":
+            shoot_bonus = True  # the bonus-flow tests below; conservative ones pass False
         self.plans = []
         self.logs = []
         self.rotations = 0
@@ -25,7 +27,8 @@ class Harness:
                                     stop_flywheels=lambda: self.flywheels.append("off"),
                                     start_flywheels=lambda: self.flywheels.append("on"),
                                     clock_origin=clock_origin,
-                                    on_magazine_empty=lambda: self.flywheels.append("empty"))
+                                    on_magazine_empty=lambda: self.flywheels.append("empty"),
+                                    shoot_bonus=shoot_bonus)
         self.board = _board_plan()
         self.now = 0.0
 
@@ -60,6 +63,88 @@ class LowerHalfTests(unittest.TestCase):
         h.tick()
         self.assertEqual(h.match.stopped, "已裝彈藥全部射出，停止發射")
         self.assertFalse(h.match.reload_wait)
+
+
+class LowerSmallHoleModeTests(unittest.TestCase):
+    """2026-11-21: remote SWB turns on 2 bonus balls in the lower half."""
+
+    def test_default_lower_has_no_bonus(self):
+        match = MatchSequencer("lower", 240.0, 18, lambda plan: None, lambda line: None)
+        self.assertFalse(match.shoot_bonus)
+        self.assertTrue(match.bonus_closed)
+
+    def test_two_on_the_lit_hole_then_sixteen_big_and_no_reload(self):
+        h = Harness("lower", light_wait=0.0, shoot_bonus=True)
+        h.tick()
+        self.assertEqual(h.match.plan.current().hole_id, "H11")  # not confirmed yet
+        h.tick(lit="H12")
+        shots = h.fire(30)
+        self.assertEqual(shots, ["H12", "H12", "H01", "H02", "H02", "H03", "H03",
+                                 "H06", "H06", "H05", "H05", "H04", "H04", "H07",
+                                 "H08", "H08", "H09", "H09"])
+        h.tick()
+        self.assertEqual(h.match.stopped, "已裝彈藥全部射出，停止發射")
+        self.assertFalse(h.match.reload_wait)
+        self.assertEqual(h.rotations, 0)
+
+    def test_light_never_confirmed_shoots_h11(self):
+        h = Harness("lower", light_wait=0.0, shoot_bonus=True)
+        h.tick()
+        self.assertEqual(h.fire(3), ["H11", "H11", "H01"])
+
+    def test_window_over_moves_the_unshot_bonus_ball_to_a_big_hole(self):
+        h = Harness("lower", light_wait=0.0, shoot_bonus=True)
+        h.tick(lit="H10")
+        self.assertEqual(h.fire(1), ["H10"])
+        h.now = 60.0
+        h.tick()
+        rest = h.fire(30)
+        self.assertNotIn("H10", rest)
+        self.assertEqual(len(rest), 17)
+        self.assertTrue(any("略過 1 顆小孔" in line for line in h.logs))
+        # Every big hole ends at the 2-ball cap: H01 or H07 got the extra ball.
+        counts = {hole: rest.count(hole) for hole in set(rest)}
+        self.assertEqual(sorted(counts.values()), [1] + [2] * 8)
+
+    def test_late_start_skips_the_bonus_entirely(self):
+        h = Harness("lower", light_wait=0.0, shoot_bonus=True, clock_origin=-61.0)
+        h.tick(lit="H10")
+        shots = h.fire(30)
+        self.assertNotIn("H10", shots)
+        self.assertEqual(len(shots), 18)
+        self.assertEqual(shots.count("H01"), 2)
+        self.assertEqual(shots.count("H07"), 2)
+
+
+class UpperHalfConservativeTests(unittest.TestCase):
+    """2026-11-20 default: the upper half shoots no small hole."""
+
+    def test_default_is_no_bonus(self):
+        match = MatchSequencer("upper", 240.0, 18, lambda plan: None, lambda line: None)
+        self.assertFalse(match.shoot_bonus)
+        self.assertTrue(match.bonus_closed)  # the light is not scored any more
+
+    def test_big_holes_three_each_with_a_reload_after_18(self):
+        h = Harness("upper", light_wait=0.0, shoot_bonus=False)
+        h.tick(lit="H11")  # a lit light changes nothing
+        self.assertFalse(h.match.waiting_light)
+        self.assertIsNone(h.match.bonus_hole_id)
+        first = h.fire(30)
+        self.assertEqual(first, ["H03"] * 3 + ["H02"] * 3 + ["H01"] * 3
+                         + ["H04"] * 3 + ["H05"] * 3 + ["H06"] * 3)
+        h.tick(lit="H10")
+        self.assertTrue(h.match.reload_wait)
+        self.assertEqual(h.match.reload_balls, 9)
+        self.assertEqual(h.flywheels, ["empty", "off"])
+        h.tick(reload=True)
+        self.assertFalse(h.match.reload_wait)
+        self.assertEqual(h.flywheels, ["empty", "off", "on"])
+        second = h.fire(30)
+        self.assertEqual(second, ["H09"] * 3 + ["H08"] * 3 + ["H07"] * 3)
+        self.assertEqual(first + second, list(UPPER_GRID_NO_BONUS_IDS))
+        h.tick()
+        self.assertEqual(h.match.stopped, "已裝彈藥全部射出，停止發射")
+        self.assertFalse(any("小孔" in line and "略過" in line for line in h.logs))
 
 
 class UpperHalfTests(unittest.TestCase):

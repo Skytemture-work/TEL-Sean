@@ -20,7 +20,9 @@ STARTUP_MODE_TIMEOUT_S = 1.0
 AUTO_STATUS_INTERVAL_SECONDS = 1.0
 AUTO_TARGET_DISTANCE_M = 2.80
 AUTO_FORWARD_VX = 40
-OCCLUSION_STRAFE_VY = 15
+OCCLUSION_REVERSE_VX = 15
+OCCLUSION_REVERSE_TIMEOUT_S = 3.0
+OCCLUSION_CLEARANCE_M = 1.0
 MAX_STRAFE_SECONDS = 1.0
 VISION_WAIT_SECONDS = 10.0
 # After a reload the robot sits in the start zone again; the remote's reload
@@ -40,10 +42,18 @@ MODE_LOCK_ESCAPE_S = 3.0
 # 'X' (no receiver) is left alone: it already keeps the mode, and its fields
 # are placeholders (reload reads 0) that must never count as a switch edge.
 RELOAD_MODE_MASK_S = 10.0
+# Emergency stop: the ESP32 reboots and reads the reload switch as 0 until the
+# receiver links, so a switch left at 1 would look like a 0 -> 1 departure the
+# moment the remote links.  After a gap in its packets, the switch only
+# records its position for RELOAD_ARM_AFTER_RECONNECT_S.
+ESP32_GAP_S = 0.5
+RELOAD_ARM_AFTER_RECONNECT_S = 3.0
 NORMAL_STRAFE_DURATION_SCALE = 1.5
 # Upper half: after the first magazine (RELOAD_WAIT) drive back to the start
 # zone by replaying the departure's chassis commands backwards (open loop).
 RETURN_TO_START_ENABLED = True
+# 回程只倒退發車軌跡的這個比例（每段時間等比例縮短，速度不變）。
+RETURN_DISTANCE_FRACTION = 3.0 / 4.0
 # The ESP32 reports every ~20 ms.  Silence this long, or any packet that is not
 # mode A (the e-stop reboots it: silence, then 'X'), aborts the return so the
 # chassis never resumes driving after the power comes back.
@@ -143,7 +153,7 @@ def read_commands():
         if command == "RELOAD":
             reload_event.set()
         elif command in ("PREPARE_MOTORS", "VISION_ON", "VISION_OFF", "START upper", "START lower",
-                         "POSITIONED", "PHASE upper", "PHASE lower") or command.startswith("DEPART "):
+                         "POSITIONED", "PHASE upper", "PHASE lower", "LOWER_BONUS") or command.startswith("DEPART "):
             handoff.put(command)
     handoff.put(None)
 
@@ -199,13 +209,14 @@ def read_positioning_vy(vision_socket, valid_after, latest, events=None):
     return None
 
 
-def build_return_path(samples, max_gap_s=ESP32_COMMAND_TIMEOUT_S):
+def build_return_path(samples, max_gap_s=ESP32_COMMAND_TIMEOUT_S, scale=1.0):
     """Reverse a departure recording into return segments.
 
     ``samples`` are ``(time, vx, vy, wz)`` as sent to the ESP32, in order.
     Each command lasted until the next sample (at most ``max_gap_s``).  Equal
     neighbours merge, stops are dropped, and the result runs backwards with
-    every component negated: ``[(duration_s, vx, vy, wz), ...]``.
+    every component negated: ``[(duration_s, vx, vy, wz), ...]``.  ``scale``
+    shortens every segment (same speed, that fraction of the distance).
     """
     segments = []
     for (t0, vx, vy, wz), (t1, *_rest) in zip(samples, samples[1:]):
@@ -216,7 +227,7 @@ def build_return_path(samples, max_gap_s=ESP32_COMMAND_TIMEOUT_S):
             segments[-1] = (segments[-1][0] + duration, vx, vy, wz)
         else:
             segments.append((duration, vx, vy, wz))
-    return [(duration, -vx, -vy, -wz) for duration, vx, vy, wz in reversed(segments)]
+    return [(duration * scale, -vx, -vy, -wz) for duration, vx, vy, wz in reversed(segments)]
 
 
 def send_aim_command(process, command):
@@ -281,6 +292,7 @@ def main():
         aim_started = False
         aim_prepared = False
         model_turn_started = False
+        vision_turn_started = False
         last_auto_reload = None
         next_auto_status_at = 0.0
         last_received_mode = None
@@ -294,7 +306,7 @@ def main():
         vision_wait_until = None
         positioning_moved = False
         brake_until = None
-        avoid_until = None
+        recovery_hold_reason = None
         aim_exit_reported = False
         repositioning = False
         reposition_release_at = 0.0
@@ -302,6 +314,7 @@ def main():
         mode_locked = False
         mode_mask_until = 0.0
         release_phase = None  # half switch latched at the VRA release
+        release_lower_bonus = False  # SWB (vin=1) latched with it: lower-half small hole mode
         depart_at = None  # time.monotonic() of the VRA release: the match clock
         drive_log = []  # departure commands (time, vx, vy, wz) for the return
         return_path = None  # active return: [(duration, vx, vy, wz), ...]
@@ -309,6 +322,15 @@ def main():
         return_arrived = False
         return_started_at = 0.0
         last_a_packet_at = 0.0
+        next_auto_rx_log_at = 0.0
+        estop = False  # POWER_LOST from the aim process: hold until its REPOSITION
+        reposition_before_start = False  # e-stop before START: re-departure ends in START
+        last_packet_at = None
+        reload_armed_at = 0.0
+        # Manual after the departure only takes the chassis: the aim process keeps
+        # the turret, aiming and firing, and the match state.
+        manual_chassis_only = False
+        drive_log_valid = True  # False once the driver moved the robot by hand
         print("[System] 已啟動，等待 ESP32 第一筆有效封包...", flush=True)
 
         while True:
@@ -316,8 +338,28 @@ def main():
                 manual.check_health()
             packet = uart.read_esp32_packet()
             raw_packet_mode = packet.get("mode") if packet is not None else None
+            if packet is not None:
+                rx_at = time.monotonic()
+                if last_packet_at is not None and rx_at - last_packet_at > ESP32_GAP_S:
+                    reload_armed_at = rx_at + RELOAD_ARM_AFTER_RECONNECT_S
+                    if aim_started or estop:
+                        print(f"[ESP32] 封包中斷 {rx_at - last_packet_at:.1f} 秒後恢復（可能是急停重啟）："
+                              f"{RELOAD_ARM_AFTER_RECONNECT_S:g} 秒內 RELOAD 開關只記錄位置、不算出發",
+                              flush=True)
+                last_packet_at = rx_at
             if raw_packet_mode == "A":
                 last_a_packet_at = time.monotonic()
+
+            if packet is not None and (current_mode == "A" or raw_packet_mode == "A"):
+                rx_now = time.monotonic()
+                if rx_now >= next_auto_rx_log_at:
+                    next_auto_rx_log_at = rx_now + AUTO_STATUS_INTERVAL_SECONDS
+                    print(
+                        f"[ESP32 RX] raw={packet['raw']!r} | mode={raw_packet_mode} "
+                        f"vx={packet['vx']} vy={packet['vy']} wz={packet['wz']} "
+                        f"auto_start={packet['auto_start']}",
+                        flush=True,
+                    )
 
             if (packet is not None and current_mode == "A"
                     and time.monotonic() < mode_mask_until
@@ -386,7 +428,54 @@ def main():
                 else:
                     manual_request_since = None
 
-                if new_mode != current_mode or (new_mode == "M" and manual is None):
+                if (current_mode == "A" and new_mode == "M"
+                        and aim_process is not None and aim_process.poll() is None):
+                    # Manual = the driver takes the chassis only; the aim process keeps
+                    # the turret (SWD/SWC keep their auto meaning, VRB is unused).
+                    current_mode = "M"
+                    manual_chassis_only = True
+                    if depart_at is None:
+                        print("\n[Mode Switch] 手動：搖桿只開底盤（尚未發車；切回自動後轉 VRA 發車）",
+                              flush=True)
+                        continue
+                    if return_path is not None:
+                        return_path = None
+                        print("[Return] 手動接手：中止自動回程，請自行開回出發區", flush=True)
+                    if not auto_complete:
+                        # Positioning in progress: the driver brings it to the spot.
+                        auto_complete = True
+                        auto_started = False
+                        if lidar is not None:
+                            lidar.stop()
+                        if not estop:
+                            if repositioning and not reposition_before_start:
+                                repositioning = False
+                                send_aim_command(aim_process, "VISION_OFF")
+                                send_aim_command(aim_process, "POSITIONED")
+                            else:
+                                repositioning = False
+                                reposition_before_start = False
+                                send_aim_command(aim_process, "VISION_OFF")
+                                awaiting_phase = not aim_started
+                    print("\n[Mode Switch] 手動接手底盤：結束自動定位，砲塔照常自動瞄準射擊"
+                          "（切回自動時底盤停住，下一次裝填或急停後 RELOAD 才自動定位）", flush=True)
+                    continue
+                if current_mode == "M" and new_mode == "A" and manual_chassis_only:
+                    current_mode = "A"
+                    manual_chassis_only = False
+                    print("\n[Mode Switch] 切回自動：" + (
+                        "等待 VRA 發車" if depart_at is None else
+                        "底盤停住，砲塔照常自動瞄準射擊；下一次裝填或急停後 RELOAD 才自動定位"),
+                        flush=True)
+                    continue
+
+                # Powered up with SWA at M: set up as for auto, then hand the chassis over.
+                startup_chassis_only = current_mode is None and new_mode == "M"
+                if startup_chassis_only:
+                    new_mode = "A"
+
+                if new_mode != current_mode or (
+                        new_mode == "M" and manual is None and not manual_chassis_only):
                     print(
                         "\n[Mode Switch] 正在切換至：{}".format(
                             "自動模式" if new_mode == "A" else "手動模式"
@@ -409,6 +498,7 @@ def main():
                             lidar.stop()
 
                     model_turn_started = False
+                    vision_turn_started = False
                     auto_complete = False
                     auto_started = False
                     awaiting_phase = False
@@ -416,6 +506,11 @@ def main():
                     mode_locked = False
                     mode_mask_until = 0.0
                     release_phase = None
+                    release_lower_bonus = False
+                    estop = False
+                    reposition_before_start = False
+                    manual_chassis_only = False
+                    drive_log_valid = True
                     depart_at = None
                     drive_log = []
                     return_path = None
@@ -429,7 +524,7 @@ def main():
                     vision_wait_until = None
                     positioning_moved = False
                     brake_until = None
-                    avoid_until = None
+                    recovery_hold_reason = None
 
                     if new_mode == "M" and manual is None:
                         print("[System] 正在初始化手動控制器（DM / MKS CAN / VESC）", flush=True)
@@ -466,10 +561,20 @@ def main():
 
                     current_mode = new_mode
                     print(f"[Mode Switch] 已切換至 {current_mode}", flush=True)
+                    if startup_chassis_only and aim_process is not None:
+                        current_mode = "M"
+                        manual_chassis_only = True
+                        print("[Mode Switch] 開機時 SWA 在 M：搖桿只開底盤；切回自動後轉 VRA 發車",
+                              flush=True)
                     # Handoff can block on motors. Read a new packet before acting.
                     continue
 
-                if current_mode == "M":
+                if current_mode == "M" and manual_chassis_only:
+                    # The ESP32 drives the chassis from the sticks; nothing to send.
+                    if (depart_at is not None and packet is not None
+                            and (packet.get("vx") or packet.get("vy") or packet.get("wz"))):
+                        drive_log_valid = False  # the return can no longer replay the departure
+                elif current_mode == "M":
                     # 手動模式：使用遙控器 yaw/pitch 控制砲台方向，
                     # fire 按鈕每次「由放開變按下」觸發一發射擊循環。
                     manual.handle_packet(packet)
@@ -481,9 +586,12 @@ def main():
 
             # 自動瞄準子程序意外結束（例如機構故障）時，不要默默停在原地：
             # 停止底盤與定位、釋放 ZED，並提示撥回手動模式。
-            if (current_mode == "A" and aim_process is not None and not aim_exit_reported
-                    and aim_process.poll() is not None):
+            if ((current_mode == "A" or manual_chassis_only) and aim_process is not None
+                    and not aim_exit_reported and aim_process.poll() is not None):
                 aim_exit_reported = True
+                if manual_chassis_only:
+                    manual_chassis_only = False  # the next M packet sets up full manual
+                    print("[Mode Switch] 射擊程式已結束：改為全手動（含砲台）", flush=True)
                 if mode_locked:
                     mode_locked = False
                     print("[Mode Switch] 射擊程式已結束，解除自動模式鎖定", flush=True)
@@ -505,10 +613,104 @@ def main():
                         flush=True,
                     )
 
-            if current_mode == "A" and auto_complete and aim_started and not repositioning:
-                aim_events = []
+            auto_session = current_mode == "A" or manual_chassis_only
+            aim_events = []
+            if auto_session:
                 latest_vy = read_positioning_vy(vision_socket, vision_valid_after, latest_vy,
                                                 aim_events)
+
+            if (manual_chassis_only and "MODEL_READY" in aim_events and manual is not None
+                    and not model_turn_started):
+                # Same "model loaded" magazine sign as in auto (checked again in auto).
+                model_turn_started = manual.signal_model_ready()
+
+            if auto_session and "POWER_LOST" in aim_events:
+                # Emergency stop (24 V cut) at any time after the departure.  The aim
+                # process keeps the match state; nothing drives until its REPOSITION
+                # (power back + RELOAD 0 -> 1).
+                estop = True
+                if return_path is not None:
+                    return_path = None
+                    print("[E-STOP] 中止自動回程", flush=True)
+                if not auto_complete:
+                    auto_started = False
+                    if lidar is not None:
+                        lidar.stop()
+                    print("[E-STOP] 中止自動定位", flush=True)
+                uart.send_packet(mode="A", vx=0, vy=0, wz=0, yaw=50, pitch=50, fire=0, speed=0)
+                print("[E-STOP] 馬達斷電：底盤停止。車拉回出發區、修好後，遙控器 RELOAD "
+                      "撥 0 再撥 1，就從出發區重新出發（不需要 VRA）。", flush=True)
+                if last_auto_reload == 1:
+                    print("[E-STOP] RELOAD 開關目前在 1：請先撥回 0，修好再撥到 1 出發", flush=True)
+
+            if manual_chassis_only and "REPOSITION" in aim_events:
+                # Power back + RELOAD while the driver has the chassis: no positioning,
+                # the driver brings it to the spot; the turret goes on at once.
+                estop = False
+                mode_mask_until = time.monotonic() + RELOAD_MODE_MASK_S
+                if aim_started:
+                    send_aim_command(aim_process, "POSITIONED")
+                else:
+                    awaiting_phase = True
+                print("[Mode] 手動模式：由駕駛開到定點，砲塔照常自動瞄準射擊", flush=True)
+            elif current_mode == "A" and "REPOSITION" in aim_events:
+                # Power back and RELOAD confirmed (after an e-stop or the upper-half
+                # reload): depart again from the start zone.  Before START this is
+                # the match departure itself and ends in START, as at the VRA release.
+                estop = False
+                reposition_before_start = not aim_started
+                if return_path is not None:
+                    return_path = None
+                    uart.send_packet(mode="A", vx=0, vy=0, wz=0, yaw=50, pitch=50,
+                                     fire=0, speed=0)
+                    print("[Return] 已確認裝填：結束回程", flush=True)
+                if reposition_before_start:
+                    awaiting_phase = False
+                    drive_log = []  # this drive is the departure the return replays
+                    drive_log_valid = True
+                    send_aim_command(aim_process, "VISION_ON")
+                repositioning = True
+                mode_mask_until = time.monotonic() + RELOAD_MODE_MASK_S
+                print(f"[Mode Switch] 裝填完成：{RELOAD_MODE_MASK_S:g} 秒內忽略封包模式"
+                      "（ESP32 重啟），reload 等其他欄位照常讀取", flush=True)
+                reposition_release_at = time.monotonic() + REPOSITION_VY_WAIT_S
+                auto_complete = False
+                auto_started = False
+                locked_vy = None
+                latest_vy = None
+                vision_valid_after = time.monotonic()
+                vy_recorded_before_release = False
+                strafe_until = None
+                vision_wait_until = None
+                positioning_moved = False
+                brake_until = None
+                recovery_hold_reason = None
+                if lidar is not None:
+                    lidar.stop()
+                    lidar.join()
+                lidar = LidarAvoidance()
+                lidar.start()
+                next_auto_status_at = 0.0
+                print(f"[Auto Drive] 裝填完成：重新出發定位（先等視覺 vy，最多 "
+                      f"{REPOSITION_VY_WAIT_S:g} 秒）", flush=True)
+
+            # Before the positioning below: its e-stop hold `continue`s.
+            if (
+                auto_session and packet is not None and packet.get("mode") in ("A", "M")
+                and (aim_started or estop)
+            ):
+                reload_value = packet.get("reload")
+                if reload_value in (0, 1):
+                    armed = time.monotonic() >= reload_armed_at
+                    if (mode_locked or estop) and reload_value != last_auto_reload:
+                        print(f"[Aim] RELOAD 開關 {last_auto_reload} → {reload_value}"
+                              + ("" if armed else "（ESP32 剛恢復，只記錄位置）"), flush=True)
+                    if armed and last_auto_reload == 0 and reload_value == 1:
+                        if send_aim_command(aim_process, "RELOAD"):
+                            print("[Aim] 已轉送遙控器裝填確認", flush=True)
+                    last_auto_reload = reload_value
+
+            if auto_session and auto_complete and aim_started and not repositioning:
                 if "RELOAD_WAIT" in aim_events and not mode_locked:
                     mode_locked = True
                     print("[Mode Switch] 進入裝填：自動模式鎖定到射擊程式結束"
@@ -525,8 +727,12 @@ def main():
                     # The last ball is out: drive back while the pusher homes
                     # and the flywheels stop.
                     return_requested = True
-                    path = build_return_path(drive_log) if RETURN_TO_START_ENABLED else []
-                    if path:
+                    path = (build_return_path(drive_log, scale=RETURN_DISTANCE_FRACTION)
+                            if RETURN_TO_START_ENABLED and drive_log_valid and not manual_chassis_only
+                            else [])
+                    if manual_chassis_only:
+                        print("[Return] 手動模式：請自行把車開回出發區裝填", flush=True)
+                    elif path:
                         return_path = path
                         return_started_at = time.monotonic()
                         print(f"[Return] 依發車軌跡反向退回出發區（開環，{len(path)} 段，約 "
@@ -534,51 +740,41 @@ def main():
                               "到達前請勿靠近車子。按急停、VRA 關閉或 ESP32 中斷都會立即停止回程。",
                               flush=True)
                     else:
-                        print("[Return] 沒有可用的發車軌跡，請人工把車移回出發區裝填", flush=True)
-                if "REPOSITION" in aim_events:
-                    if return_path is not None:
-                        return_path = None
-                        uart.send_packet(mode="A", vx=0, vy=0, wz=0, yaw=50, pitch=50,
-                                         fire=0, speed=0)
-                        print("[Return] 已確認裝填：結束回程", flush=True)
-                    # Reload done in the start zone: the reload confirmation is
-                    # the departure.  Same positioning as at the match start.
-                    repositioning = True
-                    mode_mask_until = time.monotonic() + RELOAD_MODE_MASK_S
-                    print(f"[Mode Switch] 裝填完成：{RELOAD_MODE_MASK_S:g} 秒內忽略封包模式"
-                          "（ESP32 重啟），reload 等其他欄位照常讀取", flush=True)
-                    reposition_release_at = time.monotonic() + REPOSITION_VY_WAIT_S
-                    auto_complete = False
-                    auto_started = False
-                    locked_vy = None
-                    latest_vy = None
-                    vision_valid_after = time.monotonic()
-                    vy_recorded_before_release = False
-                    strafe_until = None
-                    vision_wait_until = None
-                    positioning_moved = False
-                    brake_until = None
-                    avoid_until = None
-                    if lidar is not None:
-                        lidar.join()
-                    lidar = LidarAvoidance()
-                    lidar.start()
-                    next_auto_status_at = 0.0
-                    print(f"[Auto Drive] 裝填完成：重新出發定位（先等視覺 vy，最多 "
-                          f"{REPOSITION_VY_WAIT_S:g} 秒）", flush=True)
+                        print("[Return] 沒有可用的發車軌跡（或途中手動開過車），請人工把車移回出發區裝填",
+                              flush=True)
 
             if current_mode == "A" and not auto_complete:
                 now = time.monotonic()
-                pre_events = []
-                latest_vy = read_positioning_vy(vision_socket, vision_valid_after, latest_vy,
-                                                pre_events)
+                pre_events = aim_events
+                if estop:
+                    # Stopped by the e-stop: wait for the REPOSITION, never resume on VRA.
+                    uart.send_packet(mode="A", vx=0, vy=0, wz=0, yaw=50, pitch=50, fire=0, speed=0)
+                    if now >= next_auto_status_at:
+                        next_auto_status_at = now + AUTO_STATUS_INTERVAL_SECONDS
+                        print("[E-STOP] 等待復電與 RELOAD（撥 0 再撥 1）出發", flush=True)
+                    time.sleep(0.02)
+                    continue
                 if "MODEL_READY" in pre_events and manual is not None and not model_turn_started:
                     model_turn_started = manual.signal_model_ready()
                     if not model_turn_started:
                         raise RuntimeError("無法啟動 YOLO 就緒提示轉格")
                 model_turn_ready = manual is None or (
-                    model_turn_started and manual.wait_signal_turn(timeout=0)
+                    model_turn_started and (vision_turn_started or manual.wait_signal_turn(timeout=0))
                 )
+                if (
+                    manual is not None
+                    and not auto_started
+                    and model_turn_ready
+                    and not vision_turn_started
+                    and latest_vy is not None
+                    and packet is not None
+                    and packet.get("mode") == "A"
+                    and packet.get("auto_start") == 0
+                ):
+                    if not manual.signal_model_ready(slots=1):
+                        raise RuntimeError("無法啟動視覺 vy 提示轉格")
+                    vision_turn_started = True
+                    print(f"[Auto Drive] 已偵測到視覺 vy={latest_vy[1]}，轉 1 格提示", flush=True)
                 if packet is not None and packet.get("mode") == "A":
                     # A re-departure after the reload needs no VRA release.
                     swa_enabled = packet.get("auto_start") == 1 or repositioning
@@ -597,9 +793,11 @@ def main():
                         vision_wait_until = None
                         positioning_moved = False
                         brake_until = None
-                        avoid_until = None
+                        recovery_hold_reason = None
                     elif not auto_started and not reposition_hold and model_turn_ready:
-                        if manual is not None:
+                        if manual is not None and (
+                            not vision_turn_started or manual.wait_signal_turn(timeout=0)
+                        ):
                             manual.close()
                             manual = None
                             # Housekeeping can block. Recheck VRA before driving or timing the match.
@@ -612,20 +810,17 @@ def main():
                         if not repositioning:
                             # Latch the half here: pre-aim and START share it.
                             release_phase = "lower" if packet.get("fire") == 1 else "upper"
+                            release_lower_bonus = release_phase == "lower" and packet.get("vin") == 1
+                            if release_phase == "lower":
+                                print("[Match] 下半場：" + (
+                                    "SWB 小孔模式（先射亮燈小孔 2 顆，再射 16 顆大孔）"
+                                    if release_lower_bonus else "18 顆全打大孔（每孔 2 顆）"), flush=True)
                         if depart_at is None and not repositioning:
                             # The match clock runs from the first VRA release
                             # (the departure); both processes share CLOCK_MONOTONIC.
                             depart_at = now
                             send_aim_command(aim_process, f"DEPART {depart_at:.3f}")
                             print("[Match] VRA 發車：比賽計時開始", flush=True)
-                        if not aim_prepared and aim_process is not None and aim_process.poll() is None:
-                            # The half switch is already set on release: tell the aim
-                            # process now, so the turret pre-aims at the right first
-                            # hole (upper H11, lower H01) while the chassis drives.
-                            send_aim_command(aim_process, f"PHASE {release_phase}")
-                            aim_prepared = send_aim_command(aim_process, "PREPARE_MOTORS")
-                            if aim_prepared:
-                                print("[Aim] SWA 已放行，背景準備 DM／VESC", flush=True)
                         auto_started = True
                         vy_recorded_before_release = locked_vy is not None
                         next_auto_status_at = 0.0
@@ -656,10 +851,27 @@ def main():
                     time.sleep(0.02)
                     continue
 
+            # The optional vision cue can finish while the chassis is moving.
+            # Release its CAN hardware before handing control to the aim process.
+            if current_mode == "A" and auto_started and not repositioning:
+                if manual is not None and manual.wait_signal_turn(timeout=0):
+                    manual.close()
+                    manual = None
+                if (manual is None and not aim_prepared
+                        and aim_process is not None and aim_process.poll() is None):
+                    if release_lower_bonus:
+                        # Before PHASE: the pre-aim then heads for the top holes.
+                        send_aim_command(aim_process, "LOWER_BONUS")
+                    send_aim_command(aim_process, f"PHASE {release_phase}")
+                    aim_prepared = send_aim_command(aim_process, "PREPARE_MOTORS")
+                    if aim_prepared:
+                        print("[Aim] SWA 已放行，背景準備 DM／VESC", flush=True)
+
             # SWA already authorized motor preparation for this auto session.
             # The half was latched at the SWA release (SWD moved during
             # positioning is ignored); the next A packet sets the reload baseline.
-            if awaiting_phase and packet is not None and packet.get("mode") == "A":
+            if (awaiting_phase and manual is None and packet is not None
+                    and (packet.get("mode") == "A" or manual_chassis_only)):
                 awaiting_phase = False
                 match_phase = release_phase or (
                     "lower" if packet.get("fire") == 1 else "upper")
@@ -670,19 +882,6 @@ def main():
                         print(f"[Aim] 已送出正式投球及半場設定（{match_phase}）", flush=True)
                 else:
                     print("[Aim] 預熱子程序已結束，未交接機構", flush=True)
-
-            if (
-                current_mode == "A" and packet is not None and packet.get("mode") == "A"
-                and aim_started
-            ):
-                reload_value = packet.get("reload")
-                if reload_value in (0, 1):
-                    if mode_locked and reload_value != last_auto_reload:
-                        print(f"[Aim] RELOAD 開關 {last_auto_reload} → {reload_value}", flush=True)
-                    if last_auto_reload == 0 and reload_value == 1:
-                        if send_aim_command(aim_process, "RELOAD"):
-                            print("[Aim] 已轉送遙控器裝填確認", flush=True)
-                    last_auto_reload = reload_value
 
             if current_mode == "A" and return_path is not None:
                 now = time.monotonic()
@@ -742,37 +941,27 @@ def main():
                     brake_until = now + OCCLUSION_BRAKE_SECONDS
                     print("[Auto Drive] 移動中遇到遮擋，緊急停止", flush=True)
 
-                if (
-                    brake_until is not None
-                    and now >= brake_until
-                    and vy_recorded_before_release
-                    and locked_vy
-                    and valid_distance
-                    and not blocked
-                ):
-                    brake_until = None
-                    avoid_until = None
-                    # 避障後只沿 X 軸續行，原本的視覺橫移不再送出。
-                    strafe_until = now
-                    next_auto_status_at = 0.0
-                    print("[Auto Drive] LiDAR 前方已清空，恢復目標距離定位", flush=True)
-
                 if brake_until is not None:
                     lidar_status = "遮擋後緊急停止"
                     if now >= brake_until:
-                        if not vy_recorded_before_release or not locked_vy:
-                            auto_complete = True
-                            completion_reason = "遮擋後停止，放行前沒有有效橫移方向"
-                        elif not valid_distance:
-                            # 距離不明時停車，等待下一筆有效回波。
-                            lidar_status = "遮擋後等待有效 LiDAR 距離"
-                        elif avoid_until is not None and now >= avoid_until:
-                            lidar_status = "避障橫移達時限，停車等待前方清空"
+                        rear_range_m = lidar.get_rear_range()
+                        if recovery_hold_reason is None:
+                            if valid_distance and front_distance_m + config.LIDAR_TO_FRONT_M >= OCCLUSION_CLEARANCE_M:
+                                recovery_hold_reason = "前方達 100 cm 淨空，保持停車"
+                            elif now - brake_until >= OCCLUSION_REVERSE_TIMEOUT_S:
+                                recovery_hold_reason = "後退逾時，保持停車"
+                            elif (now - last_a_packet_at > RETURN_PACKET_TIMEOUT_S
+                                  or raw_packet_mode not in (None, "A")):
+                                recovery_hold_reason = "ESP32 通訊中斷或模式異常，保持停車"
+                            elif not valid_distance:
+                                recovery_hold_reason = "前方距離無效，保持停車"
+                            elif rear_range_m is None or rear_range_m <= config.RECOVERY_REAR_MIN_RANGE_M:
+                                recovery_hold_reason = "後方回波不足或有障礙，保持停車"
+                        if recovery_hold_reason is None:
+                            final_vx = -OCCLUSION_REVERSE_VX
+                            lidar_status = "遮擋後直線後退，等待前方達 100 cm"
                         else:
-                            if avoid_until is None:
-                                avoid_until = now + MAX_STRAFE_SECONDS
-                            final_vy = -OCCLUSION_STRAFE_VY if locked_vy < 0 else OCCLUSION_STRAFE_VY
-                            lidar_status = "遮擋後橫移，等待 LiDAR 前方清空"
+                            lidar_status = recovery_hold_reason
                 elif (
                     vision_wait_until is not None
                     and locked_vy is None
@@ -837,7 +1026,7 @@ def main():
                 tx_vx = -final_vx
                 tx_vy = final_vy
                 if vy_recorded_before_release and brake_until is None:
-                    tx_vy = max(-100, min(100, round(final_vy * 1.5)))
+                    tx_vy = max(-100, min(100, final_vy * 2))
                 uart.send_packet(
                     mode="A",
                     vx=tx_vx,
@@ -847,8 +1036,9 @@ def main():
                     pitch=pitch,
                     fire=fire_cmd,
                     speed=fire_speed,
+                    trace=now >= next_auto_status_at,
                 )
-                if not repositioning:
+                if not repositioning or reposition_before_start:
                     # The match departure (not the re-departure after the
                     # reload): replayed backwards to return for the reload.
                     drive_log.append((now, tx_vx, tx_vy, final_wz))
@@ -867,12 +1057,15 @@ def main():
                         # reach are skipped after 3 s by the aim process.
                         print(f"[Aim] 定位不完整（{completion_reason}），仍照常開始投球；"
                               "打不到的孔會自動跳過", flush=True)
-                    if repositioning:
+                    if repositioning and not reposition_before_start:
                         repositioning = False
                         send_aim_command(aim_process, "VISION_OFF")
                         if send_aim_command(aim_process, "POSITIONED"):
                             print("[Aim] 重新定位完成，通知繼續射擊", flush=True)
-                    elif aim_prepared and send_aim_command(aim_process, "VISION_OFF"):
+                    elif send_aim_command(aim_process, "VISION_OFF"):
+                        # Match departure, or its redo after an e-stop before START.
+                        repositioning = False
+                        reposition_before_start = False
                         awaiting_phase = True
                         print("[Aim] 沿用 ZED，等待下一筆 A 模式封包選擇半場", flush=True)
                     else:

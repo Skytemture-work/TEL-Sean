@@ -68,13 +68,16 @@ def _ring_mask_from_quad(
 
     try:
         outer = np.round(project_radius(outer_radius_cm)).astype(np.int32)
-        inner = np.round(project_radius(inner_radius_cm)).astype(np.int32)
+        inner = (np.round(project_radius(inner_radius_cm)).astype(np.int32)
+                 if inner_radius_cm > 0 else None)
     except cv2.error:
         return np.zeros((height, width), dtype=np.uint8)
 
     outer_mask = np.zeros((height, width), dtype=np.uint8)
-    inner_mask = np.zeros((height, width), dtype=np.uint8)
     cv2.fillPoly(outer_mask, [outer.reshape(-1, 1, 2)], 255)
+    if inner is None:
+        return outer_mask  # a full disc
+    inner_mask = np.zeros((height, width), dtype=np.uint8)
     cv2.fillPoly(inner_mask, [inner.reshape(-1, 1, 2)], 255)
     return cv2.subtract(outer_mask, inner_mask)
 
@@ -114,6 +117,8 @@ def _ring_mask_from_target(
         255,
         cv2.FILLED,
     )
+    if inner_radius_cm <= 0:
+        return outer_mask  # a full disc
     cv2.ellipse(
         inner_mask,
         center,
@@ -136,13 +141,16 @@ def detect_score_light_scores(
     search_tolerance_cm: float = 1.5,
     min_saturation: int = 55,
     min_value: int = 40,
+    interior_radius_cm: float = 8.0,
 ) -> Dict[str, float]:
     """Return a red-light score for H10/H11/H12.
 
     The small scoring hole is Ø20 cm.  The rule places the LED strip's inner
     edge about 5 cm beyond the circular frame edge, so the nominal inner
     radius is 10 + 5 = 15 cm.  The search tolerance absorbs perspective,
-    blur, and the stated field tolerance.
+    blur, and the stated field tolerance.  The hole interior (a disc of
+    ``interior_radius_cm``; 0 disables it) is scored too and the higher of
+    the two counts.
     """
 
     if frame is None or frame.ndim != 3:
@@ -169,16 +177,30 @@ def detect_score_light_scores(
             if target.hole_id in SCORE_HOLE_IDS
         }
 
+    def region_score(mask: np.ndarray) -> float:
+        pixels = mask > 0
+        count = int(np.count_nonzero(pixels))
+        if count == 0:
+            return 0.0
+        red_fraction = float(np.count_nonzero(red_pixels & pixels)) / count
+        red_energy = float(np.mean(red_excess[pixels])) / 255.0
+        return 0.70 * red_fraction + 0.30 * red_energy
+
+    shape = frame.shape[:2]
     scores: Dict[str, float] = {}
     outer_radius_cm = inner_radius_cm + strip_width_cm
     for column, hole_id in enumerate(SCORE_HOLE_IDS):
         if board_quad is not None:
             ring = _ring_mask_from_quad(
-                frame.shape[:2],
+                shape,
                 board_quad,
                 column,
                 max(0.1, inner_radius_cm - search_tolerance_cm),
                 outer_radius_cm + search_tolerance_cm,
+            )
+            interior = (
+                _ring_mask_from_quad(shape, board_quad, column, 0.0, interior_radius_cm)
+                if interior_radius_cm > 0 else None
             )
         else:
             target = targets_by_id.get(hole_id)
@@ -186,21 +208,25 @@ def detect_score_light_scores(
                 scores[hole_id] = 0.0
                 continue
             ring = _ring_mask_from_target(
-                frame.shape[:2],
+                shape,
                 target,
                 inner_radius_cm,
                 outer_radius_cm,
                 search_tolerance_cm,
             )
+            interior = (
+                _ring_mask_from_target(shape, target, 0.0, interior_radius_cm, 0.0)
+                if interior_radius_cm > 0 else None
+            )
 
-        ring_pixels = ring > 0
-        count = int(np.count_nonzero(ring_pixels))
-        if count == 0:
-            scores[hole_id] = 0.0
-            continue
-        red_fraction = float(np.count_nonzero(red_pixels & ring_pixels)) / count
-        red_energy = float(np.mean(red_excess[ring_pixels])) / 255.0
-        scores[hole_id] = 0.70 * red_fraction + 0.30 * red_energy
+        # A bright LED strip saturates to white on camera (official field,
+        # 2026-11-20: the lit H11 ring read V=252 S=12, 0 % red pixels) while
+        # its light makes the hole itself glow red (98 % red pixels inside
+        # 8 cm; an unlit hole is black).  Take whichever region shows it.
+        score = region_score(ring)
+        if interior is not None:
+            score = max(score, region_score(interior))
+        scores[hole_id] = score
     return scores
 
 

@@ -62,12 +62,13 @@ class UARTController:
                         continue
 
                 parts = line.split(',')
-                # ESP32 -> Xavier: E,MODE,VX,VY,WZ,YAW,PITCH,FIRE,SPEED,RELOAD[,AUTO_START]
+                # ESP32 -> Xavier: E,MODE,VX,VY,WZ,YAW,PITCH,FIRE,SPEED,RELOAD[,AUTO_START[,VIN]]
+                # VIN = remote SWB (lower-half small hole mode); older firmware omits it.
                 # MODE 'X' = the ESP32 has no remote signal (booting after an
                 # e-stop, link lost): a valid packet whose mode main.py ignores.
-                if len(parts) not in (10, 11) or parts[0] != 'E' or parts[1] not in ('M', 'A', 'X'):
+                if len(parts) not in (10, 11, 12) or parts[0] != 'E' or parts[1] not in ('M', 'A', 'X'):
                     print(
-                        "[UART RX INVALID] expected E,MODE,VX,VY,WZ,YAW,PITCH,FIRE,SPEED,RELOAD[,AUTO_START]; got={!r}".format(line),
+                        "[UART RX INVALID] expected E,MODE,VX,VY,WZ,YAW,PITCH,FIRE,SPEED,RELOAD[,AUTO_START[,VIN]]; got={!r}".format(line),
                         flush=True,
                     )
                     continue
@@ -84,7 +85,8 @@ class UARTController:
                         'fire': int(parts[7]),
                         'speed': int(parts[8]),
                         'reload': int(parts[9]),
-                        'auto_start': int(parts[10]) if len(parts) == 11 else 0,
+                        'auto_start': int(parts[10]) if len(parts) >= 11 else 0,
+                        'vin': int(parts[11]) if len(parts) >= 12 else 0,
                     }
                 except ValueError:
                     print("[UART RX INVALID] non-numeric ESP32 packet: {!r}".format(line), flush=True)

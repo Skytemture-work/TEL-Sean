@@ -60,6 +60,7 @@ DM_UART_DEG_PER_UNIT = 0.1
 DM_UART_YAW_SIGN = 1.0  # 遙控器左右方向反轉。
 DM_UART_PITCH_SIGN = 1.0  # 遙控器上下方向反轉。
 DM_POSITION_TOLERANCE_DEG = 2.5  # 實際角度到位容許誤差；負載下約有 1.14° 穩態誤差。
+DM_RETURN_PITCH_ABOVE_TOLERANCE_DEG = 5.0  # 關閉前回位：仰角偏高較安全，往上容許較寬。
 DM_FEEDBACK_MAX_AGE_S = 0.5
 DM_FEEDBACK_RECOVERY_TIMEOUT_S = 1.0
 AMMO_CAN_INTERFACE = "can0"
@@ -766,89 +767,20 @@ class VESCDualMotorController:
             self._ready_event.set()
 
             while not self._stop_event.is_set():
-                now = time.monotonic()
-                dt = self._clamp(now - last_time, 0.01, 0.5)
-                last_time = now
-
-                left = self._read_runtime_motor(reader_left, "LEFT", self._ser_left)
-                if self._stop_event.is_set():
-                    break
-                right = self._read_runtime_motor(reader_right, "RIGHT", self._ser_right)
-                if self._stop_event.is_set():
-                    break
-                self.last_rpm = (
-                    left["erpm"] / VESC_LEFT_POLE_PAIRS,
-                    right["erpm"] / VESC_RIGHT_POLE_PAIRS,
-                    time.monotonic(),
-                )
-
-                speed_value = self._get_speed_value()
-                target_rpm = (
-                    None if speed_value is None
-                    else VESC_MIN_RPM + speed_value * VESC_RPM_PER_SPEED_UNIT
-                )
-                target_rpm = self._apply_restart_interval(target_rpm)
-
-                if target_rpm is None:
-                    # 自動模式或關閉時清除積分並軟停止（減速→輕煞→放開）。
-                    pi_left_integral = 0.0
-                    pi_right_integral = 0.0
-                    cmd_left, cmd_right = self._soft_stop_commands(
-                        left["erpm"] / VESC_LEFT_POLE_PAIRS,
-                        right["erpm"] / VESC_RIGHT_POLE_PAIRS,
-                        time.monotonic(),
-                    )
-                else:
-                    self._soft_stop = None
-                    self._released_event.clear()
-                    rpm_left = left["erpm"] / VESC_LEFT_POLE_PAIRS
-                    rpm_right = right["erpm"] / VESC_RIGHT_POLE_PAIRS
-                    goal_left, goal_right = flywheel_wheel_targets(target_rpm)
-                    base_left = goal_left * VESC_LEFT_POLE_PAIRS
-                    base_right = goal_right * VESC_RIGHT_POLE_PAIRS
-
-                    error_left = goal_left - rpm_left
-                    error_right = goal_right - rpm_right
-                    pi_left_integral += error_left * dt
-                    pi_right_integral += error_right * dt
-                    trim_left = self._clamp(
-                        VESC_SPEED_KP * error_left + VESC_SPEED_KI * pi_left_integral,
-                        -VESC_MAX_TRIM_ERPM, VESC_MAX_TRIM_ERPM,
-                    )
-                    trim_right = self._clamp(
-                        VESC_SPEED_KP * error_right + VESC_SPEED_KI * pi_right_integral,
-                        -VESC_MAX_TRIM_ERPM, VESC_MAX_TRIM_ERPM,
-                    )
-                    # 同步修正維持「設定的轉速差」，而不是把兩輪拉成同速。
-                    sync = self._clamp(
-                        VESC_SYNC_KP * (error_right - error_left),
-                        -VESC_MAX_SYNC_CORRECTION_ERPM,
-                        VESC_MAX_SYNC_CORRECTION_ERPM,
-                    )
-                    target_left = int(base_left + trim_left - sync)
-                    target_right = int(base_right + trim_right + sync)
-
-                if target_rpm is not None:
-                    cmd_left, cmd_right = ("rpm", target_left), ("rpm", target_right)
-                self._write_cmd("LEFT", self._ser_left, cmd_left)
-                self._write_cmd("RIGHT", self._ser_right, cmd_right)
-                target_left = cmd_left[1] if cmd_left[0] == "rpm" else cmd_left[0]
-                target_right = cmd_right[1] if cmd_right[0] == "rpm" else cmd_right[0]
-                print(
-                    "[VESC] VRB={} -> target={} RPM | "
-                    "L cmd={} ERPM actual={} ERPM ({:.1f} RPM) | "
-                    "R cmd={} ERPM actual={} ERPM ({:.1f} RPM)".format(
-                        "STOP" if speed_value is None else speed_value,
-                        0 if target_rpm is None else int(target_rpm),
-                        target_left,
-                        left["erpm"],
-                        left["erpm"] / VESC_LEFT_POLE_PAIRS,
-                        target_right,
-                        right["erpm"],
-                        right["erpm"] / VESC_RIGHT_POLE_PAIRS,
-                    ),
-                    flush=True,
-                )
+                try:
+                    pi_left_integral, pi_right_integral = self._control_step(
+                        reader_left, reader_right, pi_left_integral, pi_right_integral,
+                        last_time)
+                    last_time = time.monotonic()
+                except RuntimeError as exc:
+                    if not self._usb_dropped(exc):
+                        raise
+                    readers = self._reconnect_after_usb_drop(exc)
+                    if readers is None:
+                        break  # close() requested while waiting
+                    reader_left, reader_right = readers
+                    last_time = time.monotonic()
+                    continue
                 self._stop_event.wait(VESC_LOOP_INTERVAL)
 
         except Exception as exc:
@@ -869,6 +801,138 @@ class VESCDualMotorController:
                     except Exception:
                         pass
             print("[VESC] 雙馬達控制執行緒已關閉。")
+
+    @staticmethod
+    def _usb_dropped(exc):
+        """A serial-port failure (the USB link), not a VESC fault or a power loss.
+
+        EMI makes the hub drop a VESC ("disabled by hub (EMI?)") for about a
+        second.  A voltage out of range or a VESC that stops answering on a
+        working port is not this, and still stops the flywheels.
+        """
+        cause = exc
+        while cause is not None:
+            if isinstance(cause, (serial.SerialException, OSError)) and not isinstance(
+                    cause, TimeoutError):
+                return True
+            cause = cause.__cause__
+        return False
+
+    def _reconnect_after_usb_drop(self, exc):
+        """Reopen both ports and keep the current target; None if close() was asked."""
+        print("[VESC] USB 斷線（{}）：重新連線，飛輪目標轉速不變；連回前不發射。".format(exc),
+              flush=True)
+        self.last_rpm = None  # flywheel_ready is False until fresh telemetry
+        for ser in (self._ser_left, self._ser_right):
+            if ser is not None:
+                try:
+                    ser.close()
+                except Exception:
+                    pass
+        self._ser_left = self._ser_right = None
+        self._ser_left = self._open_port_waiting(VESC_LEFT_PORT, "LEFT")
+        if self._ser_left is None:
+            return None
+        self._ser_right = self._open_port_waiting(VESC_RIGHT_PORT, "RIGHT")
+        if self._ser_right is None:
+            return None
+        if self._stop_event.wait(0.5):
+            return None
+        self._ser_left.reset_input_buffer()
+        self._ser_right.reset_input_buffer()
+        reader_left = VESCReader(self._ser_left)
+        reader_right = VESCReader(self._ser_right)
+        self._read_startup_motor(reader_left, "LEFT")
+        self._read_startup_motor(reader_right, "RIGHT")
+        print("[VESC] USB 已重新連線，恢復飛輪控制。", flush=True)
+        return reader_left, reader_right
+
+    def _control_step(self, reader_left, reader_right, pi_left_integral, pi_right_integral,
+                      last_time):
+        """One telemetry + command cycle; returns the updated PI integrals."""
+        now = time.monotonic()
+        dt = self._clamp(now - last_time, 0.01, 0.5)
+
+        left = self._read_runtime_motor(reader_left, "LEFT", self._ser_left)
+        if self._stop_event.is_set():
+            return pi_left_integral, pi_right_integral
+        right = self._read_runtime_motor(reader_right, "RIGHT", self._ser_right)
+        if self._stop_event.is_set():
+            return pi_left_integral, pi_right_integral
+        self.last_rpm = (
+            left["erpm"] / VESC_LEFT_POLE_PAIRS,
+            right["erpm"] / VESC_RIGHT_POLE_PAIRS,
+            time.monotonic(),
+        )
+
+        speed_value = self._get_speed_value()
+        target_rpm = (
+            None if speed_value is None
+            else VESC_MIN_RPM + speed_value * VESC_RPM_PER_SPEED_UNIT
+        )
+        target_rpm = self._apply_restart_interval(target_rpm)
+
+        if target_rpm is None:
+            # 自動模式或關閉時清除積分並軟停止（減速→輕煞→放開）。
+            pi_left_integral = 0.0
+            pi_right_integral = 0.0
+            cmd_left, cmd_right = self._soft_stop_commands(
+                left["erpm"] / VESC_LEFT_POLE_PAIRS,
+                right["erpm"] / VESC_RIGHT_POLE_PAIRS,
+                time.monotonic(),
+            )
+        else:
+            self._soft_stop = None
+            self._released_event.clear()
+            rpm_left = left["erpm"] / VESC_LEFT_POLE_PAIRS
+            rpm_right = right["erpm"] / VESC_RIGHT_POLE_PAIRS
+            goal_left, goal_right = flywheel_wheel_targets(target_rpm)
+            base_left = goal_left * VESC_LEFT_POLE_PAIRS
+            base_right = goal_right * VESC_RIGHT_POLE_PAIRS
+
+            error_left = goal_left - rpm_left
+            error_right = goal_right - rpm_right
+            pi_left_integral += error_left * dt
+            pi_right_integral += error_right * dt
+            trim_left = self._clamp(
+                VESC_SPEED_KP * error_left + VESC_SPEED_KI * pi_left_integral,
+                -VESC_MAX_TRIM_ERPM, VESC_MAX_TRIM_ERPM,
+            )
+            trim_right = self._clamp(
+                VESC_SPEED_KP * error_right + VESC_SPEED_KI * pi_right_integral,
+                -VESC_MAX_TRIM_ERPM, VESC_MAX_TRIM_ERPM,
+            )
+            # 同步修正維持「設定的轉速差」，而不是把兩輪拉成同速。
+            sync = self._clamp(
+                VESC_SYNC_KP * (error_right - error_left),
+                -VESC_MAX_SYNC_CORRECTION_ERPM,
+                VESC_MAX_SYNC_CORRECTION_ERPM,
+            )
+            target_left = int(base_left + trim_left - sync)
+            target_right = int(base_right + trim_right + sync)
+
+        if target_rpm is not None:
+            cmd_left, cmd_right = ("rpm", target_left), ("rpm", target_right)
+        self._write_cmd("LEFT", self._ser_left, cmd_left)
+        self._write_cmd("RIGHT", self._ser_right, cmd_right)
+        target_left = cmd_left[1] if cmd_left[0] == "rpm" else cmd_left[0]
+        target_right = cmd_right[1] if cmd_right[0] == "rpm" else cmd_right[0]
+        print(
+            "[VESC] VRB={} -> target={} RPM | "
+            "L cmd={} ERPM actual={} ERPM ({:.1f} RPM) | "
+            "R cmd={} ERPM actual={} ERPM ({:.1f} RPM)".format(
+                "STOP" if speed_value is None else speed_value,
+                0 if target_rpm is None else int(target_rpm),
+                target_left,
+                left["erpm"],
+                left["erpm"] / VESC_LEFT_POLE_PAIRS,
+                target_right,
+                right["erpm"],
+                right["erpm"] / VESC_RIGHT_POLE_PAIRS,
+            ),
+            flush=True,
+        )
+        return pi_left_integral, pi_right_integral
 
     def close(self, timeout=3.0):
         self.set_speed(None)
@@ -992,11 +1056,17 @@ def return_dm_before_shutdown(motors):
                     or time.monotonic() - state.feedback_at > 0.5
                     or not math.isfinite(state.position_rad)):
                 raise RuntimeError(f"DM 回位時 0x{i:02X} 回授異常")
-        arrived = elapsed >= duration and all(
-            abs(math.degrees(cal[i].muzzle_from_motor(states[i].position_rad)
-                             - cal[i].muzzle_from_motor(destination[i]))) <= DM_POSITION_TOLERANCE_DEG
+        error_deg = {
+            i: math.degrees(cal[i].muzzle_from_motor(states[i].position_rad)
+                            - cal[i].muzzle_from_motor(destination[i]))
             for i in (3, 1)
-        )
+        }
+        # The pitch feed-forward with the low return gain settles 2-2.5 deg
+        # above the park target, so +-2.5 deg sometimes never arrived.  Higher
+        # is the safe side (the pitch holds there once disabled).
+        arrived = (elapsed >= duration
+                   and abs(error_deg[3]) <= DM_POSITION_TOLERANCE_DEG
+                   and -DM_POSITION_TOLERANCE_DEG <= error_deg[1] <= DM_RETURN_PITCH_ABOVE_TOLERANCE_DEG)
         if now >= next_status:
             print(f"[Manual DM 回位] {elapsed:.1f}s " + " ".join(
                 f"{name}={math.degrees(cal[i].muzzle_from_motor(states[i].position_rad)):+.1f}°"
@@ -1428,7 +1498,13 @@ class _AmmoMove:
             if self._stopped_at is None:
                 self._stopped_at = time.monotonic()
             elif time.monotonic() - self._stopped_at >= SETTLE_TIME:
+                # A driver without power also reads "not running": only a
+                # status reply proves the move ended, not the 24 V.
+                status = ctrl._query_status(ctrl.ammo_servo)
+                if status is None or status == MotorStatus.Fail:
+                    raise RuntimeError("彈藥倉轉格結束時沒有狀態回應（可能已斷電），轉格可能未完成")
                 self.done = True
+                ctrl._job_turn_state = "done"
         elif elapsed > 2.0:
             raise RuntimeError("彈藥倉未偵測到移動")
         return self.done
@@ -1494,6 +1570,12 @@ class ManualController:
         self._shoot_home_encoder = None
         self._startup_home_encoder = None
         self.shot_error = None
+        # Emergency stop at any time: what the failed job was doing, so the
+        # match can carry on after the power is back (see recover_after_power_loss).
+        self._fault = None
+        self._job_start = (self.current_slot, self.slots_fired_since_reload)
+        self._job_turn_state = "none"  # magazine turn of the running job: none/active/done
+        self._resume_turn_pulses = 0
         self.current_mode = "M"
         self.last_yaw = 50
         self.last_pitch = 50
@@ -1839,6 +1921,7 @@ class ManualController:
                 raise
 
     def _reload_worker(self):
+        self._begin_job()
         try:
             if self.current_mode != "M":
                 return
@@ -1858,6 +1941,7 @@ class ManualController:
             self.shot_stage = 0
             print(f"[Reload] ID2 補彈完成，目前格位 {self.current_slot}。", flush=True)
         except Exception as exc:
+            self._record_fault("reload")
             self.shot_error = f"補彈失敗：{exc}"
             print(f"[Reload Error] {self.shot_error}", flush=True)
             self._emergency_stop(self.shoot_servo, "射擊機構")
@@ -1868,7 +1952,119 @@ class ManualController:
                 self.reload_pending = False
                 self.busy = False
 
+    # ---- emergency stop at any time --------------------------------------
+    def _begin_job(self):
+        self._job_start = (self.current_slot, self.slots_fired_since_reload)
+        self._job_turn_state = "none"
+
+    def _record_fault(self, job):
+        """Remember where a failing job stopped (an e-stop shows up as a failure)."""
+        with self.lock:
+            released = self.shot_released_seq >= getattr(self, "_active_request_seq", 1 << 62)
+        self._fault = {
+            "job": job,
+            "stage": self.shot_stage,
+            "released": job == "shot" and released,
+            "turn": getattr(self, "_job_turn_state", "none"),
+            "slot": self._job_start[0],
+            "slots_fired": self._job_start[1],
+            "pulses": getattr(self, "_resume_turn_pulses", 0),
+        }
+
+    def recover_after_power_loss(self):
+        """Bookkeeping once the 24 V is back (after reconfigure_mks_after_power_loss).
+
+        Keeps the balls still in the magazine: an interrupted stage is shot
+        again unless its ball was already out; a magazine turn that never
+        started is made up by the resume job.  Returns ``(note, turn_pulses)``:
+        ``note`` asks the team to align the magazine by hand when the power
+        was cut while it was turning (its position is lost), else None.
+        """
+        with self.lock:
+            if self.busy:
+                raise RuntimeError("發射機構工作尚未結束，稍後再恢復")
+            fault, self._fault = self._fault, None
+            self.shot_error = None
+        self._push_position = None  # the resume job homes ID1 first
+        self._turned_in_stage3 = False
+        needed, note = 0, None
+        if fault is not None:
+            job = fault["job"]
+            if job == "shot" and fault["released"] and fault["stage"] < 2:
+                self.shot_stage = fault["stage"] + 1
+            elif job == "shot" and fault["released"]:
+                # Ball 3 is out: this slot is empty, the next one comes up.
+                self.shot_stage = 0
+                self.slots_fired_since_reload = fault["slots_fired"] + 1
+                self.current_slot = fault["slot"] % SLOTS_PER_MAGAZINE + 1
+                if self.slots_fired_since_reload < SLOTS_PER_MAGAZINE:
+                    needed = AMMO_SLOT_PULSES
+            elif job == "shot":
+                self.shot_stage = fault["stage"]  # the ball did not leave: same stage again
+            elif job == "reload":
+                self.shot_stage = 0
+                self.slots_fired_since_reload = 0
+                self.current_slot = (fault["slot"] - 1 + RELOAD_SLOTS) % SLOTS_PER_MAGAZINE + 1
+                needed = RELOAD_PULSES
+            elif job == "resume":
+                needed = fault["pulses"]
+            if needed and fault["turn"] == "done":
+                needed = 0
+            elif needed and fault["turn"] == "active":
+                needed = 0
+                note = ("斷電時彈藥倉正在轉格，位置已不準：請手動把彈藥倉轉到下一格對準推球口"
+                        "（格位 {}）".format(self.current_slot))
+        self._resume_turn_pulses = needed
+        print("[Manual] 復電後恢復：彈藥倉格位 {}，下一發第 {}/3 階段{}。".format(
+            self.current_slot, self.shot_stage + 1,
+            "，ID1 回原點後補轉 {} pulses".format(needed) if needed else ""), flush=True)
+        return note, needed
+
+    def request_resume_after_power_loss(self):
+        """Background job after the reload switch: ID1 home, then any owed turn."""
+        with self.lock:
+            if self.busy or self.shot_error is not None:
+                return False
+            self.busy = True
+            # Joined by close() like a reload.
+            self.reload_thread = threading.Thread(target=self._resume_worker, name="power-resume")
+            try:
+                self.reload_thread.start()
+            except RuntimeError:
+                self.busy = False
+                self.reload_thread = None
+                raise
+        return True
+
+    def _resume_worker(self):
+        self._begin_job()
+        try:
+            self.reload_pending = False
+            home = self._go_home(self.shoot_servo, HOME_DIRECTION, "復電後 ID1 回原點")
+            self._push_position = 0
+            self._pusher_home_encoder = home
+            pulses = getattr(self, "_resume_turn_pulses", 0)
+            if pulses:
+                self._shoot_home_encoder = home
+                self.reload_pending = True
+                self._rotate_ammo_slots(pulses)
+                self._resume_turn_pulses = 0
+            print("[Manual] 復電恢復完成：ID1 在原點{}。".format(
+                "，彈藥倉已補轉格" if pulses else ""), flush=True)
+        except Exception as exc:
+            self._record_fault("resume")
+            self.shot_error = "復電恢復失敗：{}".format(exc)
+            print("[Manual Error] {}".format(self.shot_error), flush=True)
+            self._emergency_stop(self.shoot_servo, "射擊機構")
+            self._emergency_stop(self.ammo_servo, "彈藥倉")
+        finally:
+            with self.lock:
+                self._shoot_home_encoder = None
+                self.reload_pending = False
+                self.busy = False
+
     def _shot_worker(self):
+        self._begin_job()
         try:
             if self._shot_cancel.is_set():
                 return
@@ -1918,6 +2114,7 @@ class ManualController:
                 self.current_slot
             ), flush=True)
         except Exception as exc:
+            self._record_fault("shot")
             self._pusher_home_encoder = None
             self._turned_in_stage3 = False
             with self.lock:
@@ -2403,6 +2600,8 @@ class ManualController:
             # 此次確認只能用於一筆轉格指令，失敗或完成後都不能重複使用。
             self._shoot_home_encoder = None
             print("[Manual] 推球機構已確認回零，允許儲存盤移動。", flush=True)
+        # From here on a power cut leaves the magazine between two slots.
+        self._job_turn_state = "active"
         result = self.ammo_servo.run_motor_relative_motion_by_pulses(
             Direction.CW, AMMO_SPEED_RPM, AMMO_ACCELERATION, pulses
         )
